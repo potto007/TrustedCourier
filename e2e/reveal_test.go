@@ -94,6 +94,22 @@ func TestRevealDeliveryReturnsTheSecret(t *testing.T) {
 	}
 }
 
+func TestEveryRevealDeliveryFetchesFromTheBackend(t *testing.T) {
+	tc := harness.New(t)
+	path := tc.InstallPlugin(harness.FakePlugin, t.TempDir(), 0o755)
+	srv := tc.Start(strings.Replace(revealConfig, "{{.Fake.Path}}", path, 1))
+	waitForPlugin(t, srv, "fake", running)
+	token := "Bearer " + issueAgentToken(t, srv, "github-reveal", "1h").Token
+
+	if got := reveal(t, srv, token, "github"); got.Status != http.StatusOK || got.Body != "test-value-2" {
+		t.Fatalf("reveal github = %d %q, want 200 test-value-2", got.Status, got.Body)
+	}
+	tc.SetBackendSecrets(path, map[string]string{"kv/github": "rotated-value-2"})
+	if got := reveal(t, srv, token, "github"); got.Status != http.StatusOK || got.Body != "rotated-value-2" {
+		t.Fatalf("reveal github after rotation = %d %q, want 200 rotated-value-2", got.Status, got.Body)
+	}
+}
+
 func TestDeniedAndUnknownSecretNamesGetIdentical403(t *testing.T) {
 	tc := harness.New(t)
 	srv := tc.Start(revealConfig)

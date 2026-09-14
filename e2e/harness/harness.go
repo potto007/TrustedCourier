@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -177,6 +178,24 @@ func (in *Installation) InstallPlugin(bin PluginBinary, dir string, mode os.File
 	path := filepath.Join(dir, filepath.Base(bin.Path))
 	in.copyFile(bin.Path, path, mode)
 	return path
+}
+
+// SetBackendSecrets replaces what the fake Backend Plugin installed at
+// pluginPath holds with secrets, by location. The plugin reads them on every
+// Get, so a test can rotate a Secret while TrustedCourier runs.
+func (in *Installation) SetBackendSecrets(pluginPath string, secrets map[string]string) {
+	in.t.Helper()
+	data, err := json.Marshal(secrets)
+	if err != nil {
+		in.t.Fatal(err)
+	}
+	tmp := pluginPath + ".secrets.json.new"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		in.t.Fatal(err)
+	}
+	if err := os.Rename(tmp, pluginPath+".secrets.json"); err != nil {
+		in.t.Fatal(err)
+	}
 }
 
 // ReplacePlugin atomically replaces the binary at path with bin, as an

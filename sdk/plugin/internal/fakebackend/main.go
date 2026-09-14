@@ -10,12 +10,18 @@
 // "malformed" bypasses the SDK, breaks the protocol contract in every
 // response, and writes a forged log line. label, when set, appears in the
 // health detail.
+//
+// When a file named after the binary plus ".secrets.json" exists, Get serves
+// the JSON object of locations to values in it instead of the built-in
+// Secrets.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"slices"
 	"strings"
@@ -70,6 +76,15 @@ func newBackend() *backend {
 }
 
 func (b *backend) Get(_ context.Context, location string) ([]byte, error) {
+	if secrets, err := secretsFile(); err != nil {
+		return nil, err
+	} else if secrets != nil {
+		v, ok := secrets[location]
+		if !ok {
+			return nil, plugin.ErrNotFound
+		}
+		return []byte(v), nil
+	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	v, ok := b.secrets[location]
@@ -77,6 +92,28 @@ func (b *backend) Get(_ context.Context, location string) ([]byte, error) {
 		return nil, plugin.ErrNotFound
 	}
 	return slices.Clone(v), nil
+}
+
+// secretsFile returns the Secrets in <executable>.secrets.json, read afresh
+// on every call so tests can rotate a Secret, or nil when there is no such
+// file.
+func secretsFile() (map[string]string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(exe + ".secrets.json")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	secrets := map[string]string{}
+	if err := json.Unmarshal(data, &secrets); err != nil {
+		return nil, err
+	}
+	return secrets, nil
 }
 
 func (b *backend) List(_ context.Context, prefix string) ([]string, error) {
