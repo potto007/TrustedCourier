@@ -21,7 +21,7 @@ The credential an Operator issues to an Agent, identifying that Agent and carryi
 _Avoid_: Token (bare), API key, access key
 
 **Policy**:
-A named, Operator-defined rule set stating which Secret Names an Agent Token may use, in which Delivery modes. Attached to Agent Tokens; reused across Agents.
+A named, Operator-defined rule set stating which Secret Names an Agent Token may use, in which Delivery modes, and optionally which HTTP methods and path prefixes a Proxy Delivery may reach. Attached to Agent Tokens; reused across Agents.
 _Avoid_: Scope, role, permission, grant
 
 **Operator Credential**:
