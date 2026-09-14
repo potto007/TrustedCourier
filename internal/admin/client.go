@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,17 @@ func (c *Client) ListAgentTokens(ctx context.Context) ([]AgentToken, error) {
 	var tokens []AgentToken
 	err := c.do(ctx, http.MethodGet, "/v1/agent-tokens", nil, &tokens)
 	return tokens, err
+}
+
+// IssueAgentToken issues an Agent Token.
+func (c *Client) IssueAgentToken(ctx context.Context, req IssueAgentTokenRequest) (IssuedAgentToken, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return IssuedAgentToken{}, err
+	}
+	var issued IssuedAgentToken
+	err = c.do(ctx, http.MethodPost, "/v1/agent-tokens", bytes.NewReader(body), &issued)
+	return issued, err
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, out any) error {

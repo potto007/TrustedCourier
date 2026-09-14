@@ -64,6 +64,7 @@ func NewServer(svc *access.Service, allowedUIDs []int, log *slog.Logger) *Server
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/agent-tokens", s.listAgentTokens)
+	mux.HandleFunc("POST /v1/agent-tokens", s.issueAgentToken)
 
 	srv := &http.Server{
 		Handler:           s.requirePeer(s.requireOperator(mux)),
@@ -147,11 +148,68 @@ func (s *Server) listAgentTokens(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, err)
 		return
 	}
+	now := time.Now()
 	out := make([]AgentToken, 0, len(tokens))
 	for _, t := range tokens {
-		out = append(out, AgentToken(t))
+		out = append(out, toAPI(t, now))
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// maxRequestBody bounds admin request bodies; none legitimately comes close.
+const maxRequestBody = 1 << 20
+
+func (s *Server) issueAgentToken(w http.ResponseWriter, r *http.Request) {
+	var req IssueAgentTokenRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "malformed request: "+err.Error())
+		return
+	}
+	issued, err := s.access.IssueAgentToken(r.Context(), req.Policies, req.ExpiresAt)
+	if s.requestFailed(w, err) {
+		return
+	}
+	s.log.Info("Agent Token issued", "id", issued.ID, "policies", issued.Policies, "expires_at", issued.ExpiresAt)
+	writeJSON(w, http.StatusCreated, IssuedAgentToken{
+		AgentToken: toAPI(issued.AgentToken, time.Now()),
+		Token:      issued.Token,
+	})
+}
+
+func toAPI(t access.AgentToken, now time.Time) AgentToken {
+	status := StatusActive
+	switch {
+	case t.RevokedAt != nil:
+		status = StatusRevoked
+	case !now.Before(t.ExpiresAt):
+		status = StatusExpired
+	}
+	return AgentToken{
+		ID:         t.ID,
+		Policies:   t.Policies,
+		CreatedAt:  t.CreatedAt,
+		ExpiresAt:  t.ExpiresAt,
+		LastUsedAt: t.LastUsedAt,
+		RevokedAt:  t.RevokedAt,
+		Status:     status,
+	}
+}
+
+// requestFailed writes the response for a non-nil err and reports whether it
+// did.
+func (s *Server) requestFailed(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	var invalid *access.ValidationError
+	if errors.As(err, &invalid) {
+		writeError(w, http.StatusBadRequest, invalid.Error())
+		return true
+	}
+	s.internalError(w, err)
+	return true
 }
 
 func (s *Server) internalError(w http.ResponseWriter, err error) {
