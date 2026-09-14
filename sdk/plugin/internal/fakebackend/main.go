@@ -116,7 +116,7 @@ func (malformedBackend) Capabilities(context.Context, *protocol.CapabilitiesRequ
 }
 
 func (malformedBackend) Health(context.Context, *protocol.HealthRequest) (*protocol.HealthResponse, error) {
-	return &protocol.HealthResponse{Healthy: true, Detail: "\x1b[2Jall good\xff"}, nil
+	return &protocol.HealthResponse{Healthy: true, Detail: "\x1b[2Jall good\x07"}, nil
 }
 
 func (malformedBackend) Get(context.Context, *protocol.GetRequest) (*protocol.GetResponse, error) {

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -22,11 +23,30 @@ const DefaultAdminSocket = "/run/trustedcourier/admin.sock"
 
 // Config is a fully validated config snapshot. Treat it as read-only.
 type Config struct {
+	// Path is the absolute path of the config file.
+	Path string
 	// DataDir holds the SQLite database.
 	DataDir string
 	Admin   Admin
 	// Policies by name.
 	Policies map[string]Policy
+	// BackendPlugins by name.
+	BackendPlugins map[string]BackendPlugin
+}
+
+// BackendPlugin is a Backend Plugin binary the Operator approved (ADR-0004).
+type BackendPlugin struct {
+	Name string
+	// Path is the absolute path of the binary.
+	Path string
+	// SHA256 is the pinned hash of the binary, lowercase hexadecimal.
+	SHA256 string
+	// User is the OS user name or ID the plugin runs as. Empty only when
+	// InsecureShareCoreUser is set.
+	User string
+	// InsecureShareCoreUser runs the plugin as the server's own user, giving
+	// it access to the config and database. For development only.
+	InsecureShareCoreUser bool
 }
 
 // Admin configures the admin API.
@@ -59,9 +79,17 @@ const (
 )
 
 type fileConfig struct {
-	DataDir  string                `yaml:"data_dir"`
-	Admin    fileAdmin             `yaml:"admin"`
-	Policies map[string]filePolicy `yaml:"policies"`
+	DataDir        string                       `yaml:"data_dir"`
+	Admin          fileAdmin                    `yaml:"admin"`
+	Policies       map[string]filePolicy        `yaml:"policies"`
+	BackendPlugins map[string]fileBackendPlugin `yaml:"backend_plugins"`
+}
+
+type fileBackendPlugin struct {
+	Path                  string `yaml:"path"`
+	SHA256                string `yaml:"sha256"`
+	User                  string `yaml:"user"`
+	InsecureShareCoreUser bool   `yaml:"insecure_share_core_user"`
 }
 
 type fileAdmin struct {
@@ -103,11 +131,17 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	if cfg.Path, err = filepath.Abs(path); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
 func (raw fileConfig) validate(baseDir string) (*Config, error) {
-	cfg := &Config{Policies: make(map[string]Policy, len(raw.Policies))}
+	cfg := &Config{
+		Policies:       make(map[string]Policy, len(raw.Policies)),
+		BackendPlugins: make(map[string]BackendPlugin, len(raw.BackendPlugins)),
+	}
 
 	if raw.DataDir == "" {
 		return nil, errors.New("data_dir is required")
@@ -134,7 +168,41 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 		}
 		cfg.Policies[name] = policy
 	}
+	for _, name := range slices.Sorted(maps.Keys(raw.BackendPlugins)) {
+		plugin, err := raw.BackendPlugins[name].validate(name, baseDir)
+		if err != nil {
+			return nil, err
+		}
+		cfg.BackendPlugins[name] = plugin
+	}
 	return cfg, nil
+}
+
+var sha256Pattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+func (p fileBackendPlugin) validate(name, baseDir string) (BackendPlugin, error) {
+	if !namePattern.MatchString(name) {
+		return BackendPlugin{}, fmt.Errorf("invalid Backend Plugin name %q: use up to 64 letters, digits, '.', '_' or '-', starting with a letter or digit", name)
+	}
+	switch {
+	case p.Path == "":
+		return BackendPlugin{}, fmt.Errorf("Backend Plugin %q: path is required", name)
+	case p.SHA256 == "":
+		return BackendPlugin{}, fmt.Errorf("Backend Plugin %q: sha256 is required; print it with tc plugin sha256 <path>", name)
+	case !sha256Pattern.MatchString(p.SHA256):
+		return BackendPlugin{}, fmt.Errorf("Backend Plugin %q: sha256 must be 64 hexadecimal digits", name)
+	case p.User == "" && !p.InsecureShareCoreUser:
+		return BackendPlugin{}, fmt.Errorf("Backend Plugin %q: user is required, naming the separate OS user the plugin runs as", name)
+	case p.User != "" && p.InsecureShareCoreUser:
+		return BackendPlugin{}, fmt.Errorf("Backend Plugin %q: set user or insecure_share_core_user, not both", name)
+	}
+	return BackendPlugin{
+		Name:                  name,
+		Path:                  resolve(baseDir, p.Path),
+		SHA256:                strings.ToLower(p.SHA256),
+		User:                  p.User,
+		InsecureShareCoreUser: p.InsecureShareCoreUser,
+	}, nil
 }
 
 // namePattern constrains Policy names and Secret Names so they are safe on a

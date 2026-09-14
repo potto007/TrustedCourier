@@ -6,6 +6,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -58,7 +59,48 @@ func buildAndRun(m *testing.M, dir string) (int, error) {
 	if out, err := build.CombinedOutput(); err != nil {
 		return 0, fmt.Errorf("build tc: %w\n%s", err, out)
 	}
+	for _, p := range []struct {
+		bin         *PluginBinary
+		name, flags string
+	}{
+		{&FakePlugin, "fake", ""},
+		{&ReplacementPlugin, "replacement", "-X main.label=replacement"},
+		{&CrashingPlugin, "crashing", "-X main.mode=crash"},
+		{&MalformedPlugin, "malformed", "-X main.mode=malformed"},
+	} {
+		var err error
+		if *p.bin, err = buildPlugin(filepath.Join(root, "sdk", "plugin"), filepath.Join(dir, p.name), p.flags); err != nil {
+			return 0, err
+		}
+	}
 	return m.Run(), nil
+}
+
+// PluginBinary is a Backend Plugin binary and its SHA-256 as the config
+// pins it.
+type PluginBinary struct {
+	Path   string
+	SHA256 string
+}
+
+// Variants of the fake Backend Plugin built on the plugin SDK, each with its
+// own hash. FakePlugin is well behaved and reports its uid in its health
+// detail; ReplacementPlugin is the same with "replacement" in the detail;
+// CrashingPlugin exits before the handshake; MalformedPlugin breaks the
+// protocol contract in every response.
+var FakePlugin, ReplacementPlugin, CrashingPlugin, MalformedPlugin PluginBinary
+
+func buildPlugin(sdkDir, out, ldflags string) (PluginBinary, error) {
+	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", out, "./internal/fakebackend")
+	build.Dir = sdkDir
+	if b, err := build.CombinedOutput(); err != nil {
+		return PluginBinary{}, fmt.Errorf("build fake Backend Plugin: %w\n%s", err, b)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		return PluginBinary{}, err
+	}
+	return PluginBinary{Path: out, SHA256: fmt.Sprintf("%x", sha256.Sum256(data))}, nil
 }
 
 // childEnv is the environment every tc process gets: a clean base plus the
@@ -80,7 +122,9 @@ type Installation struct {
 	t       *testing.T
 	DataDir string
 	Socket  string
-	dir     string
+	// ConfigMode is the file mode the config file is written with.
+	ConfigMode os.FileMode
+	dir        string
 }
 
 // New creates an empty installation cleaned up when the test ends.
@@ -93,20 +137,72 @@ func New(t *testing.T) *Installation {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return &Installation{
-		t:       t,
-		dir:     dir,
-		DataDir: filepath.Join(dir, "data"),
-		Socket:  filepath.Join(dir, "admin.sock"),
+		t:          t,
+		dir:        dir,
+		DataDir:    filepath.Join(dir, "data"),
+		Socket:     filepath.Join(dir, "admin.sock"),
+		ConfigMode: 0o600,
 	}
 }
 
-// ConfigVars are available to config templates as {{.DataDir}}, {{.Socket}}
-// and {{.UID}}. The config file lives in the parent of DataDir.
+// ConfigVars are available to config templates as {{.DataDir}}, {{.Socket}},
+// {{.UID}}, and the fake Backend Plugins as {{.Fake.Path}},
+// {{.Fake.SHA256}} and so on. The config file lives in the parent of DataDir.
 type ConfigVars struct {
-	DataDir string
-	Socket  string
-	UID     int
+	DataDir   string
+	Socket    string
+	UID       int
+	Fake      PluginBinary
+	Crashing  PluginBinary
+	Malformed PluginBinary
 }
+
+// PluginConfig is BaseConfig plus the well-behaved fake Backend Plugin,
+// named fake, sharing the server's OS user.
+const PluginConfig = BaseConfig + `
+backend_plugins:
+  fake:
+    path: {{.Fake.Path}}
+    sha256: {{.Fake.SHA256}}
+    insecure_share_core_user: true
+`
+
+// InstallPlugin copies bin into dir with the given mode and returns its path,
+// so a test can later replace it.
+func (in *Installation) InstallPlugin(bin PluginBinary, dir string, mode os.FileMode) string {
+	in.t.Helper()
+	path := filepath.Join(dir, filepath.Base(bin.Path))
+	in.copyFile(bin.Path, path, mode)
+	return path
+}
+
+// ReplacePlugin atomically replaces the binary at path with bin, as an
+// attacker or a careless upgrade might while TrustedCourier runs.
+func (in *Installation) ReplacePlugin(path string, bin PluginBinary) {
+	in.t.Helper()
+	tmp := path + ".new"
+	in.copyFile(bin.Path, tmp, 0o755)
+	if err := os.Rename(tmp, path); err != nil {
+		in.t.Fatal(err)
+	}
+}
+
+func (in *Installation) copyFile(from, to string, mode os.FileMode) {
+	in.t.Helper()
+	data, err := os.ReadFile(from)
+	if err != nil {
+		in.t.Fatal(err)
+	}
+	if err := os.WriteFile(to, data, mode); err != nil {
+		in.t.Fatal(err)
+	}
+	if err := os.Chmod(to, mode); err != nil {
+		in.t.Fatal(err)
+	}
+}
+
+// Dir is the installation's private directory, holding the config file.
+func (in *Installation) Dir() string { return in.dir }
 
 // BaseConfig is a minimal valid config with two Policies.
 const BaseConfig = `
@@ -131,12 +227,22 @@ func (in *Installation) writeConfig(tmpl string) string {
 		in.t.Fatalf("parse config template: %v", err)
 	}
 	var buf bytes.Buffer
-	vars := ConfigVars{DataDir: in.DataDir, Socket: in.Socket, UID: os.Getuid()}
+	vars := ConfigVars{
+		DataDir:   in.DataDir,
+		Socket:    in.Socket,
+		UID:       os.Getuid(),
+		Fake:      FakePlugin,
+		Crashing:  CrashingPlugin,
+		Malformed: MalformedPlugin,
+	}
 	if err := parsed.Execute(&buf, vars); err != nil {
 		in.t.Fatalf("render config template: %v", err)
 	}
 	path := filepath.Join(in.dir, "config.yaml")
-	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+	if err := os.WriteFile(path, buf.Bytes(), in.ConfigMode); err != nil {
+		in.t.Fatal(err)
+	}
+	if err := os.Chmod(path, in.ConfigMode); err != nil {
 		in.t.Fatal(err)
 	}
 	return path

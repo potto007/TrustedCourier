@@ -10,6 +10,7 @@ import (
 	"github.com/potto007/TrustedCourier/internal/access"
 	"github.com/potto007/TrustedCourier/internal/admin"
 	"github.com/potto007/TrustedCourier/internal/config"
+	"github.com/potto007/TrustedCourier/internal/pluginhost"
 	"github.com/potto007/TrustedCourier/internal/store"
 )
 
@@ -22,6 +23,10 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
+	}
+	plugins, err := pluginhost.New(cfg, stderr, log)
+	if err != nil {
+		return err
 	}
 	db, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
@@ -45,6 +50,13 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		return err
 	}
 
+	pluginCtx, stopPlugins := context.WithCancel(ctx)
+	defer func() {
+		stopPlugins()
+		plugins.Wait()
+	}()
+	plugins.Start(pluginCtx)
+
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
-	return admin.NewServer(svc, cfg.Admin.AllowedUIDs, log).Serve(ctx, ln)
+	return admin.NewServer(svc, plugins, cfg.Admin.AllowedUIDs, log).Serve(ctx, ln)
 }

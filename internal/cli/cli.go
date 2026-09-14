@@ -20,6 +20,7 @@ import (
 
 	"github.com/potto007/TrustedCourier/internal/admin"
 	"github.com/potto007/TrustedCourier/internal/config"
+	"github.com/potto007/TrustedCourier/internal/pluginhost"
 	"github.com/potto007/TrustedCourier/internal/server"
 )
 
@@ -28,6 +29,8 @@ const usage = `Usage:
   tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | --expires-at <RFC 3339>) [--json]
   tc token list [--json]
   tc token revoke <id>
+  tc status [--json]
+  tc plugin sha256 <path>
 
 Environment:
   TC_ADMIN_SOCKET         admin socket path (default ` + config.DefaultAdminSocket + `)
@@ -59,11 +62,16 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 1 && slices.Contains([]string{"-h", "--help", "help"}, args[0]) {
 		return flag.ErrHelp
 	}
+	if len(args) >= 1 && args[0] == "status" {
+		return status(args[1:], stdout)
+	}
 	if len(args) < 2 {
 		return fmt.Errorf("%w: missing command", errUsage)
 	}
 	cmd, rest := args[0]+" "+args[1], args[2:]
 	switch cmd {
+	case "plugin sha256":
+		return pluginSHA256(rest, stdout)
 	case "server run":
 		return serverRun(rest, stdout, stderr)
 	case "token issue":
@@ -272,6 +280,62 @@ func tokenRevoke(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "Agent Token %s revoked\n", id)
 	return nil
+}
+
+func status(args []string, stdout io.Writer) error {
+	fs := newFlagSet("status")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%w: status: unexpected argument %q", errUsage, fs.Arg(0))
+	}
+	client, err := adminClient()
+	if err != nil {
+		return err
+	}
+	st, err := client.Status(context.Background())
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(stdout, st)
+	}
+	if len(st.BackendPlugins) == 0 {
+		_, err := fmt.Fprintln(stdout, "No Backend Plugins configured.")
+		return err
+	}
+	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "BACKEND PLUGIN\tSTATE\tHEALTH\tCAPABILITIES\tRESTARTS\tDETAIL")
+	for _, p := range st.BackendPlugins {
+		health := "unhealthy"
+		if p.Healthy {
+			health = "healthy"
+		}
+		caps := strings.Join(p.Capabilities, ",")
+		if caps == "" {
+			caps = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n", p.Name, p.State, health, caps, p.Restarts, p.Detail)
+	}
+	return tw.Flush()
+}
+
+func pluginSHA256(args []string, stdout io.Writer) error {
+	fs := newFlagSet("plugin sha256")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("%w: plugin sha256: exactly one Backend Plugin binary path is required", errUsage)
+	}
+	sum, err := pluginhost.FileSHA256(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "sha256: %s\n", sum)
+	return err
 }
 
 func writeJSON(w io.Writer, v any) error {
