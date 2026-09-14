@@ -1,0 +1,128 @@
+// Command fakebackend is a fake Backend Plugin for TrustedCourier's own
+// tests: the conformance kit's, and the Seam 1 process harness's.
+//
+// Its behavior is fixed at build time, so each variant has its own SHA-256:
+//
+//	go build -ldflags "-X main.mode=crash" ./internal/fakebackend
+//
+// Modes: "" is a well-behaved Backend built on the SDK; "crash" exits before
+// the handshake; "malformed" bypasses the SDK and breaks the protocol
+// contract in every response. label, when set, appears in the health detail.
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/potto007/TrustedCourier/sdk/plugin"
+	"github.com/potto007/TrustedCourier/sdk/plugin/protocol"
+)
+
+var (
+	mode  string
+	label string
+)
+
+func main() {
+	switch mode {
+	case "":
+		plugin.Serve(newBackend())
+	case "crash":
+		fmt.Fprintln(os.Stderr, "fakebackend: crashing on purpose")
+		os.Exit(3)
+	case "malformed":
+		protocol.Serve(malformedBackend{})
+	default:
+		fmt.Fprintf(os.Stderr, "fakebackend: unknown mode %q\n", mode)
+		os.Exit(2)
+	}
+}
+
+// Secrets the fake Backend holds at start.
+var Secrets = map[string]string{
+	"kv/openai": "test-value-1",
+	"kv/github": "test-value-2",
+}
+
+type backend struct {
+	mu      sync.RWMutex
+	secrets map[string][]byte
+}
+
+func newBackend() *backend {
+	b := &backend{secrets: map[string][]byte{}}
+	for loc, v := range Secrets {
+		b.secrets[loc] = []byte(v)
+	}
+	return b
+}
+
+func (b *backend) Get(_ context.Context, location string) ([]byte, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	v, ok := b.secrets[location]
+	if !ok {
+		return nil, plugin.ErrNotFound
+	}
+	return slices.Clone(v), nil
+}
+
+func (b *backend) List(_ context.Context, prefix string) ([]string, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	var locs []string
+	for loc := range b.secrets {
+		if strings.HasPrefix(loc, prefix) {
+			locs = append(locs, loc)
+		}
+	}
+	slices.Sort(locs)
+	return locs, nil
+}
+
+// Health reports the process's user so tests can see which OS user the
+// core ran the plugin as.
+func (b *backend) Health(context.Context) (string, error) {
+	detail := fmt.Sprintf("fake Backend, uid=%d gid=%d", os.Getuid(), os.Getgid())
+	if label != "" {
+		detail += ", " + label
+	}
+	return detail, nil
+}
+
+func (b *backend) Capabilities() plugin.Capabilities {
+	return plugin.Capabilities{CourierKeyWrite: true}
+}
+
+func (b *backend) WriteCourierKey(_ context.Context, location string, value []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.secrets[location] = slices.Clone(value)
+	return nil
+}
+
+// malformedBackend answers every call with a response that breaks the
+// protocol contract, as a compromised or buggy plugin might.
+type malformedBackend struct {
+	protocol.UnimplementedBackendServer
+}
+
+func (malformedBackend) Capabilities(context.Context, *protocol.CapabilitiesRequest) (*protocol.CapabilitiesResponse, error) {
+	return &protocol.CapabilitiesResponse{}, nil
+}
+
+func (malformedBackend) Health(context.Context, *protocol.HealthRequest) (*protocol.HealthResponse, error) {
+	return &protocol.HealthResponse{Healthy: true, Detail: "\x1b[2Jall good\xff"}, nil
+}
+
+func (malformedBackend) Get(context.Context, *protocol.GetRequest) (*protocol.GetResponse, error) {
+	return &protocol.GetResponse{}, nil
+}
+
+func (malformedBackend) List(context.Context, *protocol.ListRequest) (*protocol.ListResponse, error) {
+	return &protocol.ListResponse{Locations: []string{"\x00", "elsewhere/secret", "elsewhere/secret"}}, nil
+}

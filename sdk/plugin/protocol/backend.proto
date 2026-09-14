@@ -1,0 +1,56 @@
+// The wire protocol between the TrustedCourier core and a Backend Plugin.
+// Plugin Authors do not use it directly: the plugin SDK's Serve hides it.
+//
+// Regenerate with `buf generate` in this directory.
+syntax = "proto3";
+
+package trustedcourier.backend.v1;
+
+option go_package = "github.com/potto007/TrustedCourier/sdk/plugin/protocol";
+
+service Backend {
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  // Get fails with NOT_FOUND when the Backend holds nothing at the location.
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  // WriteCourierKey fails with UNIMPLEMENTED unless the Backend Plugin
+  // reports the courier_key_write capability.
+  rpc WriteCourierKey(WriteCourierKeyRequest) returns (WriteCourierKeyResponse);
+}
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+  bool courier_key_write = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string detail = 2;
+}
+
+message GetRequest {
+  string location = 1;
+}
+
+message GetResponse {
+  bytes value = 1;
+}
+
+message ListRequest {
+  string prefix = 1;
+}
+
+message ListResponse {
+  repeated string locations = 1;
+}
+
+message WriteCourierKeyRequest {
+  string location = 1;
+  bytes value = 2;
+}
+
+message WriteCourierKeyResponse {}
