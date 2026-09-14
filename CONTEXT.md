@@ -14,6 +14,10 @@ _Avoid_: Admin, user, customer
 An AI agent workload that calls the TrustedCourier API to use secrets.
 _Avoid_: Client, consumer, app
 
+**Plugin Author**:
+A developer who builds and releases a Backend Plugin against the plugin SDK, inside or outside the TrustedCourier project.
+_Avoid_: Contributor (bare), vendor, integrator
+
 ### Access
 
 **Agent Token**:
