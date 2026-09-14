@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap and Agent Tokens work today. Secret Delivery, Backends, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, and the Backend Plugin seam work today. Secret Delivery, a real Backend, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -40,13 +40,16 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Admin API on a unix socket, gated by local user and Operator Credential | done |
 | `tc token issue`, `list`, `revoke` | done |
 | Policies declared and validated in config | done |
-| Backend Plugin seam, OpenBao plugin | [#3](https://github.com/potto007/TrustedCourier/issues/3), [#18](https://github.com/potto007/TrustedCourier/issues/18) |
+| Backend Plugins pinned by SHA-256, run as a separate user, supervised | done |
+| `tc status`, `tc plugin sha256` | done |
+| Plugin SDK and conformance kit skeleton | done |
+| OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
 | Reveal Delivery, Proxy Delivery, Redaction | [#4](https://github.com/potto007/TrustedCourier/issues/4), [#5](https://github.com/potto007/TrustedCourier/issues/5), [#6](https://github.com/potto007/TrustedCourier/issues/6) |
 | Audit Records and checkpoints | [#9](https://github.com/potto007/TrustedCourier/issues/9), [#10](https://github.com/potto007/TrustedCourier/issues/10) |
 | TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
-An Agent Token can be issued, listed, and revoked, but nothing accepts one yet. Delivery comes next.
+An Agent Token can be issued, listed, and revoked, but nothing accepts one yet. Backend Plugins can be launched and monitored, but nothing fetches a Secret through them yet. Delivery comes next.
 
 ## Quickstart
 
@@ -120,6 +123,37 @@ emqckmg73t6p2xaj  openai-proxy  2026-10-14T16:42:39Z  never      revoked
 
 Stop the server with Ctrl-C or SIGTERM.
 
+### Backend Plugins
+
+A Backend Plugin is a separate binary. Pin it by hash:
+
+```sh
+./tc plugin sha256 /opt/trustedcourier/plugins/openbao
+```
+
+```
+sha256: 3f7a...
+```
+
+Paste that line into the config with the binary's path and the OS user it runs as:
+
+```yaml
+backend_plugins:
+  openbao:
+    path: /opt/trustedcourier/plugins/openbao
+    sha256: 3f7a...
+    user: trustedcourier-plugin
+```
+
+The plugin user must differ from the server's user and must not be able to read the config file, so a server that runs plugins starts as root. For development, `insecure_share_core_user: true` in place of `user` runs the plugin as the server's own user and logs a warning.
+
+`tc status` shows each plugin's state, health, and capabilities:
+
+```
+BACKEND PLUGIN  STATE    HEALTH   CAPABILITIES       RESTARTS  DETAIL
+openbao         running  healthy  courier-key-write  0         ...
+```
+
 ## CLI
 
 ```
@@ -127,12 +161,14 @@ tc server run --config <path>
 tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | --expires-at <RFC 3339>) [--json]
 tc token list [--json]
 tc token revoke <id>
+tc status [--json]
+tc plugin sha256 <path>
 ```
 
 | Variable | Meaning |
 | --- | --- |
 | `TC_ADMIN_SOCKET` | Admin socket path. Defaults to `/run/trustedcourier/admin.sock`. |
-| `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command requires it. |
+| `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command and `status` require it. |
 
 Exit codes are 0 for success, 1 for a failed operation, and 2 for a malformed command line.
 
@@ -148,8 +184,13 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `policies` | no | Map of Policy name to Policy. |
 | `policies.<name>.secrets` | yes | List of `{name, delivery}` entries, one per Secret Name. |
 | `policies.<name>.secrets[].delivery` | yes | One or both of `proxy` and `reveal`. |
+| `backend_plugins` | no | Map of Backend Plugin name to Backend Plugin. |
+| `backend_plugins.<name>.path` | yes | Path to the plugin binary. |
+| `backend_plugins.<name>.sha256` | yes | The binary's SHA-256 as `tc plugin sha256` prints it. |
+| `backend_plugins.<name>.user` | one of these two | OS user name or ID the plugin runs as. |
+| `backend_plugins.<name>.insecure_share_core_user` | one of these two | `true` runs the plugin as the server's own user. Development only. |
 
-Policy names and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, and can list each only once.
+Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, and can list each only once.
 
 Two things trip people up with the admin socket. The default `/run/trustedcourier/` usually needs root to create, so for a non-root server pick a path you own, such as one under `$XDG_RUNTIME_DIR`. And unix socket paths are limited to about 104 to 108 bytes depending on the OS, so a deeply nested path fails with `bind: invalid argument`.
 
@@ -162,6 +203,10 @@ Two things trip people up with the admin socket. The default `/run/trustedcourie
 - The admin socket checks the connecting process's UID against `admin.allowed_uids` before it looks at the Operator Credential. The socket file is owner-only unless other users are allowed.
 - A second server pointed at a live socket refuses to start. A stale socket left by a crash is replaced.
 - Revoking an Agent Token twice succeeds and keeps the first revocation time.
+- A Backend Plugin binary whose SHA-256 differs from the pinned hash stops the server at boot and is never relaunched after boot. On Linux the server executes the file descriptor it hashed, so swapping the binary after the check does not work ([ADR-0011](docs/decisions/0011-backend-plugin-host-and-protocol.md)).
+- Backend Plugins run as a separate OS user that cannot read the config file or own the data directory, with an empty environment apart from `GODEBUG`. Core and plugin talk over go-plugin's automatic mutual TLS.
+- Every plugin response is checked against the protocol contract (size limits, valid UTF-8, no control characters) before the server uses it, and plugin error text and log output are sanitized.
+- A plugin that crashes is restarted with exponential backoff, from 250 ms to 30 s. It never takes the server down.
 
 ## Repository layout
 
@@ -174,10 +219,11 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `internal/admin` | Admin API server and client over the unix socket. |
 | `internal/cli` | Command-line parsing and output. |
 | `internal/config` | Config loading and validation. |
+| `internal/pluginhost` | Plugin Host: verifies, launches, supervises, and reports Backend Plugins. |
 | `internal/server` | Wires config, database, and admin API into a running process. |
 | `internal/store` | SQLite database and migrations, through pure-Go `modernc.org/sqlite` ([ADR-0009](docs/decisions/0009-pure-go-sqlite.md)). |
 | `e2e` | Black-box tests that build `tc` and drive a real server through its config, socket, and CLI. |
-| `sdk/plugin` | Plugin SDK module for Plugin Authors. A placeholder until [#3](https://github.com/potto007/TrustedCourier/issues/3). |
+| `sdk/plugin` | Plugin SDK module: the `Backend` interface and `Serve` for Plugin Authors, the wire protocol (`protocol`), the validating client (`client`), the conformance kit (`conformance`), and the fake Backend Plugin used by tests. |
 | `plugins/openbao` | OpenBao Backend Plugin module. A placeholder until [#18](https://github.com/potto007/TrustedCourier/issues/18). |
 
 ## Development
@@ -191,6 +237,10 @@ go test -race ./...
 ```
 
 CI runs every module twice, once with `GODEBUG=fips140=off` and once with `fips140=on`. The race detector is required, not optional ([ADR-0003](docs/decisions/0003-go-over-rust-core.md) relies on it).
+
+`TestBackendPluginRunsAsSeparateUser` needs a root server to switch the plugin's user and skips otherwise. CI runs it, with the separate-user refusal tests, a second time under `sudo`.
+
+The plugin protocol's Go code is generated. After editing `sdk/plugin/protocol/backend.proto`, run `buf generate` in that directory with `protoc-gen-go` and `protoc-gen-go-grpc` on `PATH`.
 
 Tests go through the process, not internal types. The `e2e` harness builds `tc` (with `-race` when the tests run with it), starts it from a config file, and asserts only what an Operator or Agent could observe. New behavior should get a test there first.
 
