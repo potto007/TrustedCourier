@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -112,18 +115,55 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 		cfg.Admin.AllowedUIDs = []int{os.Getuid()}
 	}
 
-	for name, p := range raw.Policies {
-		policy := Policy{Name: name}
-		for _, s := range p.Secrets {
-			access := SecretAccess{SecretName: s.Name}
-			for _, mode := range s.Delivery {
-				access.Delivery = append(access.Delivery, DeliveryMode(mode))
-			}
-			policy.Secrets = append(policy.Secrets, access)
+	// Validate in name order so the reported error is deterministic.
+	for _, name := range slices.Sorted(maps.Keys(raw.Policies)) {
+		policy, err := raw.Policies[name].validate(name)
+		if err != nil {
+			return nil, err
 		}
 		cfg.Policies[name] = policy
 	}
 	return cfg, nil
+}
+
+// namePattern constrains Policy names and Secret Names so they are safe on a
+// command line, in a URL path, and in logs.
+var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+func (p filePolicy) validate(name string) (Policy, error) {
+	if !namePattern.MatchString(name) {
+		return Policy{}, fmt.Errorf("invalid Policy name %q: use up to 64 letters, digits, '.', '_' or '-', starting with a letter or digit", name)
+	}
+	policy := Policy{Name: name}
+	if len(p.Secrets) == 0 {
+		return Policy{}, fmt.Errorf("Policy %q lists no Secret Names", name)
+	}
+	for i, s := range p.Secrets {
+		if s.Name == "" {
+			return Policy{}, fmt.Errorf("Policy %q: secrets[%d]: Secret Name is required", name, i)
+		}
+		if !namePattern.MatchString(s.Name) {
+			return Policy{}, fmt.Errorf("Policy %q: invalid Secret Name %q", name, s.Name)
+		}
+		if slices.ContainsFunc(policy.Secrets, func(a SecretAccess) bool { return a.SecretName == s.Name }) {
+			return Policy{}, fmt.Errorf("Policy %q lists Secret Name %q more than once", name, s.Name)
+		}
+		if len(s.Delivery) == 0 {
+			return Policy{}, fmt.Errorf("Policy %q: Secret Name %q needs at least one Delivery mode (proxy, reveal)", name, s.Name)
+		}
+		access := SecretAccess{SecretName: s.Name}
+		for _, m := range s.Delivery {
+			mode := DeliveryMode(m)
+			if mode != DeliveryProxy && mode != DeliveryReveal {
+				return Policy{}, fmt.Errorf("Policy %q: Secret Name %q: unknown Delivery mode %q (want proxy or reveal)", name, s.Name, m)
+			}
+			if !slices.Contains(access.Delivery, mode) {
+				access.Delivery = append(access.Delivery, mode)
+			}
+		}
+		policy.Secrets = append(policy.Secrets, access)
+	}
+	return policy, nil
 }
 
 func resolve(baseDir, path string) string {
