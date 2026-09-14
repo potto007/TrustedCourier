@@ -82,6 +82,21 @@ policies:
 			wantErr: `"openai" more than once`,
 		},
 		{
+			name: "Policy defined twice",
+			config: header + `
+policies:
+  p:
+    secrets:
+      - name: openai
+        delivery: [proxy]
+  p:
+    secrets:
+      - name: github
+        delivery: [reveal]
+`,
+			wantErr: `"p" already defined`,
+		},
+		{
 			name: "invalid Policy name",
 			config: header + `
 policies:

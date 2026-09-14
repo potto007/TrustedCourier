@@ -12,3 +12,5 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0006](0006-tls-with-built-in-acme.md) | TLS is required, with built-in ACME from v1 | accepted |
 | [0007](0007-tamper-evident-audit.md) | Audit Records are hash-chained with signed checkpoints | accepted |
 | [0008](0008-bundled-openbao-static-seal.md) | OpenBao is the bundled default Backend, bootstrapped by `tc init` with a static seal | accepted |
+| [0009](0009-pure-go-sqlite.md) | Embedded SQLite through the pure-Go modernc.org/sqlite driver | accepted |
+| [0010](0010-yaml-config-strict-decoding.md) | The config file is YAML, decoded strictly | accepted |
