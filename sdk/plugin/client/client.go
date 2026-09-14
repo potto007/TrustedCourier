@@ -103,10 +103,15 @@ func (c *Client) Get(ctx context.Context, location string) ([]byte, error) {
 		return nil, callError("Get", err)
 	}
 	if err := contract.Value(resp.GetValue()); err != nil {
+		clear(resp.GetValue()) // it may still be a Secret
 		return nil, malformed("Get", err)
 	}
 	return resp.GetValue(), nil
 }
+
+// ValidateLocation reports whether loc is a Backend location the protocol
+// accepts, so a config can be checked before any plugin call.
+func ValidateLocation(loc string) error { return contract.Location(loc) }
 
 // List returns the locations starting with prefix.
 func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {

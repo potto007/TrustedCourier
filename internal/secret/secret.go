@@ -19,8 +19,14 @@ import (
 // redacted is what a Secret shows instead of its contents.
 const redacted = "[secret]"
 
-// ErrReleased reports use of a Secret after Release.
-var ErrReleased = errors.New("secret: use after Release")
+// Errors.
+var (
+	// ErrReleased reports use of a Secret after Release.
+	ErrReleased = errors.New("secret: use after Release")
+	// ErrLockedMemory reports that no locked memory could hold a Secret,
+	// such as when RLIMIT_MEMLOCK is exhausted.
+	ErrLockedMemory = errors.New("secret: no locked memory available")
+)
 
 // Secret is a plaintext Secret value. Copies of a Secret share one buffer, so
 // releasing any copy releases them all.
@@ -41,7 +47,7 @@ func New(value []byte) (*Secret, error) {
 	defer clear(value)
 	buf, err := allocate(max(len(value), 1))
 	if err != nil {
-		return nil, fmt.Errorf("secret: allocate locked memory: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrLockedMemory, err)
 	}
 	p := &locked{buf: buf, n: copy(buf, value)}
 	// A Secret dropped without Release is still wiped once unreachable.

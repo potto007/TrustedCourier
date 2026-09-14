@@ -187,7 +187,9 @@ The body is the Secret, byte for byte, with `Cache-Control: no-store`. TrustedCo
 | 200 | A Policy on the Agent Token lists the Secret Name with `reveal`. |
 | 401 | The Agent Token is missing, unknown, expired, or revoked. The message says which. |
 | 403 | Anything else: the Secret Name does not exist, no attached Policy lists it, or the Policy allows only `proxy`. The body is identical in every case, so Agents cannot discover Secret Names. |
+| 405 | Any method but `GET`, including `HEAD`. |
 | 502 | The Backend could not return the Secret. Details go to the server log only. |
+| 503 | The server has no locked memory left to hold the Secret. Raise `RLIMIT_MEMLOCK`. |
 
 The Agent Token may go in `X-TC-Agent-Token` instead of `Authorization`. The Agent API serves plain HTTP, so until TLS lands ([#13](https://github.com/potto007/TrustedCourier/issues/13)) it listens only on a loopback IP address ([ADR-0012](docs/decisions/0012-reveal-delivery-api-and-secret-memory.md)).
 

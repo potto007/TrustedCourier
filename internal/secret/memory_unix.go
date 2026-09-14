@@ -11,11 +11,16 @@ var (
 )
 
 // allocate maps size bytes of private anonymous memory outside the Go heap,
-// where the garbage collector never copies it, and locks them into RAM so the
-// value never reaches swap.
+// where the garbage collector never copies it, keeps them out of core dumps
+// where the platform allows, and locks them into RAM so the value never
+// reaches swap.
 func allocate(size int) ([]byte, error) {
 	buf, err := unix.Mmap(-1, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
 	if err != nil {
+		return nil, err
+	}
+	if err := excludeFromCoreDumps(buf); err != nil {
+		_ = unix.Munmap(buf)
 		return nil, err
 	}
 	if err := unix.Mlock(buf); err != nil {

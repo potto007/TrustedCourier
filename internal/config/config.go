@@ -14,9 +14,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
+	"github.com/potto007/TrustedCourier/sdk/plugin/client"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -240,9 +239,6 @@ func checkLoopback(listen string) error {
 	return nil
 }
 
-// maxLocationBytes matches the Backend Plugin protocol's location limit.
-const maxLocationBytes = 1024
-
 func (s fileSecretName) validate(name string, plugins map[string]BackendPlugin) (SecretName, error) {
 	if !namePattern.MatchString(name) {
 		return SecretName{}, fmt.Errorf("invalid Secret Name %q: use up to 64 letters, digits, '.', '_' or '-', starting with a letter or digit", name)
@@ -252,10 +248,9 @@ func (s fileSecretName) validate(name string, plugins map[string]BackendPlugin) 
 		return SecretName{}, fmt.Errorf("Secret Name %q: backend is required", name)
 	case s.Location == "":
 		return SecretName{}, fmt.Errorf("Secret Name %q: location is required", name)
-	case len(s.Location) > maxLocationBytes:
-		return SecretName{}, fmt.Errorf("Secret Name %q: location is over %d bytes", name, maxLocationBytes)
-	case !utf8.ValidString(s.Location) || strings.ContainsFunc(s.Location, unicode.IsControl):
-		return SecretName{}, fmt.Errorf("Secret Name %q: location must be valid UTF-8 without control characters", name)
+	}
+	if err := client.ValidateLocation(s.Location); err != nil {
+		return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
 	}
 	if _, ok := plugins[s.Backend]; !ok {
 		return SecretName{}, fmt.Errorf("Secret Name %q: unknown backend %q; name one of backend_plugins", name, s.Backend)

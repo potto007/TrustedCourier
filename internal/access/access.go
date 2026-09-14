@@ -240,26 +240,34 @@ func (s *Service) AuthenticateAgentToken(ctx context.Context, presented string) 
 	if !strings.HasPrefix(presented, AgentTokenPrefix) {
 		return AgentToken{}, ErrAgentTokenInvalid
 	}
+	now := s.now().UnixMilli()
+	// Check and record use in one statement, so a revocation committed in
+	// between cannot be missed.
 	tok, err := scanAgentToken(s.db.QueryRowContext(ctx,
-		"SELECT "+agentTokenColumns+" FROM agent_tokens WHERE hash = ?", hash(presented)))
-	if errors.Is(err, sql.ErrNoRows) {
-		return AgentToken{}, ErrAgentTokenInvalid
+		`UPDATE agent_tokens SET last_used_at = ?
+		 WHERE hash = ? AND revoked_at IS NULL AND expires_at > ?
+		 RETURNING `+agentTokenColumns,
+		now, hash(presented), now))
+	if err == nil {
+		return tok, nil
 	}
-	if err != nil {
-		return AgentToken{}, fmt.Errorf("read Agent Token: %w", err)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return AgentToken{}, fmt.Errorf("authenticate Agent Token: %w", err)
 	}
-	now := s.now()
+	// Refused: find out why.
+	var revoked sql.NullInt64
+	err = s.db.QueryRowContext(ctx,
+		"SELECT revoked_at FROM agent_tokens WHERE hash = ?", hash(presented)).Scan(&revoked)
 	switch {
-	case tok.RevokedAt != nil:
+	case errors.Is(err, sql.ErrNoRows):
+		return AgentToken{}, ErrAgentTokenInvalid
+	case err != nil:
+		return AgentToken{}, fmt.Errorf("read Agent Token: %w", err)
+	case revoked.Valid:
 		return AgentToken{}, ErrAgentTokenRevoked
-	case !now.Before(tok.ExpiresAt):
+	default:
 		return AgentToken{}, ErrAgentTokenExpired
 	}
-	if _, err := s.db.ExecContext(ctx,
-		"UPDATE agent_tokens SET last_used_at = ? WHERE id = ?", now.UnixMilli(), tok.ID); err != nil {
-		return AgentToken{}, fmt.Errorf("record Agent Token use: %w", err)
-	}
-	return tok, nil
 }
 
 // Denial is why a Delivery was denied. Agents never see it.
@@ -271,27 +279,22 @@ const (
 	DenialPolicy            Denial = "no Policy allows it"
 )
 
-// DeniedError reports a Delivery no Policy allows.
-type DeniedError struct{ Reason Denial }
-
-func (e *DeniedError) Error() string { return "Delivery denied: " + string(e.Reason) }
-
 // Authorize reports whether tok's Policies allow Delivery of secretName in
-// mode, returning a *DeniedError when they do not. A Policy must name the
-// Delivery mode explicitly; allowing proxy never allows reveal.
-func (s *Service) Authorize(tok AgentToken, secretName string, mode config.DeliveryMode) error {
+// mode, and if not, why. A Policy must name the Delivery mode explicitly;
+// allowing proxy never allows reveal.
+func (s *Service) Authorize(tok AgentToken, secretName string, mode config.DeliveryMode) (Denial, bool) {
 	if _, ok := s.cfg.Secrets[secretName]; !ok {
-		return &DeniedError{Reason: DenialUnknownSecretName}
+		return DenialUnknownSecretName, false
 	}
 	for _, name := range tok.Policies {
 		// A Policy removed from the config since issuance allows nothing.
 		for _, a := range s.cfg.Policies[name].Secrets {
 			if a.SecretName == secretName && slices.Contains(a.Delivery, mode) {
-				return nil
+				return "", true
 			}
 		}
 	}
-	return &DeniedError{Reason: DenialPolicy}
+	return DenialPolicy, false
 }
 
 func nullTime(v sql.NullInt64) *time.Time {

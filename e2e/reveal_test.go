@@ -140,7 +140,7 @@ func TestSecretNameConfigIsValidated(t *testing.T) {
 		{"unknown backend", "secrets:\n  github:\n    backend: nope\n    location: kv/github\n", `unknown backend "nope"`},
 		{"missing backend", "secrets:\n  github:\n    location: kv/github\n", "backend is required"},
 		{"missing location", "secrets:\n  github:\n    backend: fake\n", "location is required"},
-		{"control character in location", "secrets:\n  github:\n    backend: fake\n    location: \"kv/\\u001bgithub\"\n", "control characters"},
+		{"control character in location", "secrets:\n  github:\n    backend: fake\n    location: \"kv/\\u001bgithub\"\n", "control character"},
 		{"invalid Secret Name", "secrets:\n  \"bad name\":\n    backend: fake\n    location: kv/github\n", `invalid Secret Name "bad name"`},
 		{"all interfaces", "agent_api:\n  listen: 0.0.0.0:8200\n", "not a loopback address"},
 		{"IPv6 all interfaces", "agent_api:\n  listen: \"[::]:8200\"\n", "not a loopback address"},
@@ -241,11 +241,45 @@ func TestRevealDeliveryRecordsAgentTokenUse(t *testing.T) {
 	}
 }
 
+func TestRevealDeliveryAcceptsEitherTokenHeaderButOnlyGET(t *testing.T) {
+	tc := harness.New(t)
+	srv := tc.Start(revealConfig)
+	waitForPlugin(t, srv, "fake", running)
+	token := issueAgentToken(t, srv, "github-reveal", "1h").Token
+
+	// Auth schemes are case-insensitive.
+	if got := reveal(t, srv, "bearer "+token, "github"); got.Status != http.StatusOK || got.Body != "test-value-2" {
+		t.Errorf("reveal with a lowercase scheme = %d %q, want 200 test-value-2", got.Status, got.Body)
+	}
+	req, err := http.NewRequest(http.MethodGet, srv.AgentURL()+"/v1/reveal/github", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-TC-Agent-Token", token)
+	if got := agentDo(t, req); got.Status != http.StatusOK || got.Body != "test-value-2" {
+		t.Errorf("reveal with X-TC-Agent-Token = %d %q, want 200 test-value-2", got.Status, got.Body)
+	}
+
+	// HEAD would fetch the Secret and deliver nothing.
+	head, err := http.NewRequest(http.MethodHead, srv.AgentURL()+"/v1/reveal/github", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Header.Set("X-TC-Agent-Token", token)
+	if got := agentDo(t, head); got.Status != http.StatusMethodNotAllowed {
+		t.Errorf("HEAD reveal = %d, want 405", got.Status)
+	}
+	if strings.Count(srv.Stderr(), "Delivery allowed") != 2 {
+		t.Errorf("want exactly 2 allowed Deliveries logged:\n%s", srv.Stderr())
+	}
+}
+
 func TestRefusedAgentTokenReturns401(t *testing.T) {
 	tc := harness.New(t)
 	srv := tc.Start(revealConfig)
 	waitForPlugin(t, srv, "fake", running)
-	expired := issueAgentToken(t, srv, "github-reveal", "1s")
+	// Long enough to survive tc's startup and round trip under -race.
+	expired := issueAgentToken(t, srv, "github-reveal", "3s")
 	revoked := issueAgentToken(t, srv, "github-reveal", "1h")
 
 	if got := reveal(t, srv, "Bearer "+revoked.Token, "github"); got.Status != http.StatusOK {
@@ -254,7 +288,7 @@ func TestRefusedAgentTokenReturns401(t *testing.T) {
 	if res := srv.TC("token", "revoke", revoked.ID); res.ExitCode != 0 {
 		t.Fatalf("token revoke: exit %d\n%s", res.ExitCode, res.Stderr)
 	}
-	time.Sleep(1100 * time.Millisecond) // past the expiry
+	time.Sleep(3100 * time.Millisecond) // past the expiry
 
 	cases := []struct {
 		name    string

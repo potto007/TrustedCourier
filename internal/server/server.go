@@ -60,7 +60,9 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		return err
 	}
 
-	pluginCtx, stopPlugins := context.WithCancel(ctx)
+	// Plugins outlive the signal until both APIs have drained, so in-flight
+	// Deliveries can still fetch their Secrets.
+	pluginCtx, stopPlugins := context.WithCancel(context.WithoutCancel(ctx))
 	defer func() {
 		stopPlugins()
 		plugins.Wait()

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
+	"github.com/potto007/TrustedCourier/internal/httpserve"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
 )
 
@@ -114,22 +115,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		ConnContext:       withPeer,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 	}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
-	select {
-	case err := <-errc:
-		return err
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return err
-		}
-		if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
-	}
+	return httpserve.Serve(ctx, srv, ln)
 }
 
 type peerKey struct{}

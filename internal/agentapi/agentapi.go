@@ -17,7 +17,9 @@ import (
 
 	"github.com/potto007/TrustedCourier/internal/access"
 	"github.com/potto007/TrustedCourier/internal/config"
+	"github.com/potto007/TrustedCourier/internal/httpserve"
 	"github.com/potto007/TrustedCourier/internal/resolver"
+	"github.com/potto007/TrustedCourier/internal/secret"
 )
 
 // AgentTokenHeader carries the Agent Token when Authorization cannot.
@@ -64,25 +66,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           noStore(mux),
 		ReadHeaderTimeout: 10 * time.Second,
-		MaxHeaderBytes:    64 << 10,
-		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
+		// A client that stops reading must not pin a Secret's locked memory.
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    time.Minute,
+		MaxHeaderBytes: 64 << 10,
+		ErrorLog:       slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 	}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
-	select {
-	case err := <-errc:
-		return err
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return err
-		}
-		if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
-	}
+	return httpserve.Serve(ctx, srv, ln)
 }
 
 // noStore keeps every Agent API response, Secret or not, out of caches.
@@ -95,6 +85,13 @@ func noStore(next http.Handler) http.Handler {
 }
 
 func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
+	// A GET pattern also matches HEAD, which would fetch a Secret and deliver
+	// nothing.
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	tok, ok := s.authenticate(w, r)
 	if !ok {
 		return
@@ -102,19 +99,19 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("secret_name")
 	log := s.log.With("delivery", config.DeliveryReveal, "agent_token_id", tok.ID, "secret_name", name)
 
-	if err := s.access.Authorize(tok, name, config.DeliveryReveal); err != nil {
-		var denied *access.DeniedError
-		if !errors.As(err, &denied) {
-			s.internalError(w, log, err)
-			return
-		}
-		log.Info("Delivery denied", "reason", denied.Reason)
+	if reason, allowed := s.access.Authorize(tok, name, config.DeliveryReveal); !allowed {
+		log.Info("Delivery denied", "reason", reason)
 		writeError(w, http.StatusForbidden, deniedMessage)
 		return
 	}
 
 	value, err := s.secrets.Resolve(r.Context(), name)
-	if err != nil {
+	switch {
+	case errors.Is(err, secret.ErrLockedMemory):
+		log.Error("Delivery failed: no locked memory to hold the Secret; raise RLIMIT_MEMLOCK", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "the Secret cannot be held safely right now; try again later")
+		return
+	case err != nil:
 		log.Error("Delivery failed: Secret not fetched", "error", err)
 		writeError(w, http.StatusBadGateway, "the Secret could not be fetched")
 		return
@@ -136,8 +133,8 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (access.AgentToken, bool) {
 	var presented []string
 	for _, v := range r.Header.Values("Authorization") {
-		token, ok := strings.CutPrefix(v, "Bearer ")
-		if !ok {
+		scheme, token, _ := strings.Cut(v, " ")
+		if !strings.EqualFold(scheme, "Bearer") {
 			unauthorized(w, "Authorization must be a Bearer Agent Token")
 			return access.AgentToken{}, false
 		}
@@ -162,8 +159,11 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (access.Ag
 		errors.Is(err, access.ErrAgentTokenExpired),
 		errors.Is(err, access.ErrAgentTokenRevoked):
 		unauthorized(w, err.Error())
+	case r.Context().Err() != nil:
+		// The Agent went away; there is no one to answer.
 	default:
-		s.internalError(w, s.log, err)
+		s.log.Error("Agent API request failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
 	}
 	return access.AgentToken{}, false
 }
@@ -171,11 +171,6 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (access.Ag
 func unauthorized(w http.ResponseWriter, msg string) {
 	w.Header().Set("WWW-Authenticate", `Bearer realm="TrustedCourier"`)
 	writeError(w, http.StatusUnauthorized, msg)
-}
-
-func (s *Server) internalError(w http.ResponseWriter, log *slog.Logger, err error) {
-	log.Error("Agent API request failed", "error", err)
-	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
 type errorResponse struct {
