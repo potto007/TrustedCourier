@@ -1,12 +1,14 @@
 // Package store opens TrustedCourier's embedded SQLite database. It holds only
 // Agent Token hashes and metadata, the Operator Credential hash, and (later)
-// Audit Records; never Secrets or Courier Keys (ADR-0001).
+// Audit Records; never Secrets or Courier Keys (ADR-0001, ADR-0009).
 package store
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 const FileName = "trustedcourier.db"
 
 // migrations are applied in order; PRAGMA user_version records how many ran.
+// Timestamps are Unix milliseconds.
 var migrations = []string{
 	`CREATE TABLE operator_credential (
 		id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -35,20 +38,26 @@ var migrations = []string{
 	);`,
 }
 
-// Open creates dataDir if needed, opens the database with owner-only
-// permissions, and applies pending migrations.
+// Open creates dataDir if needed, restricts it and the database files to
+// the owner, and applies pending migrations. dataDir must be absolute.
 func Open(ctx context.Context, dataDir string) (*sql.DB, error) {
+	if !filepath.IsAbs(dataDir) {
+		return nil, fmt.Errorf("data directory %q is not an absolute path", dataDir)
+	}
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
 	path := filepath.Join(dataDir, FileName)
-	// Create the file ourselves so SQLite (and its -wal/-shm files, which copy
-	// the database's mode) never gets a world-readable default.
+	// Create the file ourselves so SQLite never gets a world-readable
+	// default, and tighten modes an existing installation may have loosened.
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create database: %w", err)
 	}
 	_ = f.Close()
+	if err := restrict(dataDir, path); err != nil {
+		return nil, err
+	}
 
 	dsn := (&url.URL{
 		Scheme:   "file",
@@ -67,30 +76,52 @@ func Open(ctx context.Context, dataDir string) (*sql.DB, error) {
 	return db, nil
 }
 
-func migrate(ctx context.Context, db *sql.DB) error {
-	var version int
-	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
-		return fmt.Errorf("read schema version: %w", err)
+func restrict(dataDir, dbPath string) error {
+	if err := os.Chmod(dataDir, 0o700); err != nil {
+		return fmt.Errorf("restrict data directory: %w", err)
 	}
-	if version > len(migrations) {
-		return fmt.Errorf("database schema version %d is newer than this TrustedCourier (%d)", version, len(migrations))
-	}
-	for i := version; i < len(migrations); i++ {
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("apply migration %d: %w", i+1, err)
-		}
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", i+1)); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("restrict database file: %w", err)
 		}
 	}
 	return nil
+}
+
+// migrate applies pending migrations one transaction at a time. Each
+// transaction takes SQLite's write lock (_txlock=immediate) before reading
+// the schema version, so concurrent opens cannot apply the same migration.
+func migrate(ctx context.Context, db *sql.DB) error {
+	for {
+		done, err := migrateOnce(ctx, db)
+		if err != nil || done {
+			return err
+		}
+	}
+}
+
+func migrateOnce(ctx context.Context, db *sql.DB) (done bool, err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var version int
+	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return false, fmt.Errorf("read schema version: %w", err)
+	}
+	switch {
+	case version > len(migrations):
+		return false, fmt.Errorf("database schema version %d is newer than this TrustedCourier (%d)", version, len(migrations))
+	case version == len(migrations):
+		return true, nil
+	}
+	if _, err := tx.ExecContext(ctx, migrations[version]); err != nil {
+		return false, fmt.Errorf("apply migration %d: %w", version+1, err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", version+1)); err != nil {
+		return false, err
+	}
+	return false, tx.Commit()
 }

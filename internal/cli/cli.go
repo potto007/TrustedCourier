@@ -8,8 +8,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -54,6 +56,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 1 && slices.Contains([]string{"-h", "--help", "help"}, args[0]) {
+		return flag.ErrHelp
+	}
 	if len(args) < 2 {
 		return fmt.Errorf("%w: missing command", errUsage)
 	}
@@ -93,6 +98,9 @@ func serverRun(args []string, stdout, stderr io.Writer) error {
 	configPath := fs.String("config", "", "config file path")
 	if err := parseFlags(fs, args); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%w: server run: unexpected argument %q", errUsage, fs.Arg(0))
 	}
 	if *configPath == "" {
 		return fmt.Errorf("%w: server run: --config is required", errUsage)
@@ -193,9 +201,12 @@ func parseExpiry(expiresIn, expiresAt string, now time.Time) (time.Time, error) 
 func parseLifetime(s string) (time.Duration, error) {
 	var d time.Duration
 	if days, ok := strings.CutSuffix(s, "d"); ok {
-		n, err := strconv.Atoi(days)
+		n, err := strconv.ParseInt(days, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("invalid lifetime %q", s)
+		}
+		if n > int64(math.MaxInt64/(24*time.Hour)) {
+			return 0, fmt.Errorf("lifetime %q is too long", s)
 		}
 		d = time.Duration(n) * 24 * time.Hour
 	} else {
@@ -215,6 +226,9 @@ func tokenList(args []string, stdout io.Writer) error {
 	asJSON := fs.Bool("json", false, "print JSON")
 	if err := parseFlags(fs, args); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%w: token list: unexpected argument %q", errUsage, fs.Arg(0))
 	}
 	client, err := adminClient()
 	if err != nil {

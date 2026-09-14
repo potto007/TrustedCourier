@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
@@ -19,32 +21,68 @@ import (
 
 // Listen binds the admin unix socket. A stale socket file left by a crashed
 // process is replaced; a live one is an error.
-func Listen(socket string) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+//
+// The peer-credential check is the gate. File modes are defense in depth:
+// when only the server's own user is allowed, the socket is owner-only;
+// when other users are allowed, it must be connectable by them.
+func Listen(socket string, allowedUIDs []int) (net.Listener, error) {
+	ownerOnly := !slices.ContainsFunc(allowedUIDs, func(uid int) bool { return uid != os.Getuid() })
+	dirMode, sockMode := os.FileMode(0o700), os.FileMode(0o600)
+	if !ownerOnly {
+		dirMode, sockMode = 0o711, 0o666
+	}
+
+	if err := os.MkdirAll(filepath.Dir(socket), dirMode); err != nil {
 		return nil, fmt.Errorf("create admin socket directory: %w", err)
 	}
-	if info, err := os.Lstat(socket); err == nil {
-		if info.Mode().Type() != os.ModeSocket {
-			return nil, fmt.Errorf("admin socket path %s exists and is not a socket", socket)
-		}
-		if conn, err := net.Dial("unix", socket); err == nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("another process is serving the admin socket %s", socket)
-		}
-		if err := os.Remove(socket); err != nil {
-			return nil, fmt.Errorf("remove stale admin socket: %w", err)
-		}
+	if err := removeStaleSocket(socket); err != nil {
+		return nil, err
 	}
-	ln, err := net.Listen("unix", socket)
+	var ln net.Listener
+	// Bind owner-only so the socket is never more open than intended, then
+	// widen it if other users are allowed.
+	err := withUmask(0o177, func() error {
+		var err error
+		ln, err = net.Listen("unix", socket)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("listen on admin socket: %w", err)
 	}
-	// The peer-credential check is the gate; the mode is defense in depth.
-	if err := os.Chmod(socket, 0o600); err != nil {
+	if err := os.Chmod(socket, sockMode); err != nil {
 		_ = ln.Close()
-		return nil, fmt.Errorf("restrict admin socket: %w", err)
+		return nil, fmt.Errorf("set admin socket mode: %w", err)
 	}
 	return ln, nil
+}
+
+// removeStaleSocket removes socket only when it is a socket nothing listens
+// on. Any other dial failure (a full backlog, a permission error) may mean a
+// live server, so it is reported rather than unlinked.
+func removeStaleSocket(socket string) error {
+	info, err := os.Lstat(socket)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect admin socket: %w", err)
+	}
+	if info.Mode().Type() != os.ModeSocket {
+		return fmt.Errorf("admin socket path %s exists and is not a socket", socket)
+	}
+	conn, err := net.Dial("unix", socket)
+	switch {
+	case err == nil:
+		_ = conn.Close()
+		return fmt.Errorf("another process is serving the admin socket %s", socket)
+	case errors.Is(err, syscall.ECONNREFUSED):
+		if err := os.Remove(socket); err != nil {
+			return fmt.Errorf("remove stale admin socket: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("admin socket %s may be in use: %w", socket, err)
+	}
 }
 
 // Server serves the admin API.
@@ -108,7 +146,10 @@ func withPeer(ctx context.Context, c net.Conn) context.Context {
 
 func (s *Server) requirePeer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p, _ := r.Context().Value(peerKey{}).(peer)
+		p, ok := r.Context().Value(peerKey{}).(peer)
+		if !ok {
+			p.err = errors.New("peer credentials were not recorded")
+		}
 		if p.err != nil {
 			s.log.Warn("admin connection refused: peer credentials unavailable", "error", p.err)
 			writeError(w, http.StatusForbidden, "admin socket: connecting user is not allowed")

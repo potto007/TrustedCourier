@@ -66,7 +66,7 @@ type fileConfig struct {
 
 type fileAdmin struct {
 	Socket      string `yaml:"socket"`
-	AllowedUIDs []int  `yaml:"allowed_uids"`
+	AllowedUIDs *[]int `yaml:"allowed_uids"` // nil when omitted
 }
 
 type filePolicy struct {
@@ -79,7 +79,7 @@ type fileSecretAccess struct {
 }
 
 // Load reads and validates the config file at path. Relative paths in the
-// file are resolved against the file's directory.
+// file are resolved to absolute paths against the file's directory.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -91,7 +91,15 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	cfg, err := raw.validate(filepath.Dir(path))
+	// A second document would otherwise be silently ignored.
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: config must be a single YAML document", path)
+	}
+	baseDir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := raw.validate(baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
@@ -110,9 +118,12 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 	if raw.Admin.Socket != "" {
 		cfg.Admin.Socket = resolve(baseDir, raw.Admin.Socket)
 	}
-	cfg.Admin.AllowedUIDs = raw.Admin.AllowedUIDs
-	if len(cfg.Admin.AllowedUIDs) == 0 {
-		cfg.Admin.AllowedUIDs = []int{os.Getuid()}
+	cfg.Admin.AllowedUIDs = []int{os.Getuid()}
+	if raw.Admin.AllowedUIDs != nil {
+		if len(*raw.Admin.AllowedUIDs) == 0 {
+			return nil, errors.New("admin.allowed_uids is empty, so no local user could administer TrustedCourier; omit it to allow only the server's own user")
+		}
+		cfg.Admin.AllowedUIDs = *raw.Admin.AllowedUIDs
 	}
 
 	// Validate in name order so the reported error is deterministic.

@@ -132,12 +132,46 @@ func TestRevokeUnknownAgentTokenFails(t *testing.T) {
 	}
 }
 
+func TestFarFutureExpiryIsListedAsIssued(t *testing.T) {
+	tc := harness.New(t)
+	srv := tc.Start(harness.BaseConfig)
+
+	res := srv.TC("token", "issue", "--policy", "openai-proxy", "--expires-at", "9999-12-31T23:59:59Z", "--json")
+	var issued struct {
+		ID string `json:"id"`
+	}
+	if res.ExitCode != 0 || json.Unmarshal([]byte(res.Stdout), &issued) != nil {
+		t.Fatalf("token issue: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+
+	list := srv.TC("token", "list")
+	if !strings.Contains(list.Stdout, "9999-12-31T23:59:59Z") {
+		t.Fatalf("token list does not show the issued expiry:\n%s%s", list.Stdout, list.Stderr)
+	}
+	if got := listStatuses(t, srv)[issued.ID]; got != "active" {
+		t.Fatalf("status = %q, want active", got)
+	}
+}
+
+func TestOverlongLifetimeIsRejected(t *testing.T) {
+	tc := harness.New(t)
+	srv := tc.Start(harness.BaseConfig)
+
+	res := srv.TC("token", "issue", "--policy", "openai-proxy", "--expires-in", "213504d")
+	if res.ExitCode == 0 {
+		t.Fatalf("token issue accepted a lifetime that overflows; stdout:\n%s", res.Stdout)
+	}
+	if !strings.Contains(res.Stderr, "too long") {
+		t.Fatalf("error does not say the lifetime is too long:\n%s", res.Stderr)
+	}
+}
+
 func TestExpiredAgentTokenListsAsExpired(t *testing.T) {
 	tc := harness.New(t)
 	srv := tc.Start(harness.BaseConfig)
-	id := issueJSONExpiring(t, srv, "1s", "openai-proxy")
+	id := issueJSONExpiring(t, srv, "2s", "openai-proxy")
 
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 	if got := listStatuses(t, srv)[id]; got != "expired" {
 		t.Fatalf("status = %q, want expired", got)
 	}

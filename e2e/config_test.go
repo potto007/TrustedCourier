@@ -8,6 +8,19 @@ import (
 	"github.com/potto007/TrustedCourier/e2e/harness"
 )
 
+func TestRelativeDataDirResolvesAgainstConfigFile(t *testing.T) {
+	tc := harness.New(t)
+	// The harness writes the config file next to DataDir, whose base is "data".
+	srv := tc.Start(strings.Replace(harness.BaseConfig, "{{.DataDir}}", "./data", 1))
+
+	if res := srv.TC("token", "list"); res.ExitCode != 0 {
+		t.Fatalf("token list: exit %d\n%s", res.ExitCode, res.Stderr)
+	}
+	if _, err := os.Stat(tc.DataDir); err != nil {
+		t.Fatalf("data directory not created next to the config file: %v", err)
+	}
+}
+
 func TestInvalidConfigIsRefused(t *testing.T) {
 	const header = `
 data_dir: {{.DataDir}}
@@ -80,6 +93,28 @@ policies:
         delivery: [reveal]
 `,
 			wantErr: `"openai" more than once`,
+		},
+		{
+			name: "more than one YAML document",
+			config: header + `
+---
+policies:
+  p:
+    secrets:
+      - name: openai
+        delivery: [proxy]
+`,
+			wantErr: "single YAML document",
+		},
+		{
+			name: "empty allowed_uids",
+			config: `
+data_dir: {{.DataDir}}
+admin:
+  socket: {{.Socket}}
+  allowed_uids: []
+`,
+			wantErr: "allowed_uids",
 		},
 		{
 			name: "Policy defined twice",

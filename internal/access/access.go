@@ -41,32 +41,34 @@ func New(db *sql.DB, cfg *config.Config) *Service {
 }
 
 // EnsureOperatorCredential creates the Operator Credential on first boot and
-// returns its value. It returns "" when the credential already exists, since
-// the value is never recoverable after first boot.
-func (s *Service) EnsureOperatorCredential(ctx context.Context) (string, error) {
+// passes its value to show, the only time the value exists. The credential
+// is kept only if show succeeds, so a first boot that cannot show it leaves
+// the next boot to try again. When the credential already exists, show is
+// not called.
+func (s *Service) EnsureOperatorCredential(ctx context.Context, show func(credential string) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	var exists int
 	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM operator_credential").Scan(&exists); err != nil {
-		return "", fmt.Errorf("read Operator Credential: %w", err)
+		return fmt.Errorf("read Operator Credential: %w", err)
 	}
 	if exists > 0 {
-		return "", nil
+		return nil
 	}
 	credential := OperatorCredentialPrefix + randomString(32)
 	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO operator_credential (id, hash, created_at) VALUES (1, ?, ?)",
-		hash(credential), s.now().UnixNano()); err != nil {
-		return "", fmt.Errorf("store Operator Credential: %w", err)
+		hash(credential), s.now().UnixMilli()); err != nil {
+		return fmt.Errorf("store Operator Credential: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return "", err
+	if err := show(credential); err != nil {
+		return fmt.Errorf("show Operator Credential: %w", err)
 	}
-	return credential, nil
+	return tx.Commit()
 }
 
 // VerifyOperatorCredential reports whether presented is the Operator
@@ -126,12 +128,14 @@ func (s *Service) IssueAgentToken(ctx context.Context, policies []string, expire
 		return IssuedAgentToken{}, err
 	}
 
+	// Timestamps are stored as Unix milliseconds, so return them at that
+	// precision too.
 	issued := IssuedAgentToken{
 		AgentToken: AgentToken{
 			ID:        randomString(10),
 			Policies:  names,
-			CreatedAt: now.UTC(),
-			ExpiresAt: expiresAt.UTC(),
+			CreatedAt: time.UnixMilli(now.UnixMilli()).UTC(),
+			ExpiresAt: time.UnixMilli(expiresAt.UnixMilli()).UTC(),
 		},
 		Token: AgentTokenPrefix + randomString(32),
 	}
@@ -139,7 +143,7 @@ func (s *Service) IssueAgentToken(ctx context.Context, policies []string, expire
 		`INSERT INTO agent_tokens (id, hash, policies, created_at, expires_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		issued.ID, hash(issued.Token), string(encodedPolicies),
-		issued.CreatedAt.UnixNano(), issued.ExpiresAt.UnixNano()); err != nil {
+		issued.CreatedAt.UnixMilli(), issued.ExpiresAt.UnixMilli()); err != nil {
 		return IssuedAgentToken{}, fmt.Errorf("store Agent Token: %w", err)
 	}
 	return issued, nil
@@ -155,7 +159,7 @@ func (e *NotFoundError) Error() string { return fmt.Sprintf("no Agent Token with
 func (s *Service) RevokeAgentToken(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx,
 		"UPDATE agent_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
-		s.now().UnixNano(), id)
+		s.now().UnixMilli(), id)
 	if err != nil {
 		return fmt.Errorf("revoke Agent Token: %w", err)
 	}
@@ -203,8 +207,8 @@ func (s *Service) ListAgentTokens(ctx context.Context) ([]AgentToken, error) {
 		if err := json.Unmarshal([]byte(policies), &tok.Policies); err != nil {
 			return nil, fmt.Errorf("Agent Token %s: decode Policies: %w", tok.ID, err)
 		}
-		tok.CreatedAt = time.Unix(0, created).UTC()
-		tok.ExpiresAt = time.Unix(0, expires).UTC()
+		tok.CreatedAt = time.UnixMilli(created).UTC()
+		tok.ExpiresAt = time.UnixMilli(expires).UTC()
 		tok.LastUsedAt = nullTime(lastUsed)
 		tok.RevokedAt = nullTime(revoked)
 		tokens = append(tokens, tok)
@@ -216,7 +220,7 @@ func nullTime(v sql.NullInt64) *time.Time {
 	if !v.Valid {
 		return nil
 	}
-	t := time.Unix(0, v.Int64).UTC()
+	t := time.UnixMilli(v.Int64).UTC()
 	return &t
 }
 

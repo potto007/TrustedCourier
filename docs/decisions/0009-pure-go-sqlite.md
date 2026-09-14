@@ -21,7 +21,7 @@ TrustedCourier keeps Agent Token hashes, the Operator Credential hash, and Audit
 Chosen option: "modernc.org/sqlite", because it keeps the core cgo-free, so a static binary and cross-compilation need no C toolchain, and it is the most widely used pure-Go driver.
 
 * The driver does no cryptography, so it has no bearing on the FIPS boundary; hashing stays in Go's validated module.
-* The database file is created owner-only (0600) before SQLite opens it; its WAL and shared-memory files inherit that mode.
+* The data directory and database files (including WAL and shared-memory files) are restricted to the owner (0700 and 0600) on every open, tightening modes an existing installation may have loosened.
 * Schema migrations are ordered SQL statements tracked with `PRAGMA user_version`.
 
 ### Consequences

@@ -29,19 +29,22 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	}
 	defer func() { _ = db.Close() }()
 
-	svc := access.New(db, cfg)
-	credential, err := svc.EnsureOperatorCredential(ctx)
+	// Bind before creating the Operator Credential: it is shown only once,
+	// so nothing that can still fail may come between showing it and serving.
+	ln, err := admin.Listen(cfg.Admin.Socket, cfg.Admin.AllowedUIDs)
 	if err != nil {
 		return err
 	}
-	if credential != "" {
-		fmt.Fprintf(stdout, "Operator Credential (shown once; store it now, it cannot be shown again):\n%s\n", credential)
+	defer func() { _ = ln.Close() }()
+
+	svc := access.New(db, cfg)
+	if err := svc.EnsureOperatorCredential(ctx, func(credential string) error {
+		_, err := fmt.Fprintf(stdout, "Operator Credential (shown once; store it now, it cannot be shown again):\n%s\n", credential)
+		return err
+	}); err != nil {
+		return err
 	}
 
-	ln, err := admin.Listen(cfg.Admin.Socket)
-	if err != nil {
-		return err
-	}
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
 	return admin.NewServer(svc, cfg.Admin.AllowedUIDs, log).Serve(ctx, ln)
 }
