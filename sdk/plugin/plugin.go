@@ -86,14 +86,18 @@ func (s *server) Capabilities(context.Context, *protocol.CapabilitiesRequest) (*
 
 func (s *server) Health(ctx context.Context, _ *protocol.HealthRequest) (*protocol.HealthResponse, error) {
 	detail, err := s.backend.Health(ctx)
-	healthy := err == nil
-	if !healthy {
-		detail = contract.Sanitize(err.Error())
+	if cerr := contract.Detail(detail); cerr != nil {
+		return nil, malformed(cerr)
 	}
-	if err := contract.Detail(detail); err != nil {
-		return nil, malformed(err)
+	if err == nil {
+		return &protocol.HealthResponse{Healthy: true, Detail: detail}, nil
 	}
-	return &protocol.HealthResponse{Healthy: healthy, Detail: detail}, nil
+	// The error says what is wrong; the detail still describes the Backend.
+	msg := err.Error()
+	if detail != "" {
+		msg += " (" + detail + ")"
+	}
+	return &protocol.HealthResponse{Detail: contract.Sanitize(msg)}, nil
 }
 
 func (s *server) Get(ctx context.Context, req *protocol.GetRequest) (*protocol.GetResponse, error) {

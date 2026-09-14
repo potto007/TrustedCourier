@@ -228,8 +228,45 @@ backend_plugins:
 	if strings.Contains(srv.Stderr(), "panic") {
 		t.Errorf("TrustedCourier panicked:\n%s", srv.Stderr())
 	}
+	// The plugin's log message tried to start a line of its own.
+	waitFor(t, func() bool { return strings.Contains(srv.Stderr(), "forged entry") })
+	for line := range strings.Lines(srv.Stderr()) {
+		if strings.HasPrefix(line, "[FORGED]") {
+			t.Errorf("a Backend Plugin forged a server log line: %q", line)
+		}
+		if strings.ContainsRune(line, '\u009b') {
+			t.Errorf("server log relayed a C1 control character from a Backend Plugin: %q", line)
+		}
+	}
 	if again := backendPlugins(t, srv)["malformed"]; again.PID != p.PID || again.Restarts != 0 {
 		t.Errorf("malformed responses restarted the Backend Plugin: %+v, then %+v", p, again)
+	}
+}
+
+func TestUnhealthyBackendPluginKeepsItsDetail(t *testing.T) {
+	tc := harness.New(t)
+	srv := tc.Start(harness.BaseConfig + `
+backend_plugins:
+  unhealthy:
+    path: {{.Unhealthy.Path}}
+    sha256: {{.Unhealthy.SHA256}}
+    insecure_share_core_user: true
+`)
+
+	p := waitForPlugin(t, srv, "unhealthy", running)
+	if p.Healthy || !strings.Contains(p.Detail, "Backend sealed") || !strings.Contains(p.Detail, "fake Backend, uid=") {
+		t.Fatalf("unhealthy Backend Plugin reported as %v %q, want unhealthy with its error and detail", p.Healthy, p.Detail)
+	}
+}
+
+func waitFor(t *testing.T, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

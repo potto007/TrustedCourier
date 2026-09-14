@@ -5,13 +5,16 @@
 //
 //	go build -ldflags "-X main.mode=crash" ./internal/fakebackend
 //
-// Modes: "" is a well-behaved Backend built on the SDK; "crash" exits before
-// the handshake; "malformed" bypasses the SDK and breaks the protocol
-// contract in every response. label, when set, appears in the health detail.
+// Modes: "" is a well-behaved Backend built on the SDK; "unhealthy" is the
+// same but reports itself unhealthy; "crash" exits before the handshake;
+// "malformed" bypasses the SDK, breaks the protocol contract in every
+// response, and writes a forged log line. label, when set, appears in the
+// health detail.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -29,12 +32,15 @@ var (
 
 func main() {
 	switch mode {
-	case "":
+	case "", "unhealthy":
 		plugin.Serve(newBackend())
 	case "crash":
 		fmt.Fprintln(os.Stderr, "fakebackend: crashing on purpose")
 		os.Exit(3)
 	case "malformed":
+		// A log line whose message tries to forge a second server log line
+		// and drive the terminal with an 8-bit CSI.
+		fmt.Fprintln(os.Stderr, `{"@level":"error","@message":"ok\n[FORGED] admin: forged entry \u009b2J"}`)
 		protocol.Serve(malformedBackend{})
 	default:
 		fmt.Fprintf(os.Stderr, "fakebackend: unknown mode %q\n", mode)
@@ -46,6 +52,8 @@ func main() {
 var Secrets = map[string]string{
 	"kv/openai": "test-value-1",
 	"kv/github": "test-value-2",
+	// Non-ASCII, with a multi-byte character across its midpoint.
+	"kv/üabc": "test-value-3",
 }
 
 type backend struct {
@@ -90,6 +98,9 @@ func (b *backend) Health(context.Context) (string, error) {
 	detail := fmt.Sprintf("fake Backend, uid=%d gid=%d", os.Getuid(), os.Getgid())
 	if label != "" {
 		detail += ", " + label
+	}
+	if mode == "unhealthy" {
+		return detail, errors.New("Backend sealed")
 	}
 	return detail, nil
 }

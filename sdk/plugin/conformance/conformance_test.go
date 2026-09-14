@@ -25,6 +25,7 @@ var fakeFixture = conformance.Fixture{
 	Secrets: map[string][]byte{
 		"kv/openai": []byte("test-value-1"),
 		"kv/github": []byte("test-value-2"),
+		"kv/üabc":   []byte("test-value-3"),
 	},
 	Missing:            "kv/missing",
 	CourierKeyLocation: "courier/tls-key",

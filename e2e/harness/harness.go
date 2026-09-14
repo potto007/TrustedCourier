@@ -65,6 +65,7 @@ func buildAndRun(m *testing.M, dir string) (int, error) {
 	}{
 		{&FakePlugin, "fake", ""},
 		{&ReplacementPlugin, "replacement", "-X main.label=replacement"},
+		{&UnhealthyPlugin, "unhealthy", "-X main.mode=unhealthy"},
 		{&CrashingPlugin, "crashing", "-X main.mode=crash"},
 		{&MalformedPlugin, "malformed", "-X main.mode=malformed"},
 	} {
@@ -86,9 +87,10 @@ type PluginBinary struct {
 // Variants of the fake Backend Plugin built on the plugin SDK, each with its
 // own hash. FakePlugin is well behaved and reports its uid in its health
 // detail; ReplacementPlugin is the same with "replacement" in the detail;
+// UnhealthyPlugin reports "Backend sealed" alongside that detail;
 // CrashingPlugin exits before the handshake; MalformedPlugin breaks the
-// protocol contract in every response.
-var FakePlugin, ReplacementPlugin, CrashingPlugin, MalformedPlugin PluginBinary
+// protocol contract in every response and writes a forged log line.
+var FakePlugin, ReplacementPlugin, UnhealthyPlugin, CrashingPlugin, MalformedPlugin PluginBinary
 
 func buildPlugin(sdkDir, out, ldflags string) (PluginBinary, error) {
 	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", out, "./internal/fakebackend")
@@ -153,6 +155,7 @@ type ConfigVars struct {
 	Socket    string
 	UID       int
 	Fake      PluginBinary
+	Unhealthy PluginBinary
 	Crashing  PluginBinary
 	Malformed PluginBinary
 }
@@ -232,6 +235,7 @@ func (in *Installation) writeConfig(tmpl string) string {
 		Socket:    in.Socket,
 		UID:       os.Getuid(),
 		Fake:      FakePlugin,
+		Unhealthy: UnhealthyPlugin,
 		Crashing:  CrashingPlugin,
 		Malformed: MalformedPlugin,
 	}

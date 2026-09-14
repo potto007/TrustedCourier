@@ -5,6 +5,7 @@
 package pluginhost
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,8 +16,11 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/potto007/TrustedCourier/internal/config"
@@ -286,17 +290,21 @@ func (p *supervised) status(ctx context.Context) Status {
 }
 
 // sanitizingWriter keeps text relayed from plugin output from forging log
-// lines or driving a terminal: control characters other than newline and tab
-// become '?'.
+// lines or driving a terminal. hclog writes one entry per Write, so only a
+// trailing newline is kept; any other control character (C0, DEL, C1), and
+// invalid UTF-8, becomes '?'.
 type sanitizingWriter struct{ w io.Writer }
 
 func (s sanitizingWriter) Write(b []byte) (int, error) {
-	clean := make([]byte, len(b))
-	for i, c := range b {
-		if (c < 0x20 && c != '\n' && c != '\t') || c == 0x7f {
-			c = '?'
+	body, newline := bytes.CutSuffix(b, []byte("\n"))
+	clean := []byte(strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || (unicode.IsControl(r) && r != '\t') {
+			return '?'
 		}
-		clean[i] = c
+		return r
+	}, string(body)))
+	if newline {
+		clean = append(clean, '\n')
 	}
 	if _, err := s.w.Write(clean); err != nil {
 		return 0, err

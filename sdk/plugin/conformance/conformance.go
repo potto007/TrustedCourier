@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/potto007/TrustedCourier/sdk/plugin"
 	"github.com/potto007/TrustedCourier/sdk/plugin/client"
@@ -98,7 +99,7 @@ func Run(t *testing.T, binary string, f Fixture) {
 			if !slices.Contains(all, loc) {
 				t.Errorf("List(\"\") does not include %q", loc)
 			}
-			prefix := loc[:len(loc)/2]
+			prefix := halfPrefix(loc)
 			some, err := c.List(ctx(t), prefix)
 			if err != nil {
 				t.Errorf("List(%q): %v", prefix, err)
@@ -133,6 +134,16 @@ func Run(t *testing.T, binary string, f Fixture) {
 			t.Error("Get after WriteCourierKey returned a different value")
 		}
 	})
+}
+
+// halfPrefix returns about the first half of loc, cut at a character
+// boundary so the prefix stays valid UTF-8.
+func halfPrefix(loc string) string {
+	i := len(loc) / 2
+	for i > 0 && !utf8.RuneStart(loc[i]) {
+		i--
+	}
+	return loc[:i]
 }
 
 func ctx(t *testing.T) context.Context {
