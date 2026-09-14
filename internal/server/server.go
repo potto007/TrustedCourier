@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 
 	"github.com/potto007/TrustedCourier/internal/access"
 	"github.com/potto007/TrustedCourier/internal/admin"
+	"github.com/potto007/TrustedCourier/internal/agentapi"
 	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
+	"github.com/potto007/TrustedCourier/internal/resolver"
 	"github.com/potto007/TrustedCourier/internal/store"
 )
 
@@ -41,6 +44,13 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		return err
 	}
 	defer func() { _ = ln.Close() }()
+	var agentLn net.Listener
+	if cfg.AgentAPI.Listen != "" {
+		if agentLn, err = agentapi.Listen(cfg.AgentAPI.Listen); err != nil {
+			return err
+		}
+		defer func() { _ = agentLn.Close() }()
+	}
 
 	svc := access.New(db, cfg)
 	if err := svc.EnsureOperatorCredential(ctx, func(credential string) error {
@@ -57,6 +67,27 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	}()
 	plugins.Start(pluginCtx)
 
+	// When either API stops, stop the other.
+	serveCtx, stopServing := context.WithCancel(ctx)
+	defer stopServing()
+	errc := make(chan error, 2)
+	serving := 1
+	go func() {
+		errc <- admin.NewServer(svc, plugins, cfg.Admin.AllowedUIDs, log).Serve(serveCtx, ln)
+	}()
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
-	return admin.NewServer(svc, plugins, cfg.Admin.AllowedUIDs, log).Serve(ctx, ln)
+	if agentLn != nil {
+		serving++
+		agent := agentapi.NewServer(svc, resolver.New(cfg, plugins), log)
+		go func() { errc <- agent.Serve(serveCtx, agentLn) }()
+		log.Info("Agent API listening", "address", agentLn.Addr().String())
+	}
+	var firstErr error
+	for range serving {
+		if err := <-errc; err != nil && firstErr == nil {
+			firstErr = err
+		}
+		stopServing()
+	}
+	return firstErr
 }

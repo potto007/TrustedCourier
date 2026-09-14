@@ -24,6 +24,7 @@ import (
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/potto007/TrustedCourier/internal/config"
+	"github.com/potto007/TrustedCourier/internal/secret"
 	"github.com/potto007/TrustedCourier/sdk/plugin/client"
 )
 
@@ -43,6 +44,7 @@ const (
 	stableAfter   = time.Minute
 	exitPoll      = 100 * time.Millisecond
 	healthTimeout = 5 * time.Second
+	getTimeout    = 10 * time.Second
 )
 
 // Host supervises the configured Backend Plugins.
@@ -123,6 +125,33 @@ func (h *Host) Status(ctx context.Context) []Status {
 	}
 	wg.Wait()
 	return out
+}
+
+// ErrNotRunning reports a Backend Plugin that is not running, such as one
+// being restarted.
+var ErrNotRunning = errors.New("Backend Plugin is not running")
+
+// Get fetches the Secret at location from the named Backend Plugin. The
+// caller must Release it.
+func (h *Host) Get(ctx context.Context, backendPlugin, location string) (*secret.Secret, error) {
+	i := slices.IndexFunc(h.plugins, func(p *supervised) bool { return p.cfg.Name == backendPlugin })
+	if i < 0 {
+		return nil, fmt.Errorf("Backend Plugin %q is not configured", backendPlugin)
+	}
+	p := h.plugins[i]
+	p.mu.Lock()
+	c := p.client
+	p.mu.Unlock()
+	if c == nil {
+		return nil, fmt.Errorf("Backend Plugin %q: %w", backendPlugin, ErrNotRunning)
+	}
+	gctx, cancel := context.WithTimeout(ctx, getTimeout)
+	defer cancel()
+	value, err := c.Get(gctx, location)
+	if err != nil {
+		return nil, fmt.Errorf("Backend Plugin %q: %w", backendPlugin, err)
+	}
+	return secret.New(value)
 }
 
 // FileSHA256 returns the SHA-256 of the file at path as the config pins it.

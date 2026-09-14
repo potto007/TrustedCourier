@@ -391,6 +391,24 @@ func (s *Server) checkOutput() {
 	})
 }
 
+var agentAPIAddress = regexp.MustCompile(`msg="Agent API listening" address=(\S+)`)
+
+// AgentURL waits for the server to log the Agent API's address and returns
+// its base URL, such as http://127.0.0.1:41234.
+func (s *Server) AgentURL() string {
+	s.in.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if m := agentAPIAddress.FindStringSubmatch(s.Stderr()); m != nil {
+			return "http://" + m[1]
+		}
+		if time.Now().After(deadline) {
+			s.in.t.Fatalf("the Agent API never started listening; stderr:\n%s", s.Stderr())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // Stdout returns everything the server wrote to stdout so far.
 func (s *Server) Stdout() string { return readFile(s.stdout) }
 
