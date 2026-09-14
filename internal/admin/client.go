@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -50,6 +51,11 @@ func (c *Client) IssueAgentToken(ctx context.Context, req IssueAgentTokenRequest
 	var issued IssuedAgentToken
 	err = c.do(ctx, http.MethodPost, "/v1/agent-tokens", bytes.NewReader(body), &issued)
 	return issued, err
+}
+
+// RevokeAgentToken revokes the Agent Token with id.
+func (c *Client) RevokeAgentToken(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/agent-tokens/"+url.PathEscape(id), nil, nil)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, out any) error {

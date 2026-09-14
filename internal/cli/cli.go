@@ -25,6 +25,7 @@ const usage = `Usage:
   tc server run --config <path>
   tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | --expires-at <RFC 3339>) [--json]
   tc token list [--json]
+  tc token revoke <id>
 
 Environment:
   TC_ADMIN_SOCKET         admin socket path (default ` + config.DefaultAdminSocket + `)
@@ -64,6 +65,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return tokenIssue(rest, stdout)
 	case "token list":
 		return tokenList(rest, stdout)
+	case "token revoke":
+		return tokenRevoke(rest, stdout)
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, cmd)
 	}
@@ -235,6 +238,26 @@ func tokenList(args []string, stdout io.Writer) error {
 			t.ID, strings.Join(t.Policies, ","), t.ExpiresAt.Format(time.RFC3339), lastUsed, t.Status)
 	}
 	return tw.Flush()
+}
+
+func tokenRevoke(args []string, stdout io.Writer) error {
+	fs := newFlagSet("token revoke")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("%w: token revoke: exactly one Agent Token ID is required", errUsage)
+	}
+	client, err := adminClient()
+	if err != nil {
+		return err
+	}
+	id := fs.Arg(0)
+	if err := client.RevokeAgentToken(context.Background(), id); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Agent Token %s revoked\n", id)
+	return nil
 }
 
 func writeJSON(w io.Writer, v any) error {

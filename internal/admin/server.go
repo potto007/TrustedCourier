@@ -65,6 +65,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/agent-tokens", s.listAgentTokens)
 	mux.HandleFunc("POST /v1/agent-tokens", s.issueAgentToken)
+	mux.HandleFunc("DELETE /v1/agent-tokens/{id}", s.revokeAgentToken)
 
 	srv := &http.Server{
 		Handler:           s.requirePeer(s.requireOperator(mux)),
@@ -178,6 +179,15 @@ func (s *Server) issueAgentToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) revokeAgentToken(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.requestFailed(w, s.access.RevokeAgentToken(r.Context(), id)) {
+		return
+	}
+	s.log.Info("Agent Token revoked", "id", id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func toAPI(t access.AgentToken, now time.Time) AgentToken {
 	status := StatusActive
 	switch {
@@ -206,6 +216,11 @@ func (s *Server) requestFailed(w http.ResponseWriter, err error) bool {
 	var invalid *access.ValidationError
 	if errors.As(err, &invalid) {
 		writeError(w, http.StatusBadRequest, invalid.Error())
+		return true
+	}
+	var notFound *access.NotFoundError
+	if errors.As(err, &notFound) {
+		writeError(w, http.StatusNotFound, notFound.Error())
 		return true
 	}
 	s.internalError(w, err)

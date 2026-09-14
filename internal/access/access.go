@@ -145,6 +145,30 @@ func (s *Service) IssueAgentToken(ctx context.Context, policies []string, expire
 	return issued, nil
 }
 
+// NotFoundError reports an Agent Token ID that does not exist.
+type NotFoundError struct{ ID string }
+
+func (e *NotFoundError) Error() string { return fmt.Sprintf("no Agent Token with ID %q", e.ID) }
+
+// RevokeAgentToken revokes the Agent Token with id. Revoking an already
+// revoked Agent Token succeeds and keeps the original revocation time.
+func (s *Service) RevokeAgentToken(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx,
+		"UPDATE agent_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
+		s.now().UnixNano(), id)
+	if err != nil {
+		return fmt.Errorf("revoke Agent Token: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return &NotFoundError{ID: id}
+	}
+	return nil
+}
+
 // AgentToken is an Agent Token's stored metadata. It never carries the value.
 type AgentToken struct {
 	ID         string
