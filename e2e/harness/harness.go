@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -128,7 +129,16 @@ type Installation struct {
 	// ConfigMode is the file mode the config file is written with.
 	ConfigMode os.FileMode
 	dir        string
+
+	mu sync.Mutex
+	// secretValues are the Secret values tests gave the fake Backend Plugin.
+	secretValues []string
 }
+
+// FakeSecretValues are the values the fake Backend Plugin holds at start,
+// mirroring sdk/plugin/internal/fakebackend. None may appear in
+// TrustedCourier's output.
+var FakeSecretValues = []string{"test-value-1", "test-value-2", "test-value-3"}
 
 // New creates an empty installation cleaned up when the test ends.
 func New(t *testing.T) *Installation {
@@ -189,6 +199,11 @@ func (in *Installation) SetBackendSecrets(pluginPath string, secrets map[string]
 	if err != nil {
 		in.t.Fatal(err)
 	}
+	in.mu.Lock()
+	for _, v := range secrets {
+		in.secretValues = append(in.secretValues, v)
+	}
+	in.mu.Unlock()
 	tmp := pluginPath + ".secrets.json.new"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		in.t.Fatal(err)
@@ -401,11 +416,22 @@ func (s *Server) Stop() {
 	s.checkOutput()
 }
 
-// checkOutput fails the test if the race detector reported a race.
+// checkOutput fails the test if the race detector reported a race, or if a
+// Secret value the fake Backend Plugin could hold appears in the server's
+// output.
 func (s *Server) checkOutput() {
 	s.checkOnce.Do(func() {
-		if strings.Contains(s.Stderr(), "WARNING: DATA RACE") {
+		output := s.Stdout() + s.Stderr()
+		if strings.Contains(output, "WARNING: DATA RACE") {
 			s.in.t.Errorf("race detected in TrustedCourier:\n%s", s.Stderr())
+		}
+		s.in.mu.Lock()
+		values := append(slices.Clone(FakeSecretValues), s.in.secretValues...)
+		s.in.mu.Unlock()
+		for _, v := range values {
+			if strings.Contains(output, v) {
+				s.in.t.Errorf("a Secret value appears in TrustedCourier's own output:\n%s", output)
+			}
 		}
 	})
 }

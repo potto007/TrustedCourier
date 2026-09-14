@@ -3,6 +3,7 @@ package e2e
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -107,6 +108,73 @@ func TestEveryRevealDeliveryFetchesFromTheBackend(t *testing.T) {
 	tc.SetBackendSecrets(path, map[string]string{"kv/github": "rotated-value-2"})
 	if got := reveal(t, srv, token, "github"); got.Status != http.StatusOK || got.Body != "rotated-value-2" {
 		t.Fatalf("reveal github after rotation = %d %q, want 200 rotated-value-2", got.Status, got.Body)
+	}
+}
+
+func TestBackendFailureHidesTheBackendFromTheAgent(t *testing.T) {
+	tc := harness.New(t)
+	path := tc.InstallPlugin(harness.FakePlugin, t.TempDir(), 0o755)
+	srv := tc.Start(strings.Replace(revealConfig, "{{.Fake.Path}}", path, 1))
+	waitForPlugin(t, srv, "fake", running)
+	token := "Bearer " + issueAgentToken(t, srv, "github-reveal", "1h").Token
+	tc.SetBackendSecrets(path, map[string]string{"kv/openai": "test-value-1"})
+
+	got := reveal(t, srv, token, "github")
+	if got.Status != http.StatusBadGateway {
+		t.Fatalf("reveal of a Secret missing from its Backend = %d %q, want 502", got.Status, got.Body)
+	}
+	for _, leak := range []string{"kv/", "fake", "not found", "Backend Plugin"} {
+		if strings.Contains(got.Body, leak) {
+			t.Errorf("502 body %q reveals %q to the Agent", got.Body, leak)
+		}
+	}
+	if !strings.Contains(srv.Stderr(), "not found") {
+		t.Errorf("server log does not record why the Secret was not fetched:\n%s", srv.Stderr())
+	}
+}
+
+func TestSecretNameConfigIsValidated(t *testing.T) {
+	cases := []struct {
+		name, config, wantErr string
+	}{
+		{"unknown backend", "secrets:\n  github:\n    backend: nope\n    location: kv/github\n", `unknown backend "nope"`},
+		{"missing backend", "secrets:\n  github:\n    location: kv/github\n", "backend is required"},
+		{"missing location", "secrets:\n  github:\n    backend: fake\n", "location is required"},
+		{"control character in location", "secrets:\n  github:\n    backend: fake\n    location: \"kv/\\u001bgithub\"\n", "control characters"},
+		{"invalid Secret Name", "secrets:\n  \"bad name\":\n    backend: fake\n    location: kv/github\n", `invalid Secret Name "bad name"`},
+		{"all interfaces", "agent_api:\n  listen: 0.0.0.0:8200\n", "not a loopback address"},
+		{"IPv6 all interfaces", "agent_api:\n  listen: \"[::]:8200\"\n", "not a loopback address"},
+		{"routable address", "agent_api:\n  listen: 192.0.2.10:8200\n", "not a loopback address"},
+		{"host name", "agent_api:\n  listen: localhost:8200\n", "loopback IP address"},
+		{"no port", "agent_api:\n  listen: 127.0.0.1\n", "loopback IP address"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc := harness.New(t)
+			code, stderr := tc.Refused(harness.PluginConfig + c.config)
+			if code == 0 {
+				t.Fatal("TrustedCourier started")
+			}
+			if !strings.Contains(stderr, c.wantErr) {
+				t.Fatalf("stderr does not contain %q:\n%s", c.wantErr, stderr)
+			}
+		})
+	}
+}
+
+func TestAgentAPIServesOnIPv6Loopback(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skip("IPv6 loopback not available")
+	}
+	_ = ln.Close()
+	tc := harness.New(t)
+	srv := tc.Start(strings.Replace(revealConfig, "127.0.0.1:0", `"[::1]:0"`, 1))
+	waitForPlugin(t, srv, "fake", running)
+	token := "Bearer " + issueAgentToken(t, srv, "github-reveal", "1h").Token
+
+	if got := reveal(t, srv, token, "github"); got.Status != http.StatusOK || got.Body != "test-value-2" {
+		t.Fatalf("reveal github over [::1] = %d %q, want 200 test-value-2", got.Status, got.Body)
 	}
 }
 
