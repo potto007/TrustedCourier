@@ -38,6 +38,25 @@ type IssuedAgentToken struct {
 	Token string `json:"token"`
 }
 
+// Status is the server's operational state.
+type Status struct {
+	BackendPlugins []BackendPluginStatus `json:"backend_plugins"`
+}
+
+// BackendPluginStatus is one Backend Plugin's state.
+type BackendPluginStatus struct {
+	Name string `json:"name"`
+	// State is starting, running, restarting, or stopped.
+	State string `json:"state"`
+	// PID is present only while the plugin runs.
+	PID     int  `json:"pid,omitempty"`
+	Healthy bool `json:"healthy"`
+	// Detail is the plugin's health detail, or why it is not healthy.
+	Detail       string   `json:"detail"`
+	Capabilities []string `json:"capabilities"`
+	Restarts     int      `json:"restarts"`
+}
+
 type errorResponse struct {
 	Error string `json:"error"`
 }

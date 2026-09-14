@@ -14,3 +14,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0008](0008-bundled-openbao-static-seal.md) | OpenBao is the bundled default Backend, bootstrapped by `tc init` with a static seal | accepted |
 | [0009](0009-pure-go-sqlite.md) | Embedded SQLite through the pure-Go modernc.org/sqlite driver | accepted |
 | [0010](0010-yaml-config-strict-decoding.md) | The config file is YAML, decoded strictly | accepted |
+| [0011](0011-backend-plugin-host-and-protocol.md) | How the core launches and trusts Backend Plugins | accepted |

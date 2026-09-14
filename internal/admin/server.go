@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
+	"github.com/potto007/TrustedCourier/internal/pluginhost"
 )
 
 // Listen binds the admin unix socket. A stale socket file left by a crashed
@@ -88,14 +89,15 @@ func removeStaleSocket(socket string) error {
 // Server serves the admin API.
 type Server struct {
 	access      *access.Service
+	plugins     *pluginhost.Host
 	allowedUIDs []int
 	log         *slog.Logger
 }
 
 // NewServer returns an admin API server that admits connections from
 // allowedUIDs presenting the Operator Credential.
-func NewServer(svc *access.Service, allowedUIDs []int, log *slog.Logger) *Server {
-	return &Server{access: svc, allowedUIDs: allowedUIDs, log: log}
+func NewServer(svc *access.Service, plugins *pluginhost.Host, allowedUIDs []int, log *slog.Logger) *Server {
+	return &Server{access: svc, plugins: plugins, allowedUIDs: allowedUIDs, log: log}
 }
 
 // Serve serves the admin API on ln until ctx is done.
@@ -104,6 +106,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	mux.HandleFunc("GET /v1/agent-tokens", s.listAgentTokens)
 	mux.HandleFunc("POST /v1/agent-tokens", s.issueAgentToken)
 	mux.HandleFunc("DELETE /v1/agent-tokens/{id}", s.revokeAgentToken)
+	mux.HandleFunc("GET /v1/status", s.status)
 
 	srv := &http.Server{
 		Handler:           s.requirePeer(s.requireOperator(mux)),
@@ -227,6 +230,22 @@ func (s *Server) revokeAgentToken(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("Agent Token revoked", "id", id)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	out := Status{BackendPlugins: []BackendPluginStatus{}}
+	for _, p := range s.plugins.Status(r.Context()) {
+		out.BackendPlugins = append(out.BackendPlugins, BackendPluginStatus{
+			Name:         p.Name,
+			State:        p.State,
+			PID:          p.PID,
+			Healthy:      p.Healthy,
+			Detail:       p.Detail,
+			Capabilities: p.Capabilities,
+			Restarts:     p.Restarts,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func toAPI(t access.AgentToken, now time.Time) AgentToken {

@@ -53,6 +53,13 @@ func (c *Client) IssueAgentToken(ctx context.Context, req IssueAgentTokenRequest
 	return issued, err
 }
 
+// Status returns the server's operational state.
+func (c *Client) Status(ctx context.Context) (Status, error) {
+	var status Status
+	err := c.do(ctx, http.MethodGet, "/v1/status", nil, &status)
+	return status, err
+}
+
 // RevokeAgentToken revokes the Agent Token with id.
 func (c *Client) RevokeAgentToken(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/agent-tokens/"+url.PathEscape(id), nil, nil)
