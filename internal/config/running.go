@@ -28,12 +28,13 @@ func NewRunning(cfg *Config) *Running {
 func (r *Running) Snapshot() *Config { return r.current.Load() }
 
 // Reload loads and validates the config file the running snapshot came from
-// and puts it in effect. On any error the running snapshot stays in effect.
+// and puts it in effect once check, the startup checks that live outside this
+// package, accepts it. On any error the running snapshot stays in effect.
 //
 // Only Policies and Secret Names, with their Upstreams and Injection
 // Templates, change on reload. A config that changes anything else is
 // refused, naming the keys that need a restart, rather than applied in part.
-func (r *Running) Reload() (*Config, error) {
+func (r *Running) Reload(check func(*Config) error) (*Config, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	old := r.current.Load()
@@ -43,6 +44,9 @@ func (r *Running) Reload() (*Config, error) {
 	}
 	if keys := restartKeys(old, cfg); len(keys) > 0 {
 		return nil, errors.New(strings.Join(keys, ", ") + " changed, which takes effect only on restart; restore it to reload the rest")
+	}
+	if err := check(cfg); err != nil {
+		return nil, err
 	}
 	r.current.Store(cfg)
 	return cfg, nil

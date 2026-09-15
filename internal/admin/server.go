@@ -310,7 +310,7 @@ func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) reloadConfig(w http.ResponseWriter, _ *http.Request) {
-	cfg, err := s.cfg.Reload()
+	cfg, err := s.cfg.Reload(s.plugins.CheckConfig)
 	if err != nil {
 		s.log.Warn("config reload refused; the running config stays in effect", "error", err)
 		writeError(w, http.StatusBadRequest, "config not reloaded, the running config stays in effect: "+err.Error())

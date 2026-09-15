@@ -3,6 +3,7 @@ package e2e
 import (
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -194,6 +195,46 @@ func TestReloadLetsInFlightDeliveriesFinishOnTheOldConfig(t *testing.T) {
 	if rec := records[len(records)-1]; rec.Decision != "allowed" || rec.Failure != "" || rec.UpstreamStatus == nil || *rec.UpstreamStatus != http.StatusOK {
 		t.Errorf("the in-flight Delivery's Audit Record = %+v, want allowed and finished", rec)
 	}
+}
+
+// A reloaded config passes the same separation checks as at startup, so a
+// config file an editor rewrote readable by a Backend Plugin's user is
+// refused, rather than applied and then fatal at the next restart. It needs
+// root, so the plugin can run as another user. Run it with sudo.
+func TestReloadRefusesAConfigReadableByAPluginUser(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	tc := harness.New(t)
+	// The plugin user must be able to reach its binary.
+	dir, err := os.MkdirTemp("", "tc-plugin-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := harness.AdminConfig + `
+backend_plugins:
+  fake:
+    path: ` + tc.InstallPlugin(harness.FakePlugin, dir, 0o755) + `
+    sha256: {{.Fake.SHA256}}
+    user: nobody
+`
+	srv := tc.Start(config)
+	waitForPlugin(t, srv, "fake", running)
+
+	tc.ConfigMode = 0o644
+	srv.RewriteConfig(config)
+	res := srv.TC("reload")
+	if res.ExitCode != 1 || !strings.Contains(res.Stderr, `readable by user "nobody"`) {
+		t.Fatalf("reload of a config readable by the plugin user: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+
+	tc.ConfigMode = 0o600
+	srv.RewriteConfig(config)
+	reload(t, srv)
 }
 
 func TestReloadAppliesPolicyChanges(t *testing.T) {
