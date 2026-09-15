@@ -186,8 +186,7 @@ type AgentToken struct {
 // ListAgentTokens returns every Agent Token, newest first.
 func (s *Service) ListAgentTokens(ctx context.Context) ([]AgentToken, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, policies, created_at, expires_at, last_used_at, revoked_at
-		 FROM agent_tokens ORDER BY created_at DESC, id`)
+		"SELECT "+agentTokenColumns+" FROM agent_tokens ORDER BY created_at DESC, id")
 	if err != nil {
 		return nil, err
 	}
@@ -195,25 +194,107 @@ func (s *Service) ListAgentTokens(ctx context.Context) ([]AgentToken, error) {
 
 	tokens := []AgentToken{}
 	for rows.Next() {
-		var (
-			tok               AgentToken
-			policies          string
-			created, expires  int64
-			lastUsed, revoked sql.NullInt64
-		)
-		if err := rows.Scan(&tok.ID, &policies, &created, &expires, &lastUsed, &revoked); err != nil {
+		tok, err := scanAgentToken(rows)
+		if err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(policies), &tok.Policies); err != nil {
-			return nil, fmt.Errorf("Agent Token %s: decode Policies: %w", tok.ID, err)
-		}
-		tok.CreatedAt = time.UnixMilli(created).UTC()
-		tok.ExpiresAt = time.UnixMilli(expires).UTC()
-		tok.LastUsedAt = nullTime(lastUsed)
-		tok.RevokedAt = nullTime(revoked)
 		tokens = append(tokens, tok)
 	}
 	return tokens, rows.Err()
+}
+
+const agentTokenColumns = "id, policies, created_at, expires_at, last_used_at, revoked_at"
+
+func scanAgentToken(row interface{ Scan(...any) error }) (AgentToken, error) {
+	var (
+		tok               AgentToken
+		policies          string
+		created, expires  int64
+		lastUsed, revoked sql.NullInt64
+	)
+	if err := row.Scan(&tok.ID, &policies, &created, &expires, &lastUsed, &revoked); err != nil {
+		return AgentToken{}, err
+	}
+	if err := json.Unmarshal([]byte(policies), &tok.Policies); err != nil {
+		return AgentToken{}, fmt.Errorf("Agent Token %s: decode Policies: %w", tok.ID, err)
+	}
+	tok.CreatedAt = time.UnixMilli(created).UTC()
+	tok.ExpiresAt = time.UnixMilli(expires).UTC()
+	tok.LastUsedAt = nullTime(lastUsed)
+	tok.RevokedAt = nullTime(revoked)
+	return tok, nil
+}
+
+// Reasons an Agent Token is refused.
+var (
+	ErrAgentTokenInvalid = errors.New("invalid Agent Token")
+	ErrAgentTokenExpired = errors.New("Agent Token expired")
+	ErrAgentTokenRevoked = errors.New("Agent Token revoked")
+)
+
+// AuthenticateAgentToken returns the Agent Token whose value is presented and
+// records its use. It fails with ErrAgentTokenInvalid, ErrAgentTokenExpired,
+// or ErrAgentTokenRevoked when the token must be refused. Revocation takes
+// effect on the next call.
+func (s *Service) AuthenticateAgentToken(ctx context.Context, presented string) (AgentToken, error) {
+	if !strings.HasPrefix(presented, AgentTokenPrefix) {
+		return AgentToken{}, ErrAgentTokenInvalid
+	}
+	now := s.now().UnixMilli()
+	// Check and record use in one statement, so a revocation committed in
+	// between cannot be missed.
+	tok, err := scanAgentToken(s.db.QueryRowContext(ctx,
+		`UPDATE agent_tokens SET last_used_at = ?
+		 WHERE hash = ? AND revoked_at IS NULL AND expires_at > ?
+		 RETURNING `+agentTokenColumns,
+		now, hash(presented), now))
+	if err == nil {
+		return tok, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return AgentToken{}, fmt.Errorf("authenticate Agent Token: %w", err)
+	}
+	// Refused: find out why.
+	var revoked sql.NullInt64
+	err = s.db.QueryRowContext(ctx,
+		"SELECT revoked_at FROM agent_tokens WHERE hash = ?", hash(presented)).Scan(&revoked)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return AgentToken{}, ErrAgentTokenInvalid
+	case err != nil:
+		return AgentToken{}, fmt.Errorf("read Agent Token: %w", err)
+	case revoked.Valid:
+		return AgentToken{}, ErrAgentTokenRevoked
+	default:
+		return AgentToken{}, ErrAgentTokenExpired
+	}
+}
+
+// Denial is why a Delivery was denied. Agents never see it.
+type Denial string
+
+// Denials.
+const (
+	DenialUnknownSecretName Denial = "unknown Secret Name"
+	DenialPolicy            Denial = "no Policy allows it"
+)
+
+// Authorize reports whether tok's Policies allow Delivery of secretName in
+// mode, and if not, why. A Policy must name the Delivery mode explicitly;
+// allowing proxy never allows reveal.
+func (s *Service) Authorize(tok AgentToken, secretName string, mode config.DeliveryMode) (Denial, bool) {
+	if _, ok := s.cfg.Secrets[secretName]; !ok {
+		return DenialUnknownSecretName, false
+	}
+	for _, name := range tok.Policies {
+		// A Policy removed from the config since issuance allows nothing.
+		for _, a := range s.cfg.Policies[name].Secrets {
+			if a.SecretName == secretName && slices.Contains(a.Delivery, mode) {
+				return "", true
+			}
+		}
+	}
+	return DenialPolicy, false
 }
 
 func nullTime(v sql.NullInt64) *time.Time {

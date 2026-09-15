@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 
+	"github.com/potto007/TrustedCourier/sdk/plugin/client"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -28,10 +30,31 @@ type Config struct {
 	// DataDir holds the SQLite database.
 	DataDir string
 	Admin   Admin
+	// AgentAPI configures the listener Agents call.
+	AgentAPI AgentAPI
 	// Policies by name.
 	Policies map[string]Policy
 	// BackendPlugins by name.
 	BackendPlugins map[string]BackendPlugin
+	// Secrets are the Secret Names Agents may ask for, by name.
+	Secrets map[string]SecretName
+}
+
+// AgentAPI configures the Agent API listener.
+type AgentAPI struct {
+	// Listen is the loopback address and port to serve plain HTTP on, such
+	// as 127.0.0.1:8200. Empty serves no Agent API.
+	Listen string
+}
+
+// SecretName maps a Secret Name to where its Secret lives. Agents never see
+// the mapping.
+type SecretName struct {
+	Name string
+	// Backend names the entry in BackendPlugins that holds the Secret.
+	Backend string
+	// Location is the Secret's location in that Backend.
+	Location string
 }
 
 // BackendPlugin is a Backend Plugin binary the Operator approved (ADR-0004).
@@ -81,8 +104,19 @@ const (
 type fileConfig struct {
 	DataDir        string                       `yaml:"data_dir"`
 	Admin          fileAdmin                    `yaml:"admin"`
+	AgentAPI       fileAgentAPI                 `yaml:"agent_api"`
 	Policies       map[string]filePolicy        `yaml:"policies"`
 	BackendPlugins map[string]fileBackendPlugin `yaml:"backend_plugins"`
+	Secrets        map[string]fileSecretName    `yaml:"secrets"`
+}
+
+type fileAgentAPI struct {
+	Listen string `yaml:"listen"`
+}
+
+type fileSecretName struct {
+	Backend  string `yaml:"backend"`
+	Location string `yaml:"location"`
 }
 
 type fileBackendPlugin struct {
@@ -141,6 +175,7 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 	cfg := &Config{
 		Policies:       make(map[string]Policy, len(raw.Policies)),
 		BackendPlugins: make(map[string]BackendPlugin, len(raw.BackendPlugins)),
+		Secrets:        make(map[string]SecretName, len(raw.Secrets)),
 	}
 
 	if raw.DataDir == "" {
@@ -175,7 +210,61 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 		}
 		cfg.BackendPlugins[name] = plugin
 	}
+	for _, name := range slices.Sorted(maps.Keys(raw.Secrets)) {
+		s, err := raw.Secrets[name].validate(name, cfg.BackendPlugins)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Secrets[name] = s
+	}
+	// A Policy entry naming an undefined Secret Name is a typo or a
+	// half-finished change; refuse it rather than deny Agents at runtime.
+	for _, name := range slices.Sorted(maps.Keys(cfg.Policies)) {
+		for _, a := range cfg.Policies[name].Secrets {
+			if _, ok := cfg.Secrets[a.SecretName]; !ok {
+				return nil, fmt.Errorf("Policy %q names Secret Name %q, which is not defined under secrets", name, a.SecretName)
+			}
+		}
+	}
+	if raw.AgentAPI.Listen != "" {
+		if err := checkLoopback(raw.AgentAPI.Listen); err != nil {
+			return nil, err
+		}
+		cfg.AgentAPI.Listen = raw.AgentAPI.Listen
+	}
 	return cfg, nil
+}
+
+// checkLoopback accepts only a loopback IP address and port: the Agent API
+// serves plain HTTP, and TLS is required on every other listener (ADR-0006).
+func checkLoopback(listen string) error {
+	addr, err := netip.ParseAddrPort(listen)
+	if err != nil {
+		return fmt.Errorf("agent_api.listen %q must be a loopback IP address and port, such as 127.0.0.1:8200", listen)
+	}
+	if !addr.Addr().Unmap().IsLoopback() {
+		return fmt.Errorf("agent_api.listen %q is not a loopback address; the Agent API serves plain HTTP, so it may only listen on loopback", listen)
+	}
+	return nil
+}
+
+func (s fileSecretName) validate(name string, plugins map[string]BackendPlugin) (SecretName, error) {
+	if !namePattern.MatchString(name) {
+		return SecretName{}, fmt.Errorf("invalid Secret Name %q: use up to 64 letters, digits, '.', '_' or '-', starting with a letter or digit", name)
+	}
+	switch {
+	case s.Backend == "":
+		return SecretName{}, fmt.Errorf("Secret Name %q: backend is required", name)
+	case s.Location == "":
+		return SecretName{}, fmt.Errorf("Secret Name %q: location is required", name)
+	}
+	if err := client.ValidateLocation(s.Location); err != nil {
+		return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
+	}
+	if _, ok := plugins[s.Backend]; !ok {
+		return SecretName{}, fmt.Errorf("Secret Name %q: unknown backend %q; name one of backend_plugins", name, s.Backend)
+	}
+	return SecretName{Name: name, Backend: s.Backend, Location: s.Location}, nil
 }
 
 var sha256Pattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)

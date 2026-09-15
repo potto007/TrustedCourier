@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -127,7 +129,16 @@ type Installation struct {
 	// ConfigMode is the file mode the config file is written with.
 	ConfigMode os.FileMode
 	dir        string
+
+	mu sync.Mutex
+	// secretValues are the Secret values tests gave the fake Backend Plugin.
+	secretValues []string
 }
+
+// FakeSecretValues are the values the fake Backend Plugin holds at start,
+// mirroring sdk/plugin/internal/fakebackend. None may appear in
+// TrustedCourier's output.
+var FakeSecretValues = []string{"test-value-1", "test-value-2", "test-value-3"}
 
 // New creates an empty installation cleaned up when the test ends.
 func New(t *testing.T) *Installation {
@@ -160,16 +171,6 @@ type ConfigVars struct {
 	Malformed PluginBinary
 }
 
-// PluginConfig is BaseConfig plus the well-behaved fake Backend Plugin,
-// named fake, sharing the server's OS user.
-const PluginConfig = BaseConfig + `
-backend_plugins:
-  fake:
-    path: {{.Fake.Path}}
-    sha256: {{.Fake.SHA256}}
-    insecure_share_core_user: true
-`
-
 // InstallPlugin copies bin into dir with the given mode and returns its path,
 // so a test can later replace it.
 func (in *Installation) InstallPlugin(bin PluginBinary, dir string, mode os.FileMode) string {
@@ -177,6 +178,29 @@ func (in *Installation) InstallPlugin(bin PluginBinary, dir string, mode os.File
 	path := filepath.Join(dir, filepath.Base(bin.Path))
 	in.copyFile(bin.Path, path, mode)
 	return path
+}
+
+// SetBackendSecrets replaces what the fake Backend Plugin installed at
+// pluginPath holds with secrets, by location. The plugin reads them on every
+// Get, so a test can rotate a Secret while TrustedCourier runs.
+func (in *Installation) SetBackendSecrets(pluginPath string, secrets map[string]string) {
+	in.t.Helper()
+	data, err := json.Marshal(secrets)
+	if err != nil {
+		in.t.Fatal(err)
+	}
+	in.mu.Lock()
+	for _, v := range secrets {
+		in.secretValues = append(in.secretValues, v)
+	}
+	in.mu.Unlock()
+	tmp := pluginPath + ".secrets.json.new"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		in.t.Fatal(err)
+	}
+	if err := os.Rename(tmp, pluginPath+".secrets.json"); err != nil {
+		in.t.Fatal(err)
+	}
 }
 
 // ReplacePlugin atomically replaces the binary at path with bin, as an
@@ -207,11 +231,19 @@ func (in *Installation) copyFile(from, to string, mode os.FileMode) {
 // Dir is the installation's private directory, holding the config file.
 func (in *Installation) Dir() string { return in.dir }
 
-// BaseConfig is a minimal valid config with two Policies.
-const BaseConfig = `
+// AdminConfig is the smallest valid config: a data directory and the admin
+// socket, with no Policies, Secret Names, or Backend Plugins.
+const AdminConfig = `
 data_dir: {{.DataDir}}
 admin:
   socket: {{.Socket}}
+`
+
+// BaseConfig is AdminConfig plus two Policies, the Secret Names they grant,
+// and the well-behaved fake Backend Plugin, named fake, sharing the server's
+// OS user. It ends inside backend_plugins, so a test can append more Backend
+// Plugins, or top-level keys.
+const BaseConfig = AdminConfig + `
 policies:
   openai-proxy:
     secrets:
@@ -221,6 +253,18 @@ policies:
     secrets:
       - name: github
         delivery: [proxy, reveal]
+secrets:
+  openai:
+    backend: fake
+    location: kv/openai
+  github:
+    backend: fake
+    location: kv/github
+backend_plugins:
+  fake:
+    path: {{.Fake.Path}}
+    sha256: {{.Fake.SHA256}}
+    insecure_share_core_user: true
 `
 
 func (in *Installation) writeConfig(tmpl string) string {
@@ -382,13 +426,42 @@ func (s *Server) Stop() {
 	s.checkOutput()
 }
 
-// checkOutput fails the test if the race detector reported a race.
+// checkOutput fails the test if the race detector reported a race, or if a
+// Secret value the fake Backend Plugin could hold appears in the server's
+// output.
 func (s *Server) checkOutput() {
 	s.checkOnce.Do(func() {
-		if strings.Contains(s.Stderr(), "WARNING: DATA RACE") {
+		output := s.Stdout() + s.Stderr()
+		if strings.Contains(output, "WARNING: DATA RACE") {
 			s.in.t.Errorf("race detected in TrustedCourier:\n%s", s.Stderr())
 		}
+		s.in.mu.Lock()
+		values := append(slices.Clone(FakeSecretValues), s.in.secretValues...)
+		s.in.mu.Unlock()
+		for _, v := range values {
+			if strings.Contains(output, v) {
+				s.in.t.Errorf("a Secret value appears in TrustedCourier's own output:\n%s", output)
+			}
+		}
 	})
+}
+
+var agentAPIAddress = regexp.MustCompile(`msg="Agent API listening" address=(\S+)`)
+
+// AgentURL waits for the server to log the Agent API's address and returns
+// its base URL, such as http://127.0.0.1:41234.
+func (s *Server) AgentURL() string {
+	s.in.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if m := agentAPIAddress.FindStringSubmatch(s.Stderr()); m != nil {
+			return "http://" + m[1]
+		}
+		if time.Now().After(deadline) {
+			s.in.t.Fatalf("the Agent API never started listening; stderr:\n%s", s.Stderr())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // Stdout returns everything the server wrote to stdout so far.

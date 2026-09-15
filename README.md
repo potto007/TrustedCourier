@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, and the Backend Plugin seam work today. Secret Delivery, a real Backend, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Reveal Delivery on loopback work today. Proxy Delivery, a real Backend, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -43,30 +43,43 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Backend Plugins pinned by SHA-256, run as a separate user, supervised | done |
 | `tc status`, `tc plugin sha256` | done |
 | Plugin SDK and conformance kit skeleton | done |
+| Secret Names mapped to Backend locations in config | done |
+| Reveal Delivery on a loopback Agent API | done |
 | OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
-| Reveal Delivery, Proxy Delivery, Redaction | [#4](https://github.com/potto007/TrustedCourier/issues/4), [#5](https://github.com/potto007/TrustedCourier/issues/5), [#6](https://github.com/potto007/TrustedCourier/issues/6) |
+| Proxy Delivery, Redaction | [#5](https://github.com/potto007/TrustedCourier/issues/5), [#6](https://github.com/potto007/TrustedCourier/issues/6) |
 | Audit Records and checkpoints | [#9](https://github.com/potto007/TrustedCourier/issues/9), [#10](https://github.com/potto007/TrustedCourier/issues/10) |
 | TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
-An Agent Token can be issued, listed, and revoked, but nothing accepts one yet. Backend Plugins can be launched and monitored, but nothing fetches a Secret through them yet. Delivery comes next.
+An Agent can ask for a Secret by Secret Name over plain HTTP on loopback, and gets it where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
 
 ## Quickstart
 
 You need Go 1.26.5 or newer, on Linux or macOS. The admin socket reads the connecting user's credentials from the kernel, and on other platforms it refuses every connection.
 
-Build the CLI:
+Build the CLI, and the fake Backend Plugin the tests use. It stands in until the OpenBao Backend Plugin lands ([#18](https://github.com/potto007/TrustedCourier/issues/18)) and holds made-up Secrets at `kv/openai` and `kv/github`.
 
 ```sh
 go build -o tc ./cmd/tc
+go -C sdk/plugin build -o ../../fakebackend ./internal/fakebackend
+./tc plugin sha256 fakebackend
 ```
 
-Write a config file, say `trustedcourier.yaml`:
+Write a config file, say `trustedcourier.yaml`, with the hash `tc` printed:
 
 ```yaml
 data_dir: ./data
 admin:
   socket: /run/user/1000/trustedcourier/admin.sock
+backend_plugins:
+  fake:
+    path: ./fakebackend
+    sha256: <the hash tc printed>
+    insecure_share_core_user: true
+secrets:
+  openai:
+    backend: fake
+    location: kv/openai
 policies:
   openai-proxy:
     secrets:
@@ -154,6 +167,43 @@ BACKEND PLUGIN  STATE    HEALTH   CAPABILITIES       RESTARTS  DETAIL
 openbao         running  healthy  courier-key-write  0         ...
 ```
 
+### Reveal Delivery
+
+Map a Secret Name to its location in a Backend, let a Policy reveal it, and turn on the Agent API:
+
+```yaml
+agent_api:
+  listen: 127.0.0.1:8200
+secrets:
+  github:
+    backend: openbao
+    location: secret/data/github#token
+policies:
+  github-reveal:
+    secrets:
+      - name: github
+        delivery: [reveal]
+```
+
+Issue an Agent Token with that Policy, and the Agent asks for the Secret by name:
+
+```sh
+curl -H "Authorization: Bearer tcat_..." http://127.0.0.1:8200/v1/reveal/github
+```
+
+The body is the Secret, byte for byte, with `Cache-Control: no-store`. TrustedCourier fetches it from the Backend on every request. The Agent sees only the Secret Name, never the Backend or location.
+
+| Status | When |
+| --- | --- |
+| 200 | A Policy on the Agent Token lists the Secret Name with `reveal`. |
+| 401 | The Agent Token is missing, unknown, expired, or revoked. The message says which. |
+| 403 | Anything else: the Secret Name does not exist, no attached Policy lists it, or the Policy allows only `proxy`. The body is identical in every case, so Agents cannot discover Secret Names. |
+| 405 | Any method but `GET`, including `HEAD`. |
+| 502 | The Backend could not return the Secret. Details go to the server log only. |
+| 503 | The server has no locked memory left to hold the Secret. Raise `RLIMIT_MEMLOCK`. |
+
+The Agent Token may go in `X-TC-Agent-Token` instead of `Authorization`. The Agent API serves plain HTTP, so until TLS lands ([#13](https://github.com/potto007/TrustedCourier/issues/13)) it listens only on a loopback IP address ([ADR-0012](docs/decisions/0012-reveal-delivery-api-and-secret-memory.md)).
+
 ## CLI
 
 ```
@@ -189,8 +239,12 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `backend_plugins.<name>.sha256` | yes | The binary's SHA-256 as `tc plugin sha256` prints it. |
 | `backend_plugins.<name>.user` | one of these two | OS user name or ID the plugin runs as. |
 | `backend_plugins.<name>.insecure_share_core_user` | one of these two | `true` runs the plugin as the server's own user. Development only. |
+| `secrets` | no | Map of Secret Name to where its Secret lives. |
+| `secrets.<name>.backend` | yes | The `backend_plugins` entry that holds the Secret. |
+| `secrets.<name>.location` | yes | The Secret's location in that Backend, up to 1024 bytes without control characters. |
+| `agent_api.listen` | no | Loopback IP address and port for the Agent API, such as `127.0.0.1:8200` or `[::1]:8200`. Omit it to serve no Agent API. |
 
-Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, and can list each only once.
+Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, can list each only once, and may list only Secret Names defined under `secrets`. A typo there stops the server at startup instead of denying Agents at runtime.
 
 Two things trip people up with the admin socket. The default `/run/trustedcourier/` usually needs root to create, so for a non-root server pick a path you own, such as one under `$XDG_RUNTIME_DIR`. And unix socket paths are limited to about 104 to 108 bytes depending on the OS, so a deeply nested path fails with `bind: invalid argument`.
 
@@ -207,6 +261,7 @@ Two things trip people up with the admin socket. The default `/run/trustedcourie
 - Backend Plugins run as a separate OS user that cannot read the config file or own the data directory, with an empty environment apart from `GODEBUG`. Core and plugin talk over go-plugin's automatic mutual TLS.
 - Every plugin response is checked against the protocol contract (size limits, valid UTF-8, no control characters) before the server uses it, and plugin error text and log output are sanitized.
 - A plugin that crashes is restarted with exponential backoff, from 250 ms to 30 s. It never takes the server down.
+- In the core, a Secret lives in `mlock`ed memory outside the Go heap, is wiped when the response is written, and prints as a placeholder if formatted or logged. A Delivery fails rather than hold a Secret in memory that could be swapped. The e2e harness fails any test whose server output contains a Secret value.
 
 ## Repository layout
 
@@ -215,12 +270,15 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | Path | Contents |
 | --- | --- |
 | `cmd/tc` | The `tc` binary. |
-| `internal/access` | Operator Credential and Agent Token issue, verify, revoke. |
+| `internal/access` | Operator Credential and Agent Token issue, verify, revoke; Policy evaluation. |
 | `internal/admin` | Admin API server and client over the unix socket. |
+| `internal/agentapi` | Agent API server: Reveal Delivery. |
 | `internal/cli` | Command-line parsing and output. |
 | `internal/config` | Config loading and validation. |
-| `internal/pluginhost` | Plugin Host: verifies, launches, supervises, and reports Backend Plugins. |
-| `internal/server` | Wires config, database, and admin API into a running process. |
+| `internal/pluginhost` | Plugin Host: verifies, launches, supervises, and reports Backend Plugins, and fetches Secrets through them. |
+| `internal/resolver` | Secret Resolver: Secret Name to Backend location to Secret. |
+| `internal/secret` | The Secret type: locked, unprintable, wiped on release. |
+| `internal/server` | Wires config, database, admin API, and Agent API into a running process. |
 | `internal/store` | SQLite database and migrations, through pure-Go `modernc.org/sqlite` ([ADR-0009](docs/decisions/0009-pure-go-sqlite.md)). |
 | `e2e` | Black-box tests that build `tc` and drive a real server through its config, socket, and CLI. |
 | `sdk/plugin` | Plugin SDK module: the `Backend` interface and `Serve` for Plugin Authors, the wire protocol (`protocol`), the validating client (`client`), the conformance kit (`conformance`), and the fake Backend Plugin used by tests. |

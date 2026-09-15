@@ -159,11 +159,6 @@ data_dir: {{.DataDir}}
 admin:
   socket: {{.Socket}}
   allowed_uids: [%d]
-policies:
-  openai-proxy:
-    secrets:
-      - name: openai
-        delivery: [proxy]
 `, os.Getuid()+1))
 
 	res := srv.TC("token", "list")
