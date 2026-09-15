@@ -41,7 +41,12 @@ func ParseEd25519Key(s *Secret) (*Ed25519Key, error) {
 		return nil, ErrReleased
 	}
 
-	block, rest := pem.Decode(s.p.buf[:s.p.n])
+	data := s.p.buf[:s.p.n]
+	// pem.Decode skips any text before the block; refuse it instead.
+	if !bytes.HasPrefix(bytes.TrimLeft(data, " \t\r\n"), []byte("-----BEGIN ")) {
+		return nil, errors.New("the audit signing key is not PEM, or has data before the PEM block")
+	}
+	block, rest := pem.Decode(data)
 	switch {
 	case block == nil:
 		return nil, errors.New("the audit signing key is not PEM")

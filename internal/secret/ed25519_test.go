@@ -76,6 +76,7 @@ func TestParseEd25519KeyRefusesOtherValues(t *testing.T) {
 		{"not PEM", []byte("not a key"), "PEM"},
 		{"another block type", []byte(strings.Replace(string(good), "PRIVATE KEY", "PUBLIC KEY", 2)), "PRIVATE KEY"},
 		{"trailing data", append(good, "trailing"...), "after the PEM block"},
+		{"leading data", append([]byte("leading\n"), good...), "before the PEM block"},
 		{"two keys", append(good, good...), "after the PEM block"},
 		{"ECDSA key", pkcs8PEM(t, ecKey), "not an Ed25519"},
 		{"bad DER", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte{0x30, 0x01}}), "PKCS #8"},
