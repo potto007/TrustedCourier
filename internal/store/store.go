@@ -1,6 +1,6 @@
 // Package store opens TrustedCourier's embedded SQLite database. It holds only
-// Agent Token hashes and metadata, the Operator Credential hash, and (later)
-// Audit Records; never Secrets or Courier Keys (ADR-0001, ADR-0009).
+// Agent Token hashes and metadata, the Operator Credential hash, and Audit
+// Records; never Secrets or Courier Keys (ADR-0001, ADR-0009).
 package store
 
 import (
@@ -35,6 +35,21 @@ var migrations = []string{
 		expires_at   INTEGER NOT NULL,
 		last_used_at INTEGER,
 		revoked_at   INTEGER
+	);`,
+	`CREATE TABLE audit_records (
+		seq             INTEGER PRIMARY KEY,
+		time            INTEGER NOT NULL,
+		agent_token_id  TEXT    NOT NULL,
+		secret_name     TEXT    NOT NULL,
+		delivery        TEXT    NOT NULL,
+		upstream        TEXT    NOT NULL,
+		upstream_host   TEXT    NOT NULL,
+		decision        TEXT    NOT NULL,
+		reason          TEXT    NOT NULL,
+		upstream_status INTEGER,
+		failure         TEXT    NOT NULL,
+		prev_hash       BLOB    NOT NULL,
+		hash            BLOB    NOT NULL
 	);`,
 }
 

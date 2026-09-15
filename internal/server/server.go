@@ -11,6 +11,7 @@ import (
 	"github.com/potto007/TrustedCourier/internal/access"
 	"github.com/potto007/TrustedCourier/internal/admin"
 	"github.com/potto007/TrustedCourier/internal/agentapi"
+	"github.com/potto007/TrustedCourier/internal/audit"
 	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
 	"github.com/potto007/TrustedCourier/internal/resolver"
@@ -36,6 +37,12 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		return fmt.Errorf("database: %w", err)
 	}
 	defer func() { _ = db.Close() }()
+	// Audit Records stream to stdout, which carries nothing else once the
+	// Operator Credential has been shown.
+	auditLog, err := audit.Open(ctx, db, stdout)
+	if err != nil {
+		return fmt.Errorf("audit: %w", err)
+	}
 
 	// Bind before creating the Operator Credential: it is shown only once,
 	// so nothing that can still fail may come between showing it and serving.
@@ -75,12 +82,12 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	errc := make(chan error, 2)
 	serving := 1
 	go func() {
-		errc <- admin.NewServer(svc, plugins, cfg.Admin.AllowedUIDs, log).Serve(serveCtx, ln)
+		errc <- admin.NewServer(svc, plugins, auditLog, cfg.Admin.AllowedUIDs, log).Serve(serveCtx, ln)
 	}()
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
 	if agentLn != nil {
 		serving++
-		agent := agentapi.NewServer(svc, resolver.New(cfg, plugins), cfg, log)
+		agent := agentapi.NewServer(svc, resolver.New(cfg, plugins), auditLog, cfg, log)
 		go func() { errc <- agent.Serve(serveCtx, agentLn) }()
 		log.Info("Agent API listening", "address", agentLn.Addr().String())
 	}

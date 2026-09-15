@@ -57,6 +57,22 @@ type BackendPluginStatus struct {
 	Restarts     int      `json:"restarts"`
 }
 
+// AuditVerification is the result of checking the audit chain.
+type AuditVerification struct {
+	Intact bool `json:"intact"`
+	// Records is how many Audit Records were found intact before the first
+	// break, or in all when there is none.
+	Records int64 `json:"records"`
+	// Break is the first break in the chain, or null when it is intact.
+	Break *AuditBreak `json:"break"`
+}
+
+// AuditBreak is the first place the audit chain does not hold.
+type AuditBreak struct {
+	Seq     int64  `json:"seq"`
+	Problem string `json:"problem"`
+}
+
 type errorResponse struct {
 	Error string `json:"error"`
 }

@@ -30,6 +30,7 @@ const usage = `Usage:
   tc token list [--json]
   tc token revoke <id>
   tc status [--json]
+  tc audit verify [--json]
   tc plugin sha256 <path>
 
 Environment:
@@ -70,6 +71,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	cmd, rest := args[0]+" "+args[1], args[2:]
 	switch cmd {
+	case "audit verify":
+		return auditVerify(rest, stdout)
 	case "plugin sha256":
 		return pluginSHA256(rest, stdout)
 	case "server run":
@@ -320,6 +323,51 @@ func status(args []string, stdout io.Writer) error {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n", p.Name, p.State, health, caps, p.Restarts, p.Detail)
 	}
 	return tw.Flush()
+}
+
+// errAuditBroken fails tc audit verify after it has reported the break.
+var errAuditBroken = errors.New("the audit chain is broken")
+
+func auditVerify(args []string, stdout io.Writer) error {
+	fs := newFlagSet("audit verify")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%w: audit verify: unexpected argument %q", errUsage, fs.Arg(0))
+	}
+	client, err := adminClient()
+	if err != nil {
+		return err
+	}
+	v, err := client.VerifyAudit(context.Background())
+	if err != nil {
+		return err
+	}
+	switch {
+	case *asJSON:
+		err = writeJSON(stdout, v)
+	case v.Break == nil:
+		_, err = fmt.Fprintf(stdout, "Audit chain intact: %s\n", auditRecords(v.Records))
+	default:
+		_, err = fmt.Fprintf(stdout, "Audit chain broken at record %d: %s\n%s before it intact\n",
+			v.Break.Seq, v.Break.Problem, auditRecords(v.Records))
+	}
+	if err != nil {
+		return err
+	}
+	if !v.Intact {
+		return errAuditBroken
+	}
+	return nil
+}
+
+func auditRecords(n int64) string {
+	if n == 1 {
+		return "1 Audit Record"
+	}
+	return fmt.Sprintf("%d Audit Records", n)
 }
 
 func pluginSHA256(args []string, stdout io.Writer) error {

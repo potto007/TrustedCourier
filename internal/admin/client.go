@@ -60,6 +60,13 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 	return status, err
 }
 
+// VerifyAudit checks the audit chain.
+func (c *Client) VerifyAudit(ctx context.Context) (AuditVerification, error) {
+	var v AuditVerification
+	err := c.do(ctx, http.MethodPost, "/v1/audit/verify", nil, &v)
+	return v, err
+}
+
 // RevokeAgentToken revokes the Agent Token with id.
 func (c *Client) RevokeAgentToken(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/agent-tokens/"+url.PathEscape(id), nil, nil)
