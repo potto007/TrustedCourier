@@ -81,6 +81,8 @@ func startProxy(t *testing.T, policy string) (*harness.Installation, *harness.Se
 	tc := harness.New(t)
 	srv := tc.Start(proxyConfig)
 	waitForPlugin(t, srv, "fake", running)
+	// Wait until Deliveries are served, for callers that build their own URL.
+	srv.AgentURL()
 	return tc, srv, issueAgentToken(t, srv, policy, "1h").Token
 }
 

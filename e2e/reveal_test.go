@@ -128,7 +128,7 @@ func TestBackendFailureHidesTheBackendFromTheAgent(t *testing.T) {
 	srv := tc.Start(strings.Replace(revealConfig, "{{.Fake.Path}}", path, 1))
 	waitForPlugin(t, srv, "fake", running)
 	token := "Bearer " + issueAgentToken(t, srv, "github-reveal", "1h").Token
-	tc.SetBackendSecrets(path, map[string]string{"kv/openai": "test-value-1"})
+	tc.SetBackendSecrets(path, map[string]string{"kv/openai": "test-value-1", harness.AuditSigningKeyLocation: harness.AuditSigningKey})
 
 	got := reveal(t, srv, token, "github")
 	if got.Status != http.StatusBadGateway {
