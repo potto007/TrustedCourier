@@ -253,8 +253,9 @@ components:
       description: |
         The server cannot serve the Delivery right now: it has no locked
         memory left to hold the Secret, or it has not loaded the audit
-        signing key yet, in which case it answers every request this way,
-        with `Retry-After`, before checking the Agent Token.
+        signing key yet or cannot store Audit Records, in which case it
+        answers every request this way, with `Retry-After`, before checking
+        the Agent Token.
       headers:
         Retry-After:
           schema:

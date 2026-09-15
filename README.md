@@ -235,7 +235,7 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 | 401 | The Agent Token is missing, presented twice, unknown, expired, or revoked. |
 | 403 | Anything else, including an unknown Upstream name or a method or path the Policy does not allow. The body is the same as Reveal Delivery's 403. |
 | 502 | The Backend could not return the Secret, the Upstream could not be reached or its certificate did not verify, or its response has a `Content-Encoding` Redaction cannot read. Details go to the server log only. |
-| 503 | The server has no locked memory left to hold the Secret, or has not loaded the audit signing key yet. |
+| 503 | The server has no locked memory left to hold the Secret, has not loaded the audit signing key yet, or cannot store Audit Records. |
 | 504 | Neither the Upstream's response nor the Agent's request body moved for 5 minutes before the response started. |
 
 The Agent API is described by an OpenAPI 3.1 spec in [`docs/api/agent-api.openapi.yaml`](docs/api/agent-api.openapi.yaml). Routes, credential slots, and Upstream trust are recorded in [ADR-0013](docs/decisions/0013-proxy-delivery-routes-slots-and-upstream-trust.md), and Redaction in [ADR-0014](docs/decisions/0014-redaction-masks-in-place.md).
@@ -357,7 +357,7 @@ The body is the Secret, byte for byte, with `Cache-Control: no-store`. TrustedCo
 | 403 | Anything else: the Secret Name does not exist, no attached Policy lists it, or the Policy allows only `proxy`. The body is identical in every case, so Agents cannot discover Secret Names. |
 | 405 | Any method but `GET`, including `HEAD`. |
 | 502 | The Backend could not return the Secret. Details go to the server log only. |
-| 503 | The server has no locked memory left to hold the Secret (raise `RLIMIT_MEMLOCK`), or has not loaded the audit signing key yet (`tc status` says why). |
+| 503 | The server has no locked memory left to hold the Secret (raise `RLIMIT_MEMLOCK`), or has not loaded the audit signing key yet or cannot store Audit Records (`tc status` says why). |
 
 The Agent Token may go in `X-TC-Agent-Token` instead of `Authorization`. The Agent API serves plain HTTP, so until TLS lands ([#13](https://github.com/potto007/TrustedCourier/issues/13)) it listens only on a loopback IP address ([ADR-0012](docs/decisions/0012-reveal-delivery-api-and-secret-memory.md)).
 
@@ -380,6 +380,8 @@ Every Delivery attempt made with a valid Agent Token, allowed or denied, produce
 | `prev_hash`, `hash` | The previous record's hash, and this record's: the SHA-256 of the line with its final `,"hash":"..."` member removed. The first `prev_hash` is 64 zeros. |
 
 Records never contain a Secret's value, request or response bodies, paths, or error text from a Backend or Upstream. To check a streamed record, hash the line exactly as received, minus the `hash` member. Re-encoding the JSON can change the bytes. A Proxy Delivery still streaming 5 seconds after SIGTERM is cut off and recorded with the failure `cut off by server shutdown`.
+
+If a record cannot be stored, say because the disk is full, TrustedCourier keeps it in memory, retries it every few seconds, and answers every new Agent API request with 503 until it and every record behind it are stored in order. Deliveries already under way finish. `tc status` shows how many records are waiting and why, and Deliveries resume on their own. A record still waiting at shutdown is logged to stderr as its JSON object ([ADR-0020](docs/decisions/0020-deliveries-stop-while-audit-records-cannot-be-stored.md)).
 
 `tc audit verify` walks the chain in SQLite and reports the first break. A deleted record, an altered one, or one that no longer chains all count:
 
@@ -494,7 +496,7 @@ Two things trip people up with the admin socket. The default `/run/trustedcourie
 - A plugin that crashes is restarted with exponential backoff, from 250 ms to 30 s. It never takes the server down.
 - In the core, a Secret lives in `mlock`ed memory outside the Go heap, is wiped when the response is written, and prints as a placeholder if formatted or logged. A Delivery fails rather than hold a Secret in memory that could be swapped. The e2e harness fails any test whose server output, the audit stream included, contains a Secret value.
 - Audit Records are hash-chained, so `tc audit verify` detects a record deleted or altered in SQLite ([ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md)).
-- The chain head is signed with an Ed25519 audit signing key held in locked memory and never on disk, so a chain rebuilt with fresh hashes fails verification. No Delivery is served until the key is loaded ([ADR-0019](docs/decisions/0019-signed-audit-checkpoints.md)).
+- The chain head is signed with an Ed25519 audit signing key held in locked memory and never on disk, so a chain rebuilt with fresh hashes fails verification. No Delivery is served until the key is loaded ([ADR-0019](docs/decisions/0019-signed-audit-checkpoints.md)), nor while Audit Records cannot be stored ([ADR-0020](docs/decisions/0020-deliveries-stop-while-audit-records-cannot-be-stored.md)).
 
 ## Repository layout
 
