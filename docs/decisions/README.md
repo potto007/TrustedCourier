@@ -22,3 +22,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0016](0016-audit-record-stream-chain-and-verify.md) | Audit Records stream on stdout, start at authentication, and chain over their JSON encoding | accepted |
 | [0017](0017-injection-template-kinds-presets-and-tc-env.md) | Query and basic auth Injection Templates, Presets as data, and `tc env` | accepted |
 | [0018](0018-policy-method-and-path-limits.md) | Policies limit Proxy Delivery by method and by path prefix on whole decoded segments | accepted |
+| [0019](0019-signed-audit-checkpoints.md) | Audit checkpoints sign the chain head in a linked binary message, and Deliveries wait for the key | accepted |

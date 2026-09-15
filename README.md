@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction and hash-chained Audit Records, work today. A real Backend, TLS, and signed audit checkpoints do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction and hash-chained Audit Records under signed checkpoints, work today. A real Backend and TLS do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -51,7 +51,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
 | Method and path limits in Policies | done |
 | Hash-chained Audit Records, `tc audit verify` | done |
-| Signed audit checkpoints | [#10](https://github.com/potto007/TrustedCourier/issues/10) |
+| Signed audit checkpoints | done |
 | TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
@@ -171,20 +171,26 @@ backend_plugins:
 
 The plugin user must differ from the server's user and must not be able to read the config file, so a server that runs plugins starts as root. For development, `insecure_share_core_user: true` in place of `user` runs the plugin as the server's own user and logs a warning.
 
-`tc status` shows each plugin's state, health, and capabilities:
+`tc status` shows each plugin's state, health, and capabilities, and whether the [audit signing key](#audit) is loaded:
 
 ```
 BACKEND PLUGIN  STATE    HEALTH   CAPABILITIES       RESTARTS  DETAIL
 openbao         running  healthy  courier-key-write  0         ...
+
+Audit signing key: loaded
 ```
 
 ### Proxy Delivery
 
-Pin a Secret Name to its Upstreams, say where the Secret goes with an Injection Template, let a Policy proxy it, and turn on the Agent API:
+Pin a Secret Name to its Upstreams, say where the Secret goes with an Injection Template, let a Policy proxy it, and turn on the Agent API with the key that signs its [audit trail](#audit):
 
 ```yaml
 agent_api:
   listen: 127.0.0.1:8200
+audit:
+  signing_key:
+    backend: openbao
+    location: secret/data/trustedcourier#audit-signing-key
 secrets:
   openai:
     backend: openbao
@@ -229,7 +235,7 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 | 401 | The Agent Token is missing, presented twice, unknown, expired, or revoked. |
 | 403 | Anything else, including an unknown Upstream name or a method or path the Policy does not allow. The body is the same as Reveal Delivery's 403. |
 | 502 | The Backend could not return the Secret, the Upstream could not be reached or its certificate did not verify, or its response has a `Content-Encoding` Redaction cannot read. Details go to the server log only. |
-| 503 | The server has no locked memory left to hold the Secret. |
+| 503 | The server has no locked memory left to hold the Secret, or has not loaded the audit signing key yet. |
 | 504 | Neither the Upstream's response nor the Agent's request body moved for 5 minutes before the response started. |
 
 The Agent API is described by an OpenAPI 3.1 spec in [`docs/api/agent-api.openapi.yaml`](docs/api/agent-api.openapi.yaml). Routes, credential slots, and Upstream trust are recorded in [ADR-0013](docs/decisions/0013-proxy-delivery-routes-slots-and-upstream-trust.md), and Redaction in [ADR-0014](docs/decisions/0014-redaction-masks-in-place.md).
@@ -316,11 +322,15 @@ Replace `<Agent Token>` with a token from `tc token issue`; the server keeps onl
 
 ### Reveal Delivery
 
-Map a Secret Name to its location in a Backend, let a Policy reveal it, and turn on the Agent API:
+Map a Secret Name to its location in a Backend, let a Policy reveal it, and turn on the Agent API with its audit signing key:
 
 ```yaml
 agent_api:
   listen: 127.0.0.1:8200
+audit:
+  signing_key:
+    backend: openbao
+    location: secret/data/trustedcourier#audit-signing-key
 secrets:
   github:
     backend: openbao
@@ -347,7 +357,7 @@ The body is the Secret, byte for byte, with `Cache-Control: no-store`. TrustedCo
 | 403 | Anything else: the Secret Name does not exist, no attached Policy lists it, or the Policy allows only `proxy`. The body is identical in every case, so Agents cannot discover Secret Names. |
 | 405 | Any method but `GET`, including `HEAD`. |
 | 502 | The Backend could not return the Secret. Details go to the server log only. |
-| 503 | The server has no locked memory left to hold the Secret. Raise `RLIMIT_MEMLOCK`. |
+| 503 | The server has no locked memory left to hold the Secret (raise `RLIMIT_MEMLOCK`), or has not loaded the audit signing key yet (`tc status` says why). |
 
 The Agent Token may go in `X-TC-Agent-Token` instead of `Authorization`. The Agent API serves plain HTTP, so until TLS lands ([#13](https://github.com/potto007/TrustedCourier/issues/13)) it listens only on a loopback IP address ([ADR-0012](docs/decisions/0012-reveal-delivery-api-and-secret-memory.md)).
 
@@ -378,7 +388,35 @@ Audit chain broken at record 2: record 2 does not match its hash
 1 Audit Record before it intact
 ```
 
-It exits 0 when the chain is intact and 1 when it is broken, and takes `--json`. Removing or replacing records at the end of the chain, or adding one after it, is caught while the server that wrote them runs. Removal while it was stopped needs the signed checkpoints of [#10](https://github.com/potto007/TrustedCourier/issues/10). The stream, the chain's format, and which requests count are recorded in [ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md).
+It exits 0 when the chain is intact and 1 when it is broken, and takes `--json`. Removing or replacing records at the end of the chain, or adding one after it, is caught while the server that wrote them runs. The stream, the chain's format, and which requests count are recorded in [ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md).
+
+#### Signed checkpoints
+
+Anyone who can write the database could rebuild the whole chain with fresh hashes. So TrustedCourier signs the chain head with an Ed25519 audit signing key, a Courier Key it fetches from a Backend and holds only in locked memory. Create one and store it in the Backend:
+
+```sh
+openssl genpkey -algorithm ed25519
+```
+
+The Backend's value is that PKCS #8 PEM block and nothing else. Point `audit.signing_key` at it, which the Agent API requires:
+
+```yaml
+audit:
+  signing_key:
+    backend: openbao
+    location: secret/data/trustedcourier#audit-signing-key
+  checkpoints:
+    records: 1000   # sign once this many records follow the last checkpoint
+    interval: 1m    # and at least this often while any do
+```
+
+A checkpoint is also signed at shutdown. Until the key loads, the Agent API answers every request with 503 and writes no Audit Records; the server retries every few seconds, and `tc status` says what went wrong. `tc audit verify` then checks every checkpoint against the key:
+
+```
+Audit chain intact: 5210 Audit Records, 6 signed checkpoints
+```
+
+A chain rewritten with recomputed hashes, a checkpoint that was deleted or does not verify, and records removed at the end while the server was stopped all break verification, from the database and key alone. Two things stay out of reach without the stream: records removed together with every checkpoint after them, and a rewrite of the records after the last checkpoint. Rotating the key makes earlier checkpoints fail. Checkpoints live in the `audit_checkpoints` table, and what each signature covers is in [ADR-0019](docs/decisions/0019-signed-audit-checkpoints.md).
 
 ## CLI
 
@@ -432,6 +470,10 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `secrets.<name>.upstreams.<name>.url` | yes | The Upstream's `https` base URL, optionally with a path. No user information, query, or fragment. |
 | `secrets.<name>.upstreams.<name>.ca_bundle` | no | PEM file of CA certificates that replace the system roots for this Upstream. |
 | `agent_api.listen` | no | Loopback IP address and port for the Agent API, such as `127.0.0.1:8200` or `[::1]:8200`. Omit it to serve no Agent API. |
+| `audit.signing_key.backend` | with `agent_api.listen` | The `backend_plugins` entry that holds the audit signing key. |
+| `audit.signing_key.location` | with `agent_api.listen` | The key's location in that Backend: an Ed25519 private key as PKCS #8 PEM. No Secret Name may map to it. |
+| `audit.checkpoints.records` | no | Sign a checkpoint once this many Audit Records follow the last one. At least 1; defaults to 1000. |
+| `audit.checkpoints.interval` | no | Sign a checkpoint at least this often while records are waiting for one, as a Go duration. At least `1s`; defaults to `1m`. |
 
 Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, can list each only once, may list only Secret Names defined under `secrets`, and may allow `proxy` only for Secret Names with `upstreams`. `methods` and `paths` need `proxy` in `delivery`, cannot be empty lists or keys without a value, and are refused when they hold an unknown method or a path prefix with a dot segment, an empty segment, `?`, `#`, `;` (raw or `%3B`), or an encoded slash or backslash. A typo there stops the server at startup instead of denying Agents at runtime. Upstream names follow the same rules as Secret Names.
 
@@ -452,6 +494,7 @@ Two things trip people up with the admin socket. The default `/run/trustedcourie
 - A plugin that crashes is restarted with exponential backoff, from 250 ms to 30 s. It never takes the server down.
 - In the core, a Secret lives in `mlock`ed memory outside the Go heap, is wiped when the response is written, and prints as a placeholder if formatted or logged. A Delivery fails rather than hold a Secret in memory that could be swapped. The e2e harness fails any test whose server output, the audit stream included, contains a Secret value.
 - Audit Records are hash-chained, so `tc audit verify` detects a record deleted or altered in SQLite ([ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md)).
+- The chain head is signed with an Ed25519 audit signing key held in locked memory and never on disk, so a chain rebuilt with fresh hashes fails verification. No Delivery is served until the key is loaded ([ADR-0019](docs/decisions/0019-signed-audit-checkpoints.md)).
 
 ## Repository layout
 
@@ -463,12 +506,12 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `internal/access` | Operator Credential and Agent Token issue, verify, revoke; Policy evaluation. |
 | `internal/admin` | Admin API server and client over the unix socket. |
 | `internal/agentapi` | Agent API server: Proxy Delivery and Reveal Delivery. |
-| `internal/audit` | Audit Records: appended to SQLite, hash-chained, streamed as JSON lines, and verified. |
+| `internal/audit` | Audit Records: appended to SQLite, hash-chained, streamed as JSON lines, covered by signed checkpoints, and verified. |
 | `internal/cli` | Command-line parsing and output. |
 | `internal/config` | Config loading and validation. |
 | `internal/pluginhost` | Plugin Host: verifies, launches, supervises, and reports Backend Plugins, and fetches Secrets through them. |
 | `internal/resolver` | Secret Resolver: Secret Name to Backend location to Secret. |
-| `internal/secret` | The Secret type: locked, unprintable, wiped on release. |
+| `internal/secret` | The Secret type and the Ed25519 audit signing key: locked, unprintable, wiped on release. |
 | `internal/server` | Wires config, database, admin API, and Agent API into a running process. |
 | `internal/store` | SQLite database and migrations, through pure-Go `modernc.org/sqlite` ([ADR-0009](docs/decisions/0009-pure-go-sqlite.md)). |
 | `e2e` | Black-box tests that build `tc` and drive a real server through its config, socket, CLI, and Agent API, against a fake TLS Upstream. |

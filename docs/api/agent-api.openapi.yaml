@@ -71,7 +71,7 @@ paths:
         "502":
           $ref: "#/components/responses/BackendFailed"
         "503":
-          $ref: "#/components/responses/NoLockedMemory"
+          $ref: "#/components/responses/Unavailable"
 
   /proxy/{secret_name}/{upstream}/{path}:
     summary: Proxy Delivery
@@ -99,7 +99,7 @@ paths:
         "502":
           $ref: "#/components/responses/ProxyFailed"
         "503":
-          $ref: "#/components/responses/NoLockedMemory"
+          $ref: "#/components/responses/Unavailable"
         "504":
           $ref: "#/components/responses/ProxyTimeout"
         default:
@@ -249,8 +249,16 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-    NoLockedMemory:
-      description: The server has no locked memory left to hold the Secret.
+    Unavailable:
+      description: |
+        The server cannot serve the Delivery right now: it has no locked
+        memory left to hold the Secret, or it has not loaded the audit
+        signing key yet, in which case it answers every request this way,
+        with `Retry-After`, before checking the Agent Token.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
       content:
         application/json:
           schema:
