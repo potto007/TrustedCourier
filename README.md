@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Reveal Delivery on loopback work today. Proxy Delivery, a real Backend, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback work today. Redaction, a real Backend, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -11,7 +11,7 @@ The usual way to give an Agent a Secret is an environment variable or a fetch fr
 TrustedCourier sits between the Agent and the service it calls. In the default mode (Proxy Delivery), the Agent points its SDK's base URL at a TrustedCourier route and puts its Agent Token where the API key normally goes. TrustedCourier checks the token against its Policies, swaps in the real Secret, forwards the request to the pinned Upstream over verified TLS, and strips the Secret from the response. The Agent never sees the value. The planned v1 setup for an OpenAI Agent is two environment variables.
 
 ```sh
-OPENAI_BASE_URL=https://tc.example.com/proxy/openai/v1   # route syntax not final
+OPENAI_BASE_URL=https://tc.example.com/proxy/openai/api  # Secret Name, then Upstream name
 OPENAI_API_KEY=tcat_...                                  # an Agent Token, not the OpenAI key
 ```
 
@@ -45,13 +45,15 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Plugin SDK and conformance kit skeleton | done |
 | Secret Names mapped to Backend locations in config | done |
 | Reveal Delivery on a loopback Agent API | done |
+| Proxy Delivery with a header Injection Template, OpenAPI spec for the Agent API | done |
 | OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
-| Proxy Delivery, Redaction | [#5](https://github.com/potto007/TrustedCourier/issues/5), [#6](https://github.com/potto007/TrustedCourier/issues/6) |
+| Redaction | [#6](https://github.com/potto007/TrustedCourier/issues/6) |
+| Method and path limits, query and basic auth Injection Templates, Presets | [#7](https://github.com/potto007/TrustedCourier/issues/7), [#8](https://github.com/potto007/TrustedCourier/issues/8) |
 | Audit Records and checkpoints | [#9](https://github.com/potto007/TrustedCourier/issues/9), [#10](https://github.com/potto007/TrustedCourier/issues/10) |
 | TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
-An Agent can ask for a Secret by Secret Name over plain HTTP on loopback, and gets it where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
+An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over plain HTTP on loopback, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
 
 ## Quickstart
 
@@ -167,6 +169,59 @@ BACKEND PLUGIN  STATE    HEALTH   CAPABILITIES       RESTARTS  DETAIL
 openbao         running  healthy  courier-key-write  0         ...
 ```
 
+### Proxy Delivery
+
+Pin a Secret Name to its Upstreams, say where the Secret goes with an Injection Template, let a Policy proxy it, and turn on the Agent API:
+
+```yaml
+agent_api:
+  listen: 127.0.0.1:8200
+secrets:
+  openai:
+    backend: openbao
+    location: secret/data/openai#key
+    injection_template:
+      header:
+        name: Authorization
+        value: Bearer {secret}
+    upstreams:
+      api:
+        url: https://api.openai.com/v1
+policies:
+  openai-proxy:
+    secrets:
+      - name: openai
+        delivery: [proxy]
+```
+
+Issue an Agent Token with that Policy and give it to the Agent in place of the API key:
+
+```sh
+OPENAI_BASE_URL=http://127.0.0.1:8200/proxy/openai/api
+OPENAI_API_KEY=tcat_...
+```
+
+The route is `/proxy/<Secret Name>/<Upstream name>`. The rest of the path is appended to the Upstream's URL, so `/proxy/openai/api/chat/completions` goes to `https://api.openai.com/v1/chat/completions`, and the query goes along unchanged. A Secret Name pinned to several Upstreams has one route for each.
+
+TrustedCourier finds the Agent Token where the Injection Template would put the Secret (here `Authorization: Bearer tcat_...`) or in `X-TC-Agent-Token`, never in the URL. It fetches the Secret from the Backend, puts it in the header, removes the Agent Token, and forwards the request. The Agent never sees the Secret, and the Upstream never sees the Agent Token.
+
+- Upstream URLs must be `https`, and TLS is always verified. There is no setting to skip it. For an internal CA, set `ca_bundle` on the Upstream to a PEM file; it replaces the system roots for that Upstream only.
+- Redirects are never followed. The 3xx and its `Location` reach the Agent unchanged, so the Secret is never re-sent to another host.
+- HTTP/1.1 and HTTP/2 both work, to the Agent API (HTTP/2 with prior knowledge, since it is plain HTTP for now) and to the Upstream. Server-sent event streams pass through as they arrive.
+- WebSockets and other protocol upgrades are refused.
+- Redaction is not in yet ([#6](https://github.com/potto007/TrustedCourier/issues/6)): an Upstream that echoes its credential back sends the Secret to the Agent.
+
+| Status | When |
+| --- | --- |
+| Upstream's | The request reached the Upstream. Its response comes back with `Cache-Control: no-store`. |
+| 400 | The path contains a dot segment (`..`, `%2e%2e`), or the request asks for a protocol upgrade. |
+| 401 | The Agent Token is missing, presented twice, unknown, expired, or revoked. |
+| 403 | Anything else, including an unknown Upstream name. The body is the same as Reveal Delivery's 403. |
+| 502 | The Backend could not return the Secret, or the Upstream could not be reached or its certificate did not verify. Details go to the server log only. |
+| 503 | The server has no locked memory left to hold the Secret. |
+
+The Agent API is described by an OpenAPI 3.1 spec in [`docs/api/agent-api.openapi.yaml`](docs/api/agent-api.openapi.yaml). Routes, credential slots, and Upstream trust are recorded in [ADR-0013](docs/decisions/0013-proxy-delivery-routes-slots-and-upstream-trust.md).
+
 ### Reveal Delivery
 
 Map a Secret Name to its location in a Backend, let a Policy reveal it, and turn on the Agent API:
@@ -242,9 +297,14 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `secrets` | no | Map of Secret Name to where its Secret lives. |
 | `secrets.<name>.backend` | yes | The `backend_plugins` entry that holds the Secret. |
 | `secrets.<name>.location` | yes | The Secret's location in that Backend, up to 1024 bytes without control characters. |
+| `secrets.<name>.injection_template.header.name` | with `upstreams` | The header Proxy Delivery puts the Secret in. Hop-by-hop headers, `Host`, `Content-Length`, and `X-TC-Agent-Token` are refused. |
+| `secrets.<name>.injection_template.header.value` | with `upstreams` | The header's value, with `{secret}` exactly once where the Secret goes, such as `Bearer {secret}`. |
+| `secrets.<name>.upstreams` | with `injection_template` | Map of Upstream name to Upstream. Each is served at `/proxy/<Secret Name>/<Upstream name>`. |
+| `secrets.<name>.upstreams.<name>.url` | yes | The Upstream's `https` base URL, optionally with a path. No user information, query, or fragment. |
+| `secrets.<name>.upstreams.<name>.ca_bundle` | no | PEM file of CA certificates that replace the system roots for this Upstream. |
 | `agent_api.listen` | no | Loopback IP address and port for the Agent API, such as `127.0.0.1:8200` or `[::1]:8200`. Omit it to serve no Agent API. |
 
-Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, can list each only once, and may list only Secret Names defined under `secrets`. A typo there stops the server at startup instead of denying Agents at runtime.
+Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, can list each only once, may list only Secret Names defined under `secrets`, and may allow `proxy` only for Secret Names with `upstreams`. A typo there stops the server at startup instead of denying Agents at runtime. Upstream names follow the same rules as Secret Names.
 
 Two things trip people up with the admin socket. The default `/run/trustedcourier/` usually needs root to create, so for a non-root server pick a path you own, such as one under `$XDG_RUNTIME_DIR`. And unix socket paths are limited to about 104 to 108 bytes depending on the OS, so a deeply nested path fails with `bind: invalid argument`.
 
@@ -272,7 +332,7 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `cmd/tc` | The `tc` binary. |
 | `internal/access` | Operator Credential and Agent Token issue, verify, revoke; Policy evaluation. |
 | `internal/admin` | Admin API server and client over the unix socket. |
-| `internal/agentapi` | Agent API server: Reveal Delivery. |
+| `internal/agentapi` | Agent API server: Proxy Delivery and Reveal Delivery. |
 | `internal/cli` | Command-line parsing and output. |
 | `internal/config` | Config loading and validation. |
 | `internal/pluginhost` | Plugin Host: verifies, launches, supervises, and reports Backend Plugins, and fetches Secrets through them. |
@@ -280,7 +340,8 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `internal/secret` | The Secret type: locked, unprintable, wiped on release. |
 | `internal/server` | Wires config, database, admin API, and Agent API into a running process. |
 | `internal/store` | SQLite database and migrations, through pure-Go `modernc.org/sqlite` ([ADR-0009](docs/decisions/0009-pure-go-sqlite.md)). |
-| `e2e` | Black-box tests that build `tc` and drive a real server through its config, socket, and CLI. |
+| `e2e` | Black-box tests that build `tc` and drive a real server through its config, socket, CLI, and Agent API, against a fake TLS Upstream. |
+| `docs/api` | OpenAPI spec for the Agent API. |
 | `sdk/plugin` | Plugin SDK module: the `Backend` interface and `Serve` for Plugin Authors, the wire protocol (`protocol`), the validating client (`client`), the conformance kit (`conformance`), and the fake Backend Plugin used by tests. |
 | `plugins/openbao` | OpenBao Backend Plugin module. A placeholder until [#18](https://github.com/potto007/TrustedCourier/issues/18). |
 
