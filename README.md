@@ -49,7 +49,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Presets for OpenAI, Anthropic, and GitHub, `tc env` | done |
 | Redaction | done |
 | OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
-| Method and path limits | [#7](https://github.com/potto007/TrustedCourier/issues/7) |
+| Method and path limits in Policies | done |
 | Hash-chained Audit Records, `tc audit verify` | done |
 | Signed audit checkpoints | [#10](https://github.com/potto007/TrustedCourier/issues/10) |
 | TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
@@ -227,12 +227,33 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 | Upstream's | The request reached the Upstream. Its response comes back with `Cache-Control: no-store`. |
 | 400 | The path contains a dot segment (`..`, `%2e%2e`, `..;`), or the request asks for a protocol upgrade. |
 | 401 | The Agent Token is missing, presented twice, unknown, expired, or revoked. |
-| 403 | Anything else, including an unknown Upstream name. The body is the same as Reveal Delivery's 403. |
+| 403 | Anything else, including an unknown Upstream name or a method or path the Policy does not allow. The body is the same as Reveal Delivery's 403. |
 | 502 | The Backend could not return the Secret, the Upstream could not be reached or its certificate did not verify, or its response has a `Content-Encoding` Redaction cannot read. Details go to the server log only. |
 | 503 | The server has no locked memory left to hold the Secret. |
 | 504 | Neither the Upstream's response nor the Agent's request body moved for 5 minutes before the response started. |
 
 The Agent API is described by an OpenAPI 3.1 spec in [`docs/api/agent-api.openapi.yaml`](docs/api/agent-api.openapi.yaml). Routes, credential slots, and Upstream trust are recorded in [ADR-0013](docs/decisions/0013-proxy-delivery-routes-slots-and-upstream-trust.md), and Redaction in [ADR-0014](docs/decisions/0014-redaction-masks-in-place.md).
+
+#### Method and path limits
+
+A Policy entry can limit Proxy Delivery to some HTTP methods and path prefixes, so an Agent with a GitHub Secret can read issues but cannot delete a repository:
+
+```yaml
+policies:
+  github-issues:
+    secrets:
+      - name: github
+        delivery: [proxy]
+        methods: [GET, HEAD]
+        paths: [/repos/acme/app/issues, /user]
+```
+
+- `methods` lists any of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, and `OPTIONS`, in any case. Requests must use the uppercase method. `GET` does not imply `HEAD`.
+- `paths` match the path after `/proxy/<Secret Name>/<Upstream name>`, not the Upstream URL's own path, so the same Policy works for GitHub Enterprise Server at `/api/v3`. A prefix matches whole segments after percent-decoding: `/repos/acme/app/issues` allows `/repos/acme/app/issues` and `/repos/acme/app/issues/7`, not `/repos/acme/app/issuesx`, and `/%72epos/...` counts as `/repos/...`. A path with an encoded slash, a `;` parameter, an empty segment, or invalid UTF-8 inside the prefix's segments does not match. Dot segments still get 400.
+- One entry must allow both the method and the path. Among an Agent Token's Policies, any entry that allows the request is enough, and an entry without `methods` or `paths` allows any method or path.
+- Everything else gets the same 403 as every other denial and never reaches the Upstream. The Audit Record's reason is `no Policy allows the method` or `no Policy allows the path`.
+
+Recorded in [ADR-0018](docs/decisions/0018-policy-method-and-path-limits.md).
 
 #### Injection Templates
 
@@ -391,6 +412,8 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `policies` | no | Map of Policy name to Policy. |
 | `policies.<name>.secrets` | yes | List of `{name, delivery}` entries, one per Secret Name. |
 | `policies.<name>.secrets[].delivery` | yes | One or both of `proxy` and `reveal`. |
+| `policies.<name>.secrets[].methods` | no | HTTP methods Proxy Delivery may send: any of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`. Omit to allow any method. |
+| `policies.<name>.secrets[].paths` | no | Path prefixes, starting with `/`, that Proxy Delivery may reach below the route. Omit to allow any path. |
 | `backend_plugins` | no | Map of Backend Plugin name to Backend Plugin. |
 | `backend_plugins.<name>.path` | yes | Path to the plugin binary. |
 | `backend_plugins.<name>.sha256` | yes | The binary's SHA-256 as `tc plugin sha256` prints it. |
@@ -410,7 +433,7 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `secrets.<name>.upstreams.<name>.ca_bundle` | no | PEM file of CA certificates that replace the system roots for this Upstream. |
 | `agent_api.listen` | no | Loopback IP address and port for the Agent API, such as `127.0.0.1:8200` or `[::1]:8200`. Omit it to serve no Agent API. |
 
-Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, can list each only once, may list only Secret Names defined under `secrets`, and may allow `proxy` only for Secret Names with `upstreams`. A typo there stops the server at startup instead of denying Agents at runtime. Upstream names follow the same rules as Secret Names.
+Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, can list each only once, may list only Secret Names defined under `secrets`, and may allow `proxy` only for Secret Names with `upstreams`. `methods` and `paths` need `proxy` in `delivery`, cannot be empty lists, and are refused when they hold an unknown method or a path prefix with a dot segment, an empty segment, `?`, `#`, `;`, or an encoded slash or backslash. A typo there stops the server at startup instead of denying Agents at runtime. Upstream names follow the same rules as Secret Names.
 
 Two things trip people up with the admin socket. The default `/run/trustedcourier/` usually needs root to create, so for a non-root server pick a path you own, such as one under `$XDG_RUNTIME_DIR`. And unix socket paths are limited to about 104 to 108 bytes depending on the OS, so a deeply nested path fails with `bind: invalid argument`.
 

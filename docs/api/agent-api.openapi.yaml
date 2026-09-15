@@ -26,8 +26,9 @@ info:
     After authentication, every denial gets the identical 403 body, whether
     the Secret Name does not exist, no attached Policy lists it, the Policy
     does not allow the Delivery mode, or (for Proxy Delivery) the Upstream is
-    not pinned to the Secret Name. Agents cannot discover Secret Names or
-    Upstreams from the Agent API.
+    not pinned to the Secret Name or the Policy does not allow the request's
+    method or path. Agents cannot discover Secret Names or Upstreams from the
+    Agent API.
   license:
     name: Apache-2.0
     identifier: Apache-2.0
