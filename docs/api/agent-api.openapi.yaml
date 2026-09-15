@@ -234,9 +234,13 @@ components:
     Upstream:
       description: |
         The Upstream's response, status, headers, and body as the Upstream
-        sent them, except that `Cache-Control` is `no-store`. Redirects are
-        never followed: a 3xx and its `Location` reach the Agent unchanged.
-        Server-sent event streams pass through as they arrive.
+        sent them, except that `Cache-Control` is `no-store` and Redaction
+        masks every exact match of the Secret, in headers, body, and trailers,
+        with a run of `*` of the same length. Redirects are never followed: a
+        3xx and its `Location` reach the Agent unchanged. Server-sent event
+        streams pass through as they arrive, held back only by bytes that
+        could begin the Secret. A gzip body arrives decoded, and `Range`
+        requests get the whole response.
     ProxyBadRequest:
       description: |
         The path contains a dot segment, or the request asks for a protocol
@@ -258,7 +262,8 @@ components:
       description: |
         The Backend could not return the Secret, the Secret cannot go in the
         Injection Template's header, or the Upstream could not be reached,
-        including when its TLS certificate does not verify. Details go to the
+        including when its TLS certificate does not verify, or its response
+        has a `Content-Encoding` Redaction cannot read. Details go to the
         server log only.
       content:
         application/json:

@@ -17,3 +17,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0011](0011-backend-plugin-host-and-protocol.md) | How the core launches and trusts Backend Plugins | accepted |
 | [0012](0012-reveal-delivery-api-and-secret-memory.md) | Reveal Delivery's Agent API and how the core holds a Secret | accepted |
 | [0013](0013-proxy-delivery-routes-slots-and-upstream-trust.md) | Proxy Delivery's routes, credential slots, and Upstream trust | accepted |
+| [0014](0014-redaction-masks-in-place.md) | Redaction masks the Secret in place and reads responses as plain bytes | accepted |
