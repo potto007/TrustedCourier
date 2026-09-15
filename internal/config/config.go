@@ -156,6 +156,18 @@ type Policy struct {
 type SecretAccess struct {
 	SecretName string
 	Delivery   []DeliveryMode
+	// Methods are the uppercase HTTP methods Proxy Delivery may send. Nil
+	// allows any method.
+	Methods []string
+	// Paths are the path prefixes Proxy Delivery may reach. Nil allows any
+	// path.
+	Paths []PathPrefix
+}
+
+// ProxyMethods are the HTTP methods a Policy may limit Proxy Delivery to.
+var ProxyMethods = []string{
+	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+	http.MethodPatch, http.MethodDelete, http.MethodOptions,
 }
 
 // DeliveryMode is proxy or reveal.
@@ -230,8 +242,10 @@ type filePolicy struct {
 }
 
 type fileSecretAccess struct {
-	Name     string   `yaml:"name"`
-	Delivery []string `yaml:"delivery"`
+	Name     string    `yaml:"name"`
+	Delivery []string  `yaml:"delivery"`
+	Methods  *[]string `yaml:"methods"` // nil when omitted
+	Paths    *[]string `yaml:"paths"`   // nil when omitted
 }
 
 // Load reads and validates the config file at path. Relative paths in the
@@ -618,9 +632,53 @@ func (p filePolicy) validate(name string) (Policy, error) {
 				access.Delivery = append(access.Delivery, mode)
 			}
 		}
+		if err := s.validateLimits(&access); err != nil {
+			return Policy{}, fmt.Errorf("Policy %q: Secret Name %q: %w", name, s.Name, err)
+		}
 		policy.Secrets = append(policy.Secrets, access)
 	}
 	return policy, nil
+}
+
+// validateLimits sets the methods and paths that limit access's Proxy
+// Delivery. An empty list is refused rather than read as allowing nothing or
+// everything.
+func (s fileSecretAccess) validateLimits(access *SecretAccess) error {
+	if s.Methods == nil && s.Paths == nil {
+		return nil
+	}
+	if !slices.Contains(access.Delivery, DeliveryProxy) {
+		return errors.New("methods and paths limit Proxy Delivery, which the entry does not allow")
+	}
+	if s.Methods != nil {
+		if len(*s.Methods) == 0 {
+			return errors.New("methods is empty; omit it to allow any method")
+		}
+		access.Methods = []string{}
+		for _, m := range *s.Methods {
+			method := strings.ToUpper(m)
+			if !slices.Contains(ProxyMethods, method) {
+				return fmt.Errorf("unknown method %q (want %s)", m, strings.Join(ProxyMethods, ", "))
+			}
+			if !slices.Contains(access.Methods, method) {
+				access.Methods = append(access.Methods, method)
+			}
+		}
+	}
+	if s.Paths != nil {
+		if len(*s.Paths) == 0 {
+			return errors.New("paths is empty; omit it to allow any path")
+		}
+		access.Paths = []PathPrefix{}
+		for _, p := range *s.Paths {
+			prefix, err := ParsePathPrefix(p)
+			if err != nil {
+				return fmt.Errorf("path %q: %w", p, err)
+			}
+			access.Paths = append(access.Paths, prefix)
+		}
+	}
+	return nil
 }
 
 func resolve(baseDir, path string) string {

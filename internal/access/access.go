@@ -277,6 +277,8 @@ type Denial string
 const (
 	DenialUnknownSecretName Denial = "unknown Secret Name"
 	DenialPolicy            Denial = "no Policy allows it"
+	DenialMethod            Denial = "no Policy allows the method"
+	DenialPath              Denial = "no Policy allows the path"
 )
 
 // Authorize reports whether tok's Policies allow Delivery of secretName in
@@ -295,6 +297,36 @@ func (s *Service) Authorize(tok AgentToken, secretName string, mode config.Deliv
 		}
 	}
 	return DenialPolicy, false
+}
+
+// AuthorizeProxy reports whether tok's Policies allow Proxy Delivery of
+// secretName for a request with method to escapedPath, the escaped path after
+// the Upstream name, and if not, why. One Policy entry must allow both the
+// method and the path; an entry without limits allows any of either.
+func (s *Service) AuthorizeProxy(tok AgentToken, secretName, method, escapedPath string) (Denial, bool) {
+	if _, ok := s.cfg.Secrets[secretName]; !ok {
+		return DenialUnknownSecretName, false
+	}
+	denial := DenialPolicy
+	for _, name := range tok.Policies {
+		for _, a := range s.cfg.Policies[name].Secrets {
+			if a.SecretName != secretName || !slices.Contains(a.Delivery, config.DeliveryProxy) {
+				continue
+			}
+			if a.Methods != nil && !slices.Contains(a.Methods, method) {
+				if denial == DenialPolicy {
+					denial = DenialMethod
+				}
+				continue
+			}
+			if a.Paths != nil && !slices.ContainsFunc(a.Paths, func(p config.PathPrefix) bool { return p.Matches(escapedPath) }) {
+				denial = DenialPath
+				continue
+			}
+			return "", true
+		}
+	}
+	return denial, false
 }
 
 func nullTime(v sql.NullInt64) *time.Time {
