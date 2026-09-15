@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -173,6 +174,137 @@ func TestQueryInjectionTemplateIsValidated(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			tc := harness.New(t)
 			code, stderr := tc.Refused(harness.AdminConfig + fakePluginConfig + name + "    injection_template:\n" + c.template + upstream)
+			if code == 0 {
+				t.Fatal("TrustedCourier started")
+			}
+			if !strings.Contains(stderr, c.wantErr) {
+				t.Fatalf("stderr does not contain %q:\n%s", c.wantErr, stderr)
+			}
+		})
+	}
+}
+
+const basicAuthSecretNames = `
+  twilio:
+    backend: fake
+    location: kv/github
+    injection_template:
+      basic_auth:
+        username: AC123
+        password: "{secret}"
+    upstreams:
+      api:
+        url: {{.Upstream.URL}}
+        ca_bundle: {{.Upstream.CABundle}}
+  stripe:
+    backend: fake
+    location: kv/openai
+    injection_template:
+      basic_auth:
+        username: "{secret}"
+    upstreams:
+      api:
+        url: {{.Upstream.URL}}
+        ca_bundle: {{.Upstream.CABundle}}
+`
+
+const basicAuthPolicies = `
+  basic-proxy:
+    secrets:
+      - name: twilio
+        delivery: [proxy]
+      - name: stripe
+        delivery: [proxy]
+`
+
+func basic(username, password string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+}
+
+func TestBasicAuthInjectionTemplateInjectsTheSecret(t *testing.T) {
+	tc, srv := startTemplates(t, basicAuthSecretNames, basicAuthPolicies)
+	token := issueAgentToken(t, srv, "basic-proxy", "1h").Token
+
+	cases := []struct {
+		name, path, want string
+		header           http.Header
+	}{
+		{"Agent Token as the password", "/proxy/twilio/api/v1/messages", basic("AC123", "test-value-2"),
+			http.Header{"Authorization": {basic("AC123", token)}}},
+		{"case-insensitive scheme", "/proxy/twilio/api/v1/messages", basic("AC123", "test-value-2"),
+			http.Header{"Authorization": {"basic " + strings.TrimPrefix(basic("AC123", token), "Basic ")}}},
+		{"Agent Token as the username", "/proxy/stripe/api/v1/charges", basic("test-value-1", ""),
+			http.Header{"Authorization": {basic(token, "")}}},
+		{"fallback header", "/proxy/twilio/api/v1/messages", basic("AC123", "test-value-2"),
+			http.Header{"X-Tc-Agent-Token": {token}, "Authorization": {basic("AC123", "placeholder")}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			before := len(tc.Upstream().Requests())
+			if got := proxy(t, srv, http.MethodGet, c.path, c.header, ""); got.Status != http.StatusOK {
+				t.Fatalf("proxy = %d %q, want 200\nserver stderr:\n%s", got.Status, got.Body, srv.Stderr())
+			}
+			reqs := tc.Upstream().Requests()
+			if len(reqs) != before+1 {
+				t.Fatalf("the Upstream received %d requests, want 1", len(reqs)-before)
+			}
+			up := reqs[before]
+			if v := up.Header.Values("Authorization"); len(v) != 1 || v[0] != c.want {
+				t.Errorf("the Upstream received Authorization %q, want %q", v, c.want)
+			}
+			assertNoAgentToken(t, up, token)
+		})
+	}
+}
+
+func TestBasicAuthInjectionTemplateSlotMatchesItsLiteralCredential(t *testing.T) {
+	tc, srv := startTemplates(t, basicAuthSecretNames, basicAuthPolicies)
+	token := issueAgentToken(t, srv, "basic-proxy", "1h").Token
+	for name, header := range map[string]string{
+		"other username":           basic("AC999", token),
+		"password beside username": basic(token, "x"),
+		"not base64":               "Basic " + token,
+	} {
+		got := proxy(t, srv, http.MethodGet, "/proxy/twilio/api/v1/messages", http.Header{"Authorization": {header}}, "")
+		if got.Status != http.StatusUnauthorized || !strings.Contains(got.Body, "Agent Token required") {
+			t.Errorf("%s: proxy = %d %q, want 401 Agent Token required", name, got.Status, got.Body)
+		}
+	}
+	if n := len(tc.Upstream().Requests()); n != 0 {
+		t.Fatalf("the Upstream received %d refused requests", n)
+	}
+}
+
+func TestBasicAuthInjectionTemplateRedactsTheEncodedSecret(t *testing.T) {
+	_, srv := startTemplates(t, basicAuthSecretNames, basicAuthPolicies)
+	token := issueAgentToken(t, srv, "basic-proxy", "1h").Token
+
+	got := proxy(t, srv, http.MethodGet, "/proxy/twilio/api/echo?header=Authorization", http.Header{"Authorization": {basic("AC123", token)}}, "")
+	encoded := strings.TrimPrefix(basic("AC123", "test-value-2"), "Basic ")
+	if want := "Basic " + strings.Repeat("*", len(encoded)); got.Status != http.StatusOK || got.Body != want || got.Header.Get("X-Echo") != want {
+		t.Fatalf("proxy = %d %q X-Echo %q, want 200 %q", got.Status, got.Body, got.Header.Get("X-Echo"), want)
+	}
+	for _, form := range []string{"test-value-2", encoded} {
+		if strings.Contains(got.Body, form) || strings.Contains(fmt.Sprint(got.Header), form) {
+			t.Errorf("the Agent received the Secret as %q: %v %q", form, got.Header, got.Body)
+		}
+	}
+}
+
+func TestBasicAuthInjectionTemplateIsValidated(t *testing.T) {
+	const name = "secrets:\n  twilio:\n    backend: fake\n    location: kv/openai\n"
+	const upstream = "    upstreams:\n      api:\n        url: https://api.example.com\n"
+	cases := []struct{ name, fields, wantErr string }{
+		{"no {secret}", "        username: a\n        password: b\n", "{secret}"},
+		{"{secret} twice", "        username: \"{secret}\"\n        password: \"{secret}\"\n", "{secret}"},
+		{"{secret} with other text", "        username: a\n        password: \"x{secret}\"\n", "whole"},
+		{"colon in the username", "        username: \"a:b\"\n        password: \"{secret}\"\n", "':'"},
+		{"control character", "        username: \"{secret}\"\n        password: \"a\\tb\"\n", "control character"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc := harness.New(t)
+			code, stderr := tc.Refused(harness.AdminConfig + fakePluginConfig + name + "    injection_template:\n      basic_auth:\n" + c.fields + upstream)
 			if code == 0 {
 				t.Fatal("TrustedCourier started")
 			}

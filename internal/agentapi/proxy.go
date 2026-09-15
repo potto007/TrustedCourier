@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -75,6 +76,8 @@ type slots struct {
 	headers map[string][]config.HeaderTemplate
 	// queries are the query parameter names, sorted.
 	queries []string
+	// basicAuth are the basic auth templates, read from Authorization.
+	basicAuth []config.BasicAuthTemplate
 }
 
 // slot is where an Agent Token was presented: a header or a query parameter.
@@ -90,6 +93,8 @@ func newSlots(cfg *config.Config) slots {
 			out.headers[t.Header.Name] = append(out.headers[t.Header.Name], *t.Header)
 		case t.Query != nil && !slices.Contains(out.queries, t.Query.Name):
 			out.queries = append(out.queries, t.Query.Name)
+		case t.BasicAuth != nil && !slices.Contains(out.basicAuth, *t.BasicAuth):
+			out.basicAuth = append(out.basicAuth, *t.BasicAuth)
 		}
 	}
 	slices.Sort(out.queries)
@@ -558,6 +563,9 @@ type credential struct {
 // Secret out of locked memory (ADR-0013).
 func render(t config.InjectionTemplate, value *secret.Secret) (credential, error) {
 	var b strings.Builder
+	if t.BasicAuth != nil {
+		return renderBasicAuth(t.BasicAuth, value)
+	}
 	if t.Query != nil {
 		b.Grow(value.Len())
 		if _, err := value.WriteTo(&b); err != nil {
@@ -578,6 +586,42 @@ func render(t config.InjectionTemplate, value *secret.Secret) (credential, error
 	v := b.String()
 	// The Secret is the part of the header between the template's text.
 	return credential{header: h.Name, headerValue: v, needles: []string{v[len(h.Prefix) : len(v)-len(h.Suffix)]}}, nil
+}
+
+var errUsernameColon = errors.New("the Secret contains ':', which a basic auth username cannot carry")
+
+// renderBasicAuth renders a basic auth template around value. The request
+// carries the Secret only base64-encoded, but Redaction needs its plain form
+// too, so both are needles.
+func renderBasicAuth(t *config.BasicAuthTemplate, value *secret.Secret) (credential, error) {
+	var b strings.Builder
+	b.Grow(len(t.Username) + 1 + value.Len() + len(t.Password))
+	b.WriteString(t.Username)
+	if !t.SecretIsUsername {
+		b.WriteByte(':')
+	}
+	if _, err := value.WriteTo(&b); err != nil {
+		return credential{}, err
+	}
+	if t.SecretIsUsername {
+		b.WriteByte(':')
+	}
+	b.WriteString(t.Password)
+	pair := b.String()
+	var raw string
+	if t.SecretIsUsername {
+		raw = pair[:len(pair)-len(t.Password)-1]
+		if strings.Contains(raw, ":") {
+			return credential{}, errUsernameColon
+		}
+	} else {
+		raw = pair[len(t.Username)+1:]
+	}
+	const scheme = "Basic "
+	plain := []byte(pair)
+	header := scheme + base64.StdEncoding.EncodeToString(plain)
+	clear(plain)
+	return credential{header: "Authorization", headerValue: header, needles: []string{raw, header[len(scheme):]}}, nil
 }
 
 // withoutParam returns the query rawQuery without its name parameters. The
@@ -630,6 +674,14 @@ func (s *Server) authenticateProxy(w http.ResponseWriter, r *http.Request) (acce
 			}
 		}
 	}
+	for _, v := range r.Header.Values("Authorization") {
+		for _, t := range s.slots.basicAuth {
+			if tok, ok := extractBasicAuth(v, t); ok && strings.HasPrefix(tok, access.AgentTokenPrefix) {
+				presented, from = append(presented, tok), append(from, slot{header: "Authorization"})
+				break
+			}
+		}
+	}
 	if len(s.slots.queries) > 0 {
 		query := r.URL.Query()
 		for _, name := range s.slots.queries {
@@ -659,4 +711,26 @@ func extract(value string, t config.HeaderTemplate) (string, bool) {
 		return "", false
 	}
 	return value[len(t.Prefix) : len(value)-len(t.Suffix)], true
+}
+
+// extractBasicAuth returns what sits where the Secret would in a basic auth
+// Authorization value under t. The literal field must match exactly.
+func extractBasicAuth(value string, t config.BasicAuthTemplate) (string, bool) {
+	scheme, encoded, ok := strings.Cut(value, " ")
+	if !ok || !strings.EqualFold(scheme, "Basic") {
+		return "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", false
+	}
+	username, password, ok := strings.Cut(string(decoded), ":")
+	switch {
+	case !ok:
+		return "", false
+	case t.SecretIsUsername:
+		return username, password == t.Password
+	default:
+		return password, username == t.Username
+	}
 }

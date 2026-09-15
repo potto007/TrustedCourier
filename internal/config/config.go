@@ -72,6 +72,19 @@ type InjectionTemplate struct {
 	Header *HeaderTemplate
 	// Query puts the Secret in a query parameter.
 	Query *QueryTemplate
+	// BasicAuth puts the Secret in HTTP basic auth.
+	BasicAuth *BasicAuthTemplate
+}
+
+// BasicAuthTemplate puts the Secret in the Authorization header as the whole
+// basic auth username or password. The other field is literal.
+type BasicAuthTemplate struct {
+	// Username and Password are the literal credentials. The one the Secret
+	// takes is empty.
+	Username, Password string
+	// SecretIsUsername says the Secret is the username; otherwise it is the
+	// password.
+	SecretIsUsername bool
 }
 
 // QueryTemplate puts the Secret in a query parameter, as its whole value.
@@ -168,8 +181,14 @@ type fileSecretName struct {
 }
 
 type fileInjectionTemplate struct {
-	Header *fileHeaderTemplate `yaml:"header"`
-	Query  *fileQueryTemplate  `yaml:"query"`
+	Header    *fileHeaderTemplate    `yaml:"header"`
+	Query     *fileQueryTemplate     `yaml:"query"`
+	BasicAuth *fileBasicAuthTemplate `yaml:"basic_auth"`
+}
+
+type fileBasicAuthTemplate struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
 }
 
 type fileQueryTemplate struct {
@@ -376,11 +395,11 @@ var reservedHeaders = []string{
 
 // templateKinds names the kinds of Injection Template, as the config spells
 // them.
-const templateKinds = "header, query"
+const templateKinds = "header, query, basic_auth"
 
 func (t fileInjectionTemplate) validate() (InjectionTemplate, error) {
 	set := 0
-	for _, kind := range []bool{t.Header != nil, t.Query != nil} {
+	for _, kind := range []bool{t.Header != nil, t.Query != nil, t.BasicAuth != nil} {
 		if kind {
 			set++
 		}
@@ -393,6 +412,9 @@ func (t fileInjectionTemplate) validate() (InjectionTemplate, error) {
 	case t.Query != nil:
 		q, err := t.Query.validate()
 		return InjectionTemplate{Query: q}, err
+	case t.BasicAuth != nil:
+		b, err := t.BasicAuth.validate()
+		return InjectionTemplate{BasicAuth: b}, err
 	}
 	h, err := t.Header.validate()
 	return InjectionTemplate{Header: h}, err
@@ -425,6 +447,28 @@ func (q fileQueryTemplate) validate() (*QueryTemplate, error) {
 		return nil, fmt.Errorf("invalid query parameter name %q: use up to 64 letters, digits, '.', '_', '~' or '-'", q.Name)
 	}
 	return &QueryTemplate{Name: q.Name}, nil
+}
+
+func (b fileBasicAuthTemplate) validate() (*BasicAuthTemplate, error) {
+	if strings.Count(b.Username+"\x00"+b.Password, SecretPlaceholder) != 1 {
+		return nil, fmt.Errorf("basic_auth must contain %s exactly once, as the username or the password", SecretPlaceholder)
+	}
+	out := &BasicAuthTemplate{Username: b.Username, Password: b.Password}
+	switch {
+	case b.Username == SecretPlaceholder:
+		out.Username, out.SecretIsUsername = "", true
+	case b.Password == SecretPlaceholder:
+		out.Password = ""
+	default:
+		return nil, fmt.Errorf("basic_auth: %s must be the whole username or the whole password", SecretPlaceholder)
+	}
+	switch {
+	case strings.Contains(out.Username, ":"):
+		return nil, errors.New("basic_auth username must not contain ':'")
+	case hasControl(out.Username) || hasControl(out.Password):
+		return nil, errors.New("basic_auth contains a control character")
+	}
+	return out, nil
 }
 
 func hasControl(s string) bool {
