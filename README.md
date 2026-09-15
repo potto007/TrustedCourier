@@ -463,6 +463,12 @@ go vet ./...
 go test -race ./...
 ```
 
+The full suite takes several minutes, and `go test` prints nothing for a package until it finishes. To watch a run live in Claude Code's work-band plugin, run it through `scripts/testprogress`, which writes the readable output to a log, progress (tests run, passed, failed, skipped, and the current test) to `<log>.progress.jsonl`, and `DONE` or `FAILED` as the log's last line:
+
+```sh
+go run ./scripts/testprogress -log /tmp/tc-tests.log -label "TrustedCourier tests" -- go test -race -json ./...
+```
+
 CI runs every module twice, once with `GODEBUG=fips140=off` and once with `fips140=on`. The race detector is required, not optional ([ADR-0003](docs/decisions/0003-go-over-rust-core.md) relies on it).
 
 `TestBackendPluginRunsAsSeparateUser` needs a root server to switch the plugin's user and skips otherwise. CI runs it, with the separate-user refusal tests, a second time under `sudo`.
