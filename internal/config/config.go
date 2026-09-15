@@ -505,7 +505,7 @@ func (s fileSecretName) validate(name, baseDir string, plugins map[string]Backen
 		case err != nil:
 			return SecretName{}, fmt.Errorf("Secret Name %q: cache_ttl %q is not a duration such as 30s", name, s.CacheTTL)
 		case d < time.Second || d > MaxCacheTTL:
-			return SecretName{}, fmt.Errorf("Secret Name %q: cache_ttl %q must be from 1s to %v; omit it to fetch the Secret on every Delivery", name, s.CacheTTL, MaxCacheTTL)
+			return SecretName{}, fmt.Errorf("Secret Name %q: cache_ttl %q must be from 1s to 1h; omit it to fetch the Secret on every Delivery", name, s.CacheTTL)
 		}
 		out.CacheTTL = d
 	}

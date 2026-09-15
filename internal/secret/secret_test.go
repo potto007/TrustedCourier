@@ -3,6 +3,7 @@ package secret
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -115,6 +116,27 @@ func TestReleasedSecretIsUnusable(t *testing.T) {
 	}
 	if s.Len() != 0 {
 		t.Fatalf("Len after Release = %d, want 0", s.Len())
+	}
+}
+
+func TestCloneOutlivesTheOriginal(t *testing.T) {
+	s, err := New([]byte(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clone, err := s.Clone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clone.Release()
+	s.Release()
+
+	var buf bytes.Buffer
+	if _, err := clone.WriteTo(&buf); err != nil || buf.String() != value {
+		t.Fatalf("clone after the original's Release = %q, %v; want %q", buf.String(), err, value)
+	}
+	if _, err := s.Clone(); !errors.Is(err, ErrReleased) {
+		t.Fatalf("Clone of a released Secret = %v, want ErrReleased", err)
 	}
 }
 
