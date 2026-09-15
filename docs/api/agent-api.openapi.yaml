@@ -258,9 +258,10 @@ components:
       description: |
         The Upstream's response, status, headers, and body as the Upstream
         sent them, except that `Cache-Control` is `no-store` and Redaction
-        masks every exact match of the Secret, in headers, body, and trailers,
-        with a run of `*` (another byte if the Secret contains `*`) of the
-        same length. Redirects are never followed: a
+        masks every exact match of the Secret, and of the encoded form the
+        Injection Template sent (the escaped query value, or the base64 basic
+        auth credential), in headers, body, and trailers, with a run of `*`
+        (another byte if one of them contains `*`) of the same length. Redirects are never followed: a
         3xx and its `Location` reach the Agent unchanged. Server-sent event
         streams pass through as they arrive, held back only by bytes that
         could begin the Secret. A gzip body arrives decoded, and `Range`
@@ -285,8 +286,8 @@ components:
             $ref: "#/components/schemas/Error"
     ProxyFailed:
       description: |
-        The Backend could not return the Secret, the Secret cannot go in the
-        Injection Template's header, or the Upstream could not be reached,
+        The Backend could not return the Secret, the Secret cannot go where
+        the Injection Template puts it, or the Upstream could not be reached,
         including when its TLS certificate does not verify, or its response
         has a `Content-Encoding` Redaction cannot read. Details go to the
         server log only.
