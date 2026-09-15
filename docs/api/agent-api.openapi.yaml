@@ -147,7 +147,8 @@ components:
       description: |
         The rest of the path, which may contain slashes. It is forwarded
         under the Upstream's base URL as sent, and the query string is
-        forwarded unchanged. Dot segments, including percent-encoded ones
+        forwarded unchanged, except that parameters Go cannot parse, such as
+        ones separated by `;`, are dropped. Dot segments, including percent-encoded ones
         and ones with `;` parameters such as `..;`, get 400.
       schema:
         type: string
@@ -253,7 +254,8 @@ components:
             $ref: "#/components/schemas/Error"
     ProxyTimeout:
       description: |
-        The Upstream sent no response for 5 minutes. A response that has
+        Neither the Upstream's response nor the Agent's request body moved
+        for 5 minutes before the response started. A response that has
         started streaming and then goes silent that long is cut off instead.
       content:
         application/json:
