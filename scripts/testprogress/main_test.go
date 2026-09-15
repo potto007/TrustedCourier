@@ -12,9 +12,10 @@ import (
 )
 
 // events is recorded `go test -json` output: p1 runs TestA (with a subtest),
-// TestB fails, TestC is skipped, and p2 fails to build. One line is not JSON,
-// as when go test writes to stderr. Times step so progress appends are rate
-// limited to one a second.
+// TestB fails, TestC is skipped, p2 fails to build, and p3 fails without a
+// failing test, as when TestMain exits or the package times out. One line is
+// not JSON, as when go test writes to stderr. Times step so progress appends
+// are rate limited to one a second.
 const events = `{"Time":"2026-09-15T10:00:00Z","Action":"start","Package":"example.com/m/p1"}
 {"Time":"2026-09-15T10:00:00Z","Action":"run","Package":"example.com/m/p1","Test":"TestA"}
 {"Time":"2026-09-15T10:00:00.2Z","Action":"output","Package":"example.com/m/p1","Test":"TestA","Output":"=== RUN   TestA\n"}
@@ -30,6 +31,9 @@ go: downloading example.com/dep v1.0.0
 {"Time":"2026-09-15T10:00:02Z","Action":"fail","Package":"example.com/m/p1"}
 {"ImportPath":"example.com/m/p2","Action":"build-output","Output":"# example.com/m/p2\n"}
 {"ImportPath":"example.com/m/p2","Action":"build-fail"}
+{"Time":"2026-09-15T10:00:03Z","Action":"start","Package":"example.com/m/p3"}
+{"Time":"2026-09-15T10:00:03.1Z","Action":"output","Package":"example.com/m/p3","Output":"panic: boom\n"}
+{"Time":"2026-09-15T10:00:03.2Z","Action":"fail","Package":"example.com/m/p3"}
 `
 
 func readLines(t *testing.T, path string) []string {
@@ -71,6 +75,7 @@ func TestRunWritesTheLogProgressAndFailedSentinel(t *testing.T) {
 		"go: downloading example.com/dep v1.0.0",
 		"    b_test.go:9: boom",
 		"# example.com/m/p2",
+		"panic: boom",
 		"FAILED",
 	}
 	if got := readLines(t, log); !reflect.DeepEqual(got, wantLog) {
@@ -87,11 +92,15 @@ func TestRunWritesTheLogProgressAndFailedSentinel(t *testing.T) {
 	const t0 = 1789466400.0 // 2026-09-15T10:00:00Z
 	wantProgress := []map[string]any{
 		// The first change is written at once; later ones at most once a
-		// second, and the last is flushed when the stream ends. Subtests and
-		// package results are not counted.
+		// second, and the last is flushed when the stream ends. Subtests are
+		// not counted. A package that fails without a failing test, or fails
+		// to build, counts as one failure so the counts never read as clean
+		// when the run is not. p1's package failure is TestB's, so it does
+		// not count again.
 		line(0, 0, 0, 0, "p1.TestA", t0),
 		line(1, 1, 0, 0, "p1.TestB", t0+1),
-		line(3, 1, 1, 1, "p1.TestC", t0+2),
+		line(4, 1, 2, 1, "p2 (build)", t0+2),
+		line(5, 1, 3, 1, "p3 (package)", t0+3),
 	}
 	var gotProgress []map[string]any
 	for _, l := range readLines(t, log+".progress.jsonl") {

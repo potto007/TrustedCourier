@@ -56,11 +56,12 @@ func main() {
 
 // event is one line of `go test -json` output.
 type event struct {
-	Time    time.Time
-	Action  string
-	Package string
-	Test    string
-	Output  string
+	Time       time.Time
+	Action     string
+	Package    string
+	ImportPath string
+	Test       string
+	Output     string
 }
 
 // progress is one line of the work-band progress sidecar (contract v1).
@@ -81,9 +82,11 @@ const appendInterval = time.Second
 
 // run reads `go test -json` events, truncates and writes the log at logPath
 // and its progress sidecar, and once events end, ends the log with DONE or
-// FAILED by what wait returns. Only top-level tests are counted. Lines that
-// are not events, such as go's own stderr, go to the log as they are. It
-// returns wait's error joined with any write error.
+// FAILED by what wait returns. Only top-level tests are counted. A package
+// that fails to build, or fails without a failing test (e.g. TestMain exit,
+// panic, timeout), counts as one failure. Lines that are not events, such as
+// go's own stderr, go to the log as they are. It returns wait's error joined
+// with any write error.
 func run(events io.Reader, wait func() error, logPath, label string) error {
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -97,12 +100,13 @@ func run(events io.Reader, wait func() error, logPath, label string) error {
 	defer func() { _ = sidecar.Close() }()
 
 	var (
-		writeErr  error
-		endsLine  = true
-		p         = progress{V: 1, Phase: "test", Label: label}
-		now, last time.Time
-		appended  bool
-		pending   bool
+		writeErr   error
+		endsLine   = true
+		p          = progress{V: 1, Phase: "test", Label: label}
+		now, last  time.Time
+		appended   bool
+		pending    bool
+		testFailed = map[string]bool{} // package -> any top-level test failed
 	)
 	writeLog := func(s string) {
 		if s == "" {
@@ -149,11 +153,30 @@ func run(events io.Reader, wait func() error, logPath, label string) error {
 						p.Pass++
 					case "fail":
 						p.Fail++
+						testFailed[e.Package] = true
 					default:
 						p.Skip++
 					}
 					pending = true
+				} else if e.Action == "fail" && e.Test == "" {
+					// Package-level fail with no failing test (TestMain exit,
+					// panic, timeout). If a test already failed in this package,
+					// it has been counted; do not double-count.
+					if !testFailed[e.Package] {
+						p.Done++
+						p.Fail++
+						p.Current = path.Base(e.Package) + " (package)"
+						pending = true
+					}
 				}
+			case "build-fail":
+				// A build failure is rare and final for its package, so it is
+				// appended at once rather than rate limited. The event carries
+				// no Time, so ts keeps the last event's.
+				p.Done++
+				p.Fail++
+				p.Current = path.Base(e.ImportPath) + " (build)"
+				appendProgress()
 			}
 			if pending && (!appended || now.Sub(last) >= appendInterval) {
 				appendProgress()
