@@ -139,7 +139,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reason, allowed := s.access.Authorize(tok, name, config.DeliveryProxy)
+	reason, allowed := s.access.AuthorizeProxy(tok, name, r.Method, rest)
 	if allowed && rt == nil {
 		reason, allowed = "unknown Upstream", false
 	}

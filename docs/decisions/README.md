@@ -21,3 +21,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0015](0015-proxy-stall-limits-and-query-cleaning.md) | Proxy Delivery's stall limits guard writes, count uploads, and log cut-offs; unparsable query parameters are dropped | accepted |
 | [0016](0016-audit-record-stream-chain-and-verify.md) | Audit Records stream on stdout, start at authentication, and chain over their JSON encoding | accepted |
 | [0017](0017-injection-template-kinds-presets-and-tc-env.md) | Query and basic auth Injection Templates, Presets as data, and `tc env` | accepted |
+| [0018](0018-policy-method-and-path-limits.md) | Policies limit Proxy Delivery by method and by path prefix on whole decoded segments | accepted |
