@@ -63,13 +63,40 @@ type SecretName struct {
 	InjectionTemplate *InjectionTemplate
 	// Upstreams are the Upstreams the Secret is pinned to, by name.
 	Upstreams map[string]Upstream
+	// Preset names the Preset that supplied InjectionTemplate, and Upstreams
+	// unless the Operator set them. Empty without one.
+	Preset string
+	// Env are the environment variables an Agent needs to use the Secret Name
+	// through Proxy Delivery. Nil exactly when Upstreams is empty.
+	Env []EnvVar
 }
 
 // InjectionTemplate is where Proxy Delivery puts a Secret in a request, and
-// so where it finds the Agent Token.
+// so where it finds the Agent Token. Exactly one field is set.
 type InjectionTemplate struct {
-	// Header is the header the Secret goes in.
-	Header HeaderTemplate
+	// Header puts the Secret in a header.
+	Header *HeaderTemplate
+	// Query puts the Secret in a query parameter.
+	Query *QueryTemplate
+	// BasicAuth puts the Secret in HTTP basic auth.
+	BasicAuth *BasicAuthTemplate
+}
+
+// BasicAuthTemplate puts the Secret in the Authorization header as the whole
+// basic auth username or password. The other field is literal.
+type BasicAuthTemplate struct {
+	// Username and Password are the literal credentials. The one the Secret
+	// takes is empty.
+	Username, Password string
+	// SecretIsUsername says the Secret is the username; otherwise it is the
+	// password.
+	SecretIsUsername bool
+}
+
+// QueryTemplate puts the Secret in a query parameter, as its whole value.
+type QueryTemplate struct {
+	// Name is the query parameter's name, which never needs escaping.
+	Name string
 }
 
 // HeaderTemplate puts the Secret in a header as Prefix, the Secret, Suffix.
@@ -80,7 +107,8 @@ type HeaderTemplate struct {
 	Suffix string
 }
 
-// SecretPlaceholder marks where the Secret goes in a header template.
+// SecretPlaceholder marks where the Secret goes in a header or basic auth
+// template.
 const SecretPlaceholder = "{secret}"
 
 // Upstream is one Upstream a Secret Name is pinned to.
@@ -155,12 +183,24 @@ type fileAgentAPI struct {
 type fileSecretName struct {
 	Backend           string                  `yaml:"backend"`
 	Location          string                  `yaml:"location"`
+	Preset            string                  `yaml:"preset"`
 	InjectionTemplate *fileInjectionTemplate  `yaml:"injection_template"`
 	Upstreams         map[string]fileUpstream `yaml:"upstreams"`
 }
 
 type fileInjectionTemplate struct {
-	Header *fileHeaderTemplate `yaml:"header"`
+	Header    *fileHeaderTemplate    `yaml:"header"`
+	Query     *fileQueryTemplate     `yaml:"query"`
+	BasicAuth *fileBasicAuthTemplate `yaml:"basic_auth"`
+}
+
+type fileBasicAuthTemplate struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+}
+
+type fileQueryTemplate struct {
+	Name string `yaml:"name"`
 }
 
 type fileHeaderTemplate struct {
@@ -325,11 +365,34 @@ func (s fileSecretName) validate(name, baseDir string, plugins map[string]Backen
 	}
 	out := SecretName{Name: name, Backend: s.Backend, Location: s.Location}
 
+	if s.Preset != "" {
+		presets, err := builtinPresets()
+		if err != nil {
+			return SecretName{}, err
+		}
+		p, ok := presets[s.Preset]
+		switch {
+		case !ok:
+			return SecretName{}, fmt.Errorf("Secret Name %q: unknown preset %q; use one of %s", name, s.Preset, strings.Join(slices.Sorted(maps.Keys(presets)), ", "))
+		case s.InjectionTemplate != nil:
+			return SecretName{}, fmt.Errorf("Secret Name %q: set preset or injection_template, not both", name)
+		}
+		out.Preset, out.InjectionTemplate, out.Upstreams, out.Env = s.Preset, &p.template, p.upstreams, p.env
+		// Upstreams set beside a Preset replace its own, as for a GitHub
+		// Enterprise Server.
+		if len(s.Upstreams) > 0 {
+			if out.Upstreams, err = validateUpstreams(s.Upstreams, baseDir); err != nil {
+				return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
+			}
+		}
+		return out, nil
+	}
+
 	switch {
 	case s.InjectionTemplate == nil && len(s.Upstreams) == 0:
 		return out, nil
 	case s.InjectionTemplate == nil:
-		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template is required with upstreams", name)
+		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template is required with upstreams, unless preset is set", name)
 	case len(s.Upstreams) == 0:
 		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template needs upstreams to deliver to", name)
 	}
@@ -338,13 +401,21 @@ func (s fileSecretName) validate(name, baseDir string, plugins map[string]Backen
 		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template: %w", name, err)
 	}
 	out.InjectionTemplate = &tmpl
-	out.Upstreams = make(map[string]Upstream, len(s.Upstreams))
-	for _, upName := range slices.Sorted(maps.Keys(s.Upstreams)) {
-		up, err := s.Upstreams[upName].validate(upName, baseDir)
+	if out.Upstreams, err = validateUpstreams(s.Upstreams, baseDir); err != nil {
+		return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
+	}
+	out.Env = defaultEnv(name, tmpl)
+	return out, nil
+}
+
+func validateUpstreams(raw map[string]fileUpstream, baseDir string) (map[string]Upstream, error) {
+	out := make(map[string]Upstream, len(raw))
+	for _, name := range slices.Sorted(maps.Keys(raw)) {
+		up, err := raw[name].validate(name, baseDir)
 		if err != nil {
-			return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
+			return nil, err
 		}
-		out.Upstreams[upName] = up
+		out[name] = up
 	}
 	return out, nil
 }
@@ -361,26 +432,86 @@ var reservedHeaders = []string{
 	"Transfer-Encoding", "Upgrade", "X-Tc-Agent-Token",
 }
 
+// templateKinds names the kinds of Injection Template, as the config spells
+// them.
+const templateKinds = "header, query, basic_auth"
+
 func (t fileInjectionTemplate) validate() (InjectionTemplate, error) {
-	if t.Header == nil {
-		return InjectionTemplate{}, errors.New("set header")
+	set := 0
+	for _, kind := range []bool{t.Header != nil, t.Query != nil, t.BasicAuth != nil} {
+		if kind {
+			set++
+		}
 	}
-	h := t.Header
+	switch {
+	case set == 0:
+		return InjectionTemplate{}, errors.New("set one of " + templateKinds)
+	case set > 1:
+		return InjectionTemplate{}, errors.New("set only one of " + templateKinds)
+	case t.Query != nil:
+		q, err := t.Query.validate()
+		return InjectionTemplate{Query: q}, err
+	case t.BasicAuth != nil:
+		b, err := t.BasicAuth.validate()
+		return InjectionTemplate{BasicAuth: b}, err
+	}
+	h, err := t.Header.validate()
+	return InjectionTemplate{Header: h}, err
+}
+
+func (h fileHeaderTemplate) validate() (*HeaderTemplate, error) {
 	if !headerNamePattern.MatchString(h.Name) {
-		return InjectionTemplate{}, fmt.Errorf("invalid header name %q", h.Name)
+		return nil, fmt.Errorf("invalid header name %q", h.Name)
 	}
 	name := http.CanonicalHeaderKey(h.Name)
 	if slices.Contains(reservedHeaders, name) {
-		return InjectionTemplate{}, fmt.Errorf("header %q is reserved and cannot carry a Secret", h.Name)
+		return nil, fmt.Errorf("header %q is reserved and cannot carry a Secret", h.Name)
 	}
 	if strings.Count(h.Value, SecretPlaceholder) != 1 {
-		return InjectionTemplate{}, fmt.Errorf("header value must contain %s exactly once", SecretPlaceholder)
+		return nil, fmt.Errorf("header value must contain %s exactly once", SecretPlaceholder)
 	}
-	if strings.ContainsFunc(h.Value, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
-		return InjectionTemplate{}, errors.New("header value contains a control character")
+	if hasControl(h.Value) {
+		return nil, errors.New("header value contains a control character")
 	}
 	prefix, suffix, _ := strings.Cut(h.Value, SecretPlaceholder)
-	return InjectionTemplate{Header: HeaderTemplate{Name: name, Prefix: prefix, Suffix: suffix}}, nil
+	return &HeaderTemplate{Name: name, Prefix: prefix, Suffix: suffix}, nil
+}
+
+// queryNamePattern is a query parameter name made only of bytes a query never
+// escapes, so the name matches as the Agent sends it.
+var queryNamePattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,64}$`)
+
+func (q fileQueryTemplate) validate() (*QueryTemplate, error) {
+	if !queryNamePattern.MatchString(q.Name) {
+		return nil, fmt.Errorf("invalid query parameter name %q: use up to 64 letters, digits, '.', '_', '~' or '-'", q.Name)
+	}
+	return &QueryTemplate{Name: q.Name}, nil
+}
+
+func (b fileBasicAuthTemplate) validate() (*BasicAuthTemplate, error) {
+	if strings.Count(b.Username+"\x00"+b.Password, SecretPlaceholder) != 1 {
+		return nil, fmt.Errorf("basic_auth must contain %s exactly once, as the username or the password", SecretPlaceholder)
+	}
+	out := &BasicAuthTemplate{Username: b.Username, Password: b.Password}
+	switch {
+	case b.Username == SecretPlaceholder:
+		out.Username, out.SecretIsUsername = "", true
+	case b.Password == SecretPlaceholder:
+		out.Password = ""
+	default:
+		return nil, fmt.Errorf("basic_auth: %s must be the whole username or the whole password", SecretPlaceholder)
+	}
+	switch {
+	case strings.Contains(out.Username, ":"):
+		return nil, errors.New("basic_auth username must not contain ':'")
+	case hasControl(out.Username) || hasControl(out.Password):
+		return nil, errors.New("basic_auth contains a control character")
+	}
+	return out, nil
+}
+
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
 }
 
 func (u fileUpstream) validate(name, baseDir string) (Upstream, error) {

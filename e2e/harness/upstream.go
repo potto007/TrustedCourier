@@ -89,10 +89,24 @@ func (u *Upstream) ReleaseEvents() { u.releaseOnce.Do(func() { close(u.release) 
 
 // echoed is what /echo and /echo-events send back, as an Upstream echoes a
 // rejected credential: the text query parameter, then the value of the
-// request header the header query parameter names.
+// request header the header query parameter names, then the decoded value of
+// the query parameter the query parameter names, then the value, as sent, of
+// the query parameter the rawquery parameter names.
 func echoed(r *http.Request) string {
 	q := r.URL.Query()
-	return q.Get("text") + r.Header.Get(q.Get("header"))
+	v := q.Get("text") + r.Header.Get(q.Get("header"))
+	if name := q.Get("query"); name != "" {
+		v += q.Get(name)
+	}
+	if name := q.Get("rawquery"); name != "" {
+		for pair := range strings.SplitSeq(r.URL.RawQuery, "&") {
+			if key, value, _ := strings.Cut(pair, "="); key == name {
+				v += value
+				break
+			}
+		}
+	}
+	return v
 }
 
 // echo answers with the echoed value as the body and the X-Echo header, with

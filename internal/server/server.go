@@ -81,8 +81,12 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	defer stopServing()
 	errc := make(chan error, 2)
 	serving := 1
+	var agentURL string
+	if agentLn != nil {
+		agentURL = "http://" + agentLn.Addr().String()
+	}
 	go func() {
-		errc <- admin.NewServer(svc, plugins, auditLog, cfg.Admin.AllowedUIDs, log).Serve(serveCtx, ln)
+		errc <- admin.NewServer(svc, plugins, auditLog, cfg, agentURL, log).Serve(serveCtx, ln)
 	}()
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
 	if agentLn != nil {

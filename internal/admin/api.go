@@ -73,6 +73,24 @@ type AuditBreak struct {
 	Problem string `json:"problem"`
 }
 
+// AgentTokenPlaceholder stands in for the Agent Token in a SecretNameEnv,
+// since the server never holds Agent Token values.
+const AgentTokenPlaceholder = "<Agent Token>"
+
+// SecretNameEnv is the environment an Agent needs to use a Secret Name
+// through Proxy Delivery to one Upstream.
+type SecretNameEnv struct {
+	SecretName string   `json:"secret_name"`
+	Upstream   string   `json:"upstream"`
+	Env        []EnvVar `json:"env"`
+}
+
+// EnvVar is one environment variable in a SecretNameEnv.
+type EnvVar struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 type errorResponse struct {
 	Error string `json:"error"`
 }

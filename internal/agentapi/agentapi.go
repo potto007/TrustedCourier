@@ -55,7 +55,7 @@ type Server struct {
 	audit   *audit.Log
 	log     *slog.Logger
 	routes  map[routeKey]*route
-	slots   map[string][]config.HeaderTemplate
+	slots   slots
 
 	// inflight is read-locked by every request, so Serve can wait for the
 	// ones shutdown cut off to write their Audit Records.

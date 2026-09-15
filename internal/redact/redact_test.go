@@ -2,6 +2,7 @@ package redact_test
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/potto007/TrustedCourier/internal/redact"
@@ -67,12 +68,68 @@ func TestWriterPassesThroughWithoutTheNeedle(t *testing.T) {
 	}
 }
 
-func TestWriterMasksOverlappingMatchesLeftmostFirst(t *testing.T) {
+func TestWriterMasksEveryByteOfOverlappingMatches(t *testing.T) {
 	var out bytes.Buffer
 	w := redact.NewWriter(&out, "aa")
 	_, _ = w.Write([]byte("xaaay"))
 	_ = w.Close()
-	if got, want := out.String(), "x**ay"; got != want {
+	if got, want := out.String(), "x***y"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// writeNeedles writes each chunk to a Writer over needles, closes it, and
+// returns everything that reached the underlying writer.
+func writeNeedles(t *testing.T, needles []string, chunks ...string) string {
+	t.Helper()
+	var out bytes.Buffer
+	w := redact.NewWriter(&out, needles...)
+	for _, c := range chunks {
+		if n, err := w.Write([]byte(c)); err != nil || n != len(c) {
+			t.Fatalf("Write(%q) = %d, %v, want %d, nil", c, n, err, len(c))
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	return out.String()
+}
+
+func TestWriterMasksEveryNeedle(t *testing.T) {
+	// The Secret, and the basic auth credential that encodes it.
+	needles := []string{"test-value-1", "dXNlcjp0ZXN0LXZhbHVlLTE="}
+	const stream = "raw test-value-1, encoded Basic dXNlcjp0ZXN0LXZhbHVlLTE=\n"
+	const want = "raw ************, encoded Basic ************************\n"
+	for i := 1; i < len(stream); i++ {
+		if got := writeNeedles(t, needles, stream[:i], stream[i:]); got != want {
+			t.Fatalf("split at %d: got %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestWriterMasksNeedlesThatOverlap(t *testing.T) {
+	needles := []string{"abcd", "cdef"}
+	if got, want := writeNeedles(t, needles, "xabcdefy"), "x******y"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	// A match of one needle that ends where a partial match of the other
+	// begins: the held-back bytes stay masked, and the completed match is
+	// masked too.
+	if got, want := writeNeedles(t, []string{"ab", "bc"}, "xab", "c"), "x***"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestWriterMasksWithAByteNoNeedleContains(t *testing.T) {
+	got := writeNeedles(t, []string{"k*y", "x-z"}, "[k*y|x-z]")
+	if len(got) != 9 || got[0] != '[' || got[4] != '|' || got[8] != ']' ||
+		strings.Count(got, got[1:2]) != 6 || strings.ContainsAny(got[1:2], "k*yx-z") {
+		t.Fatalf("got %q, want both needles masked with one byte neither contains", got)
+	}
+}
+
+func TestWriterIgnoresEmptyNeedles(t *testing.T) {
+	if got, want := writeNeedles(t, []string{"", needle, ""}, "key test-value-1"), "key ************"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
@@ -122,6 +179,9 @@ func TestString(t *testing.T) {
 		if got := redact.String(in, needle); got != want {
 			t.Errorf("String(%q) = %q, want %q", in, got, want)
 		}
+	}
+	if got, want := redact.String("a test-value-1 b dGVzdA== c", needle, "dGVzdA=="), "a ************ b ******** c"; got != want {
+		t.Errorf("String with two needles = %q, want %q", got, want)
 	}
 }
 
