@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -127,7 +128,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target := &url.URL{Scheme: rt.upstream.Scheme, Host: rt.upstream.Host, RawQuery: r.URL.RawQuery}
+	target := &url.URL{Scheme: rt.upstream.Scheme, Host: rt.upstream.Host}
 	escaped := rt.upstream.BasePath + rest
 	if escaped == "" {
 		escaped = "/"
@@ -138,8 +139,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 
 	// A proxied response may stream for as long as the Upstream keeps
 	// sending, but may not stall: the request holds the Secret's header copy
-	// until it ends. An Upstream silent for proxyIdleTimeout cancels it, and
-	// an Agent that stops reading for proxyWriteStall fails its writes.
+	// until it ends. When neither the Upstream's response nor the Agent's
+	// request body moves for proxyIdleTimeout, the Delivery is cancelled, and
+	// a write to an Agent that stops reading fails after proxyWriteStall.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	var idle atomic.Bool
@@ -149,15 +151,44 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	})
 	defer timer.Stop()
 	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Now().Add(proxyIdleTimeout))
+	// progressWriter bounds each write instead of the server's write timeout,
+	// since on HTTP/2 an armed deadline resets the stream when it passes,
+	// even while no write is pending.
+	_ = rc.SetWriteDeadline(time.Time{})
 	// The Secret is the part of the header between the template's text.
 	rw := newRedactingWriter(w, header[len(rt.template.Prefix):len(header)-len(rt.template.Suffix)])
 	pw := &progressWriter{ResponseWriter: rw, rc: rc, timer: timer}
+	defer func() {
+		// Once the response has started, ReverseProxy ends a Delivery it
+		// cannot finish by aborting the response with this panic.
+		if p := recover(); p != nil {
+			if p == http.ErrAbortHandler {
+				switch {
+				case idle.Load():
+					log.Error("Delivery cut off: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
+				case r.Context().Err() != nil:
+					log.Info("Delivery abandoned by the Agent")
+				case pw.writeErr() != nil:
+					log.Error("Delivery cut off: the response could not be written to the Agent", "error", pw.writeErr())
+				default:
+					log.Error("Delivery cut off: the Upstream's response broke off")
+				}
+			}
+			panic(p)
+		}
+	}()
 
 	(&httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.Out.URL = target
+			// ReverseProxy has already dropped query parameters it cannot
+			// parse from pr.Out, so the query comes from there.
+			out := *target
+			out.RawQuery = pr.Out.URL.RawQuery
+			pr.Out.URL = &out
 			pr.Out.Host = ""
+			if pr.Out.Body != nil && pr.Out.Body != http.NoBody {
+				pr.Out.Body = &progressReader{ReadCloser: pr.Out.Body, timer: timer}
+			}
 			pr.Out.Header.Del(AgentTokenHeader)
 			pr.Out.Header.Del(tokenHeader)
 			pr.Out.Header.Set(rt.template.Name, header)
@@ -198,6 +229,10 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}).ServeHTTP(pw, r.WithContext(ctx))
+	// The held-back bytes, the trailers, and the end of the response go out
+	// after the last guarded write, so bound them too. The deadline stays
+	// set until the server has sent them.
+	_ = rc.SetWriteDeadline(time.Now().Add(proxyWriteStall))
 	// Not deferred: when the body copy fails, ReverseProxy aborts the
 	// response with a panic, and the held-back bytes must not follow.
 	rw.finish()
@@ -212,27 +247,75 @@ const (
 	proxyWriteStall = 30 * time.Second
 )
 
-// progressWriter pushes the idle timer and the write deadline forward
-// whenever the Upstream's response makes progress.
+// progressWriter pushes the idle timer forward whenever the Upstream's
+// response makes progress, and bounds each write and flush to the Agent by
+// proxyWriteStall. The deadline is cleared between writes: on HTTP/2 an armed
+// deadline resets the stream when it passes, even with no write pending.
 type progressWriter struct {
 	http.ResponseWriter
 	rc    *http.ResponseController
 	timer *time.Timer
+
+	mu  sync.Mutex
+	err error // the last failed write's or flush's error
 }
 
-func (p *progressWriter) progress() {
-	p.timer.Reset(proxyIdleTimeout)
+// guard sets the write deadline for one write and returns what clears it.
+func (p *progressWriter) guard() func() {
 	_ = p.rc.SetWriteDeadline(time.Now().Add(proxyWriteStall))
+	return func() { _ = p.rc.SetWriteDeadline(time.Time{}) }
+}
+
+func (p *progressWriter) record(err error) {
+	if err != nil {
+		p.mu.Lock()
+		p.err = err
+		p.mu.Unlock()
+	}
+}
+
+func (p *progressWriter) writeErr() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
 }
 
 func (p *progressWriter) WriteHeader(code int) {
-	p.progress()
+	p.timer.Reset(proxyIdleTimeout)
+	defer p.guard()()
 	p.ResponseWriter.WriteHeader(code)
 }
 
 func (p *progressWriter) Write(b []byte) (int, error) {
-	p.progress()
-	return p.ResponseWriter.Write(b)
+	p.timer.Reset(proxyIdleTimeout)
+	defer p.guard()()
+	n, err := p.ResponseWriter.Write(b)
+	p.record(err)
+	return n, err
+}
+
+// FlushError flushes the underlying writer, bounded like a write. It sends
+// only what Redaction has already released.
+func (p *progressWriter) FlushError() error {
+	defer p.guard()()
+	err := p.rc.Flush()
+	p.record(err)
+	return err
+}
+
+// progressReader pushes the idle timer forward whenever the Agent's request
+// body makes progress, so a long upload is not taken for a silent Upstream.
+type progressReader struct {
+	io.ReadCloser
+	timer *time.Timer
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.ReadCloser.Read(b)
+	if n > 0 {
+		p.timer.Reset(proxyIdleTimeout)
+	}
+	return n, err
 }
 
 // Unwrap lets http.ResponseController flush the underlying writer.

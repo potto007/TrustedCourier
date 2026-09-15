@@ -82,6 +82,13 @@ secrets:
   openai:
     backend: fake
     location: kv/openai
+    injection_template:
+      header:
+        name: Authorization
+        value: Bearer {secret}
+    upstreams:
+      api:
+        url: https://api.openai.com/v1
 policies:
   openai-proxy:
     secrets:

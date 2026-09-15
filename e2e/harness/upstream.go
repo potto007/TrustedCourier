@@ -192,6 +192,28 @@ func (u *Upstream) serve(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(15 * time.Second):
 		}
 		_, _ = io.WriteString(w, "data: second\n\n")
+	case "/pause-end":
+		// One event, silence for the pause query parameter, then the end of
+		// the stream with an X-Done trailer.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Trailer", "X-Done")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: first\n\n")
+		http.NewResponseController(w).Flush()
+		pause, _ := time.ParseDuration(r.URL.Query().Get("pause"))
+		select {
+		case <-time.After(pause):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("X-Done", "yes")
+	case "/cut":
+		// Promises 100 bytes, sends 7, and drops the connection.
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "partial")
+		http.NewResponseController(w).Flush()
+		panic(http.ErrAbortHandler)
 	case "/echo":
 		u.echo(w, r)
 	case "/echo-events":
