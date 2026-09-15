@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback work today. Redaction, a real Backend, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction, work today. A real Backend, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -46,8 +46,8 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Secret Names mapped to Backend locations in config | done |
 | Reveal Delivery on a loopback Agent API | done |
 | Proxy Delivery with a header Injection Template, OpenAPI spec for the Agent API | done |
+| Redaction | done |
 | OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
-| Redaction | [#6](https://github.com/potto007/TrustedCourier/issues/6) |
 | Method and path limits, query and basic auth Injection Templates, Presets | [#7](https://github.com/potto007/TrustedCourier/issues/7), [#8](https://github.com/potto007/TrustedCourier/issues/8) |
 | Audit Records and checkpoints | [#9](https://github.com/potto007/TrustedCourier/issues/9), [#10](https://github.com/potto007/TrustedCourier/issues/10) |
 | TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
@@ -82,6 +82,13 @@ secrets:
   openai:
     backend: fake
     location: kv/openai
+    injection_template:
+      header:
+        name: Authorization
+        value: Bearer {secret}
+    upstreams:
+      api:
+        url: https://api.openai.com/v1
 policies:
   openai-proxy:
     secrets:
@@ -201,7 +208,7 @@ OPENAI_BASE_URL=http://127.0.0.1:8200/proxy/openai/api
 OPENAI_API_KEY=tcat_...
 ```
 
-The route is `/proxy/<Secret Name>/<Upstream name>`. The rest of the path is appended to the Upstream's URL, so `/proxy/openai/api/chat/completions` goes to `https://api.openai.com/v1/chat/completions`, and the query goes along unchanged. A Secret Name pinned to several Upstreams has one route for each.
+The route is `/proxy/<Secret Name>/<Upstream name>`. The rest of the path is appended to the Upstream's URL, so `/proxy/openai/api/chat/completions` goes to `https://api.openai.com/v1/chat/completions`, and the query goes along unchanged, except that parameters Go cannot parse, such as ones separated by `;`, are dropped. A Secret Name pinned to several Upstreams has one route for each.
 
 TrustedCourier finds the Agent Token where the Injection Template would put the Secret (here `Authorization: Bearer tcat_...`) or in `X-TC-Agent-Token`, never in the URL. It fetches the Secret from the Backend, puts it in the header, removes the Agent Token, and forwards the request. The Agent never sees the Secret, and the Upstream never sees the Agent Token.
 
@@ -209,8 +216,9 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 - Redirects are never followed. The 3xx and its `Location` reach the Agent unchanged, so the Secret is never re-sent to another host.
 - HTTP/1.1 and HTTP/2 both work, to the Agent API (HTTP/2 with prior knowledge, since it is plain HTTP for now) and to the Upstream. Server-sent event streams pass through as they arrive.
 - WebSockets and other protocol upgrades are refused. An `h2c` offer, as `curl --http2` sends, is answered over HTTP/1.1.
-- A response may stream for as long as the Upstream keeps sending. An Upstream that sends nothing for 5 minutes, or an Agent that stops reading for 30 seconds, ends the Delivery.
-- Redaction is not in yet ([#6](https://github.com/potto007/TrustedCourier/issues/6)): an Upstream that echoes its credential back sends the Secret to the Agent.
+- A response may stream for as long as the Upstream keeps sending, pauses included. The Delivery ends when neither the Upstream's response nor the Agent's request body moves for 5 minutes, or when a write to the Agent is stuck for 30 seconds. A Delivery cut off mid-response is logged as such.
+- Redaction: an Upstream that echoes the Secret back, as some do in a 401 body, sends the Agent a run of `*` of the same length instead, in headers, body, and trailers. Only exact matches are caught, not a base64 or escaped copy. A stream is held back only by trailing bytes that could begin the Secret.
+- So Redaction can read every response, TrustedCourier asks the Upstream for gzip in place of the Agent's `Accept-Encoding` and does not forward `Range` or `If-Range`. A gzip response arrives decoded; any other or repeated `Content-Encoding` gets 502.
 
 | Status | When |
 | --- | --- |
@@ -218,11 +226,11 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 | 400 | The path contains a dot segment (`..`, `%2e%2e`, `..;`), or the request asks for a protocol upgrade. |
 | 401 | The Agent Token is missing, presented twice, unknown, expired, or revoked. |
 | 403 | Anything else, including an unknown Upstream name. The body is the same as Reveal Delivery's 403. |
-| 502 | The Backend could not return the Secret, or the Upstream could not be reached or its certificate did not verify. Details go to the server log only. |
+| 502 | The Backend could not return the Secret, the Upstream could not be reached or its certificate did not verify, or its response has a `Content-Encoding` Redaction cannot read. Details go to the server log only. |
 | 503 | The server has no locked memory left to hold the Secret. |
-| 504 | The Upstream sent no response for 5 minutes. |
+| 504 | Neither the Upstream's response nor the Agent's request body moved for 5 minutes before the response started. |
 
-The Agent API is described by an OpenAPI 3.1 spec in [`docs/api/agent-api.openapi.yaml`](docs/api/agent-api.openapi.yaml). Routes, credential slots, and Upstream trust are recorded in [ADR-0013](docs/decisions/0013-proxy-delivery-routes-slots-and-upstream-trust.md).
+The Agent API is described by an OpenAPI 3.1 spec in [`docs/api/agent-api.openapi.yaml`](docs/api/agent-api.openapi.yaml). Routes, credential slots, and Upstream trust are recorded in [ADR-0013](docs/decisions/0013-proxy-delivery-routes-slots-and-upstream-trust.md), and Redaction in [ADR-0014](docs/decisions/0014-redaction-masks-in-place.md).
 
 ### Reveal Delivery
 

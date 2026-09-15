@@ -147,7 +147,8 @@ components:
       description: |
         The rest of the path, which may contain slashes. It is forwarded
         under the Upstream's base URL as sent, and the query string is
-        forwarded unchanged. Dot segments, including percent-encoded ones
+        forwarded unchanged, except that parameters Go cannot parse, such as
+        ones separated by `;`, are dropped. Dot segments, including percent-encoded ones
         and ones with `;` parameters such as `..;`, get 400.
       schema:
         type: string
@@ -234,9 +235,14 @@ components:
     Upstream:
       description: |
         The Upstream's response, status, headers, and body as the Upstream
-        sent them, except that `Cache-Control` is `no-store`. Redirects are
-        never followed: a 3xx and its `Location` reach the Agent unchanged.
-        Server-sent event streams pass through as they arrive.
+        sent them, except that `Cache-Control` is `no-store` and Redaction
+        masks every exact match of the Secret, in headers, body, and trailers,
+        with a run of `*` (another byte if the Secret contains `*`) of the
+        same length. Redirects are never followed: a
+        3xx and its `Location` reach the Agent unchanged. Server-sent event
+        streams pass through as they arrive, held back only by bytes that
+        could begin the Secret. A gzip body arrives decoded, and `Range`
+        requests get the whole response.
     ProxyBadRequest:
       description: |
         The path contains a dot segment, or the request asks for a protocol
@@ -248,7 +254,8 @@ components:
             $ref: "#/components/schemas/Error"
     ProxyTimeout:
       description: |
-        The Upstream sent no response for 5 minutes. A response that has
+        Neither the Upstream's response nor the Agent's request body moved
+        for 5 minutes before the response started. A response that has
         started streaming and then goes silent that long is cut off instead.
       content:
         application/json:
@@ -258,7 +265,8 @@ components:
       description: |
         The Backend could not return the Secret, the Secret cannot go in the
         Injection Template's header, or the Upstream could not be reached,
-        including when its TLS certificate does not verify. Details go to the
+        including when its TLS certificate does not verify, or its response
+        has a `Content-Encoding` Redaction cannot read. Details go to the
         server log only.
       content:
         application/json:

@@ -1,9 +1,12 @@
 package agentapi
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net"
@@ -12,11 +15,13 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
 	"github.com/potto007/TrustedCourier/internal/config"
+	"github.com/potto007/TrustedCourier/internal/redact"
 	"github.com/potto007/TrustedCourier/internal/secret"
 )
 
@@ -51,9 +56,12 @@ func newTransport(up config.Upstream) *http.Transport {
 		Proxy:       http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		// Verification is never optional: there is no setting to skip it.
-		TLSClientConfig:       &tls.Config{RootCAs: up.RootCAs, MinVersion: tls.VersionTLS12},
-		TLSHandshakeTimeout:   10 * time.Second,
-		ForceAttemptHTTP2:     true,
+		TLSClientConfig:     &tls.Config{RootCAs: up.RootCAs, MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:   true,
+		// The proxy decodes gzip itself, after checking every
+		// Content-Encoding the Upstream sent (see decodeBody).
+		DisableCompression:    true,
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       90 * time.Second,
 		ExpectContinueTimeout: time.Second,
@@ -120,7 +128,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target := &url.URL{Scheme: rt.upstream.Scheme, Host: rt.upstream.Host, RawQuery: r.URL.RawQuery}
+	target := &url.URL{Scheme: rt.upstream.Scheme, Host: rt.upstream.Host}
 	escaped := rt.upstream.BasePath + rest
 	if escaped == "" {
 		escaped = "/"
@@ -131,8 +139,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 
 	// A proxied response may stream for as long as the Upstream keeps
 	// sending, but may not stall: the request holds the Secret's header copy
-	// until it ends. An Upstream silent for proxyIdleTimeout cancels it, and
-	// an Agent that stops reading for proxyWriteStall fails its writes.
+	// until it ends. When neither the Upstream's response nor the Agent's
+	// request body moves for proxyIdleTimeout, the Delivery is cancelled, and
+	// a write to an Agent that stops reading fails after proxyWriteStall.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	var idle atomic.Bool
@@ -142,28 +151,70 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	})
 	defer timer.Stop()
 	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Now().Add(proxyIdleTimeout))
-	pw := &progressWriter{ResponseWriter: w, rc: rc, timer: timer}
+	// progressWriter bounds each write instead of the server's write timeout,
+	// since on HTTP/2 an armed deadline resets the stream when it passes,
+	// even while no write is pending.
+	_ = rc.SetWriteDeadline(time.Time{})
+	// The Secret is the part of the header between the template's text.
+	rw := newRedactingWriter(w, header[len(rt.template.Prefix):len(header)-len(rt.template.Suffix)])
+	pw := &progressWriter{ResponseWriter: rw, rc: rc, timer: timer}
+	defer func() {
+		// Once the response has started, ReverseProxy ends a Delivery it
+		// cannot finish by aborting the response with this panic.
+		if p := recover(); p != nil {
+			if p == http.ErrAbortHandler {
+				switch {
+				case idle.Load():
+					log.Error("Delivery cut off: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
+				case r.Context().Err() != nil:
+					log.Info("Delivery abandoned by the Agent")
+				case pw.writeErr() != nil:
+					log.Error("Delivery cut off: the response could not be written to the Agent", "error", pw.writeErr())
+				default:
+					log.Error("Delivery cut off: the Upstream's response broke off")
+				}
+			}
+			panic(p)
+		}
+	}()
 
 	(&httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.Out.URL = target
+			// ReverseProxy has already dropped query parameters it cannot
+			// parse from pr.Out, so the query comes from there.
+			out := *target
+			out.RawQuery = pr.Out.URL.RawQuery
+			pr.Out.URL = &out
 			pr.Out.Host = ""
+			if pr.Out.Body != nil && pr.Out.Body != http.NoBody {
+				pr.Out.Body = &progressReader{ReadCloser: pr.Out.Body, timer: timer}
+			}
 			pr.Out.Header.Del(AgentTokenHeader)
 			pr.Out.Header.Del(tokenHeader)
 			pr.Out.Header.Set(rt.template.Name, header)
+			// Redaction must see the whole response as plain bytes: the
+			// proxy asks for gzip and decodes it, and a range could carry
+			// the Secret in pieces.
+			pr.Out.Header.Set("Accept-Encoding", "gzip")
+			pr.Out.Header.Del("Range")
+			pr.Out.Header.Del("If-Range")
 		},
 		Transport: rt.transport,
 		// Redirects reach the Agent as they are: the transport never follows
 		// them, so the Secret is never sent to another host.
 		ModifyResponse: func(res *http.Response) error {
-			// noStore already set these; avoid duplicates.
-			res.Header.Del("Cache-Control")
-			res.Header.Del("X-Content-Type-Options")
+			if err := decodeBody(res); err != nil {
+				return err
+			}
 			log.Info("Delivery allowed", "upstream_status", res.StatusCode)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, errUnreadableEncoding) {
+				log.Error("Delivery failed: Redaction cannot read the Upstream's response", "error", err)
+				writeError(w, http.StatusBadGateway, "the Upstream's response could not be delivered")
+				return
+			}
 			if idle.Load() {
 				log.Error("Delivery failed: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
 				writeError(w, http.StatusGatewayTimeout, "the Upstream did not respond in time")
@@ -178,6 +229,13 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}).ServeHTTP(pw, r.WithContext(ctx))
+	// The held-back bytes, the trailers, and the end of the response go out
+	// after the last guarded write, so bound them too. The deadline stays
+	// set until the server has sent them.
+	_ = rc.SetWriteDeadline(time.Now().Add(proxyWriteStall))
+	// Not deferred: when the body copy fails, ReverseProxy aborts the
+	// response with a panic, and the held-back bytes must not follow.
+	rw.finish()
 }
 
 const (
@@ -189,31 +247,209 @@ const (
 	proxyWriteStall = 30 * time.Second
 )
 
-// progressWriter pushes the idle timer and the write deadline forward
-// whenever the Upstream's response makes progress.
+// progressWriter pushes the idle timer forward whenever the Upstream's
+// response makes progress, and bounds each write and flush to the Agent by
+// proxyWriteStall. The deadline is cleared between writes: on HTTP/2 an armed
+// deadline resets the stream when it passes, even with no write pending.
 type progressWriter struct {
 	http.ResponseWriter
 	rc    *http.ResponseController
 	timer *time.Timer
+
+	mu  sync.Mutex
+	err error // the last failed write's or flush's error
 }
 
-func (p *progressWriter) progress() {
-	p.timer.Reset(proxyIdleTimeout)
+// guard sets the write deadline for one write and returns what clears it.
+func (p *progressWriter) guard() func() {
 	_ = p.rc.SetWriteDeadline(time.Now().Add(proxyWriteStall))
+	return func() { _ = p.rc.SetWriteDeadline(time.Time{}) }
+}
+
+func (p *progressWriter) record(err error) {
+	if err != nil {
+		p.mu.Lock()
+		p.err = err
+		p.mu.Unlock()
+	}
+}
+
+func (p *progressWriter) writeErr() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
 }
 
 func (p *progressWriter) WriteHeader(code int) {
-	p.progress()
+	p.timer.Reset(proxyIdleTimeout)
+	defer p.guard()()
 	p.ResponseWriter.WriteHeader(code)
 }
 
 func (p *progressWriter) Write(b []byte) (int, error) {
-	p.progress()
-	return p.ResponseWriter.Write(b)
+	p.timer.Reset(proxyIdleTimeout)
+	defer p.guard()()
+	n, err := p.ResponseWriter.Write(b)
+	p.record(err)
+	return n, err
+}
+
+// FlushError flushes the underlying writer, bounded like a write. It sends
+// only what Redaction has already released.
+func (p *progressWriter) FlushError() error {
+	defer p.guard()()
+	err := p.rc.Flush()
+	p.record(err)
+	return err
+}
+
+// progressReader pushes the idle timer forward whenever the Agent's request
+// body makes progress, so a long upload is not taken for a silent Upstream.
+type progressReader struct {
+	io.ReadCloser
+	timer *time.Timer
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.ReadCloser.Read(b)
+	if n > 0 {
+		p.timer.Reset(proxyIdleTimeout)
+	}
+	return n, err
 }
 
 // Unwrap lets http.ResponseController flush the underlying writer.
 func (p *progressWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
+
+// redactingWriter performs Redaction on a proxied response: it masks the
+// Secret in the headers of every response, 1xx included, in the body, and in
+// the trailers.
+type redactingWriter struct {
+	http.ResponseWriter
+	secret      string
+	body        *redact.Writer
+	wroteHeader bool
+}
+
+func newRedactingWriter(w http.ResponseWriter, secret string) *redactingWriter {
+	return &redactingWriter{ResponseWriter: w, secret: secret, body: redact.NewWriter(w, secret)}
+}
+
+// redactHeader masks the Secret in every header value and drops any header
+// whose name contains it, since a masked name is not a valid one. Names are
+// matched in any case: Go canonicalizes them, and HTTP/2 lowercases them on
+// the wire. So are the names Trailer announces.
+func (w *redactingWriter) redactHeader() {
+	if w.secret == "" {
+		return
+	}
+	h := w.Header()
+	secret := strings.ToLower(w.secret)
+	for name, values := range h {
+		if strings.Contains(strings.ToLower(name), secret) {
+			delete(h, name)
+			continue
+		}
+		for i, v := range values {
+			values[i] = redact.String(v, w.secret)
+		}
+	}
+	if announced := h.Values("Trailer"); len(announced) > 0 {
+		var kept []string
+		for _, v := range announced {
+			for name := range strings.SplitSeq(v, ",") {
+				if name = strings.TrimSpace(name); name != "" && !strings.Contains(strings.ToLower(name), secret) {
+					kept = append(kept, name)
+				}
+			}
+		}
+		h.Del("Trailer")
+		if len(kept) > 0 {
+			h.Set("Trailer", strings.Join(kept, ", "))
+		}
+	}
+}
+
+func (w *redactingWriter) WriteHeader(code int) {
+	w.redactHeader()
+	if code >= http.StatusOK {
+		w.wroteHeader = true
+		// A 1xx response clears the header map noStore filled, so the final
+		// response gets these again, in place of the Upstream's own.
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *redactingWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.body.Write(p)
+}
+
+// finish writes the body's held-back bytes, which the response ended before
+// they could become the Secret, and masks the trailers.
+func (w *redactingWriter) finish() {
+	_ = w.body.Close()
+	w.redactHeader()
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer. A flush
+// sends only what Redaction has already released.
+func (w *redactingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+var errUnreadableEncoding = errors.New("the response has a Content-Encoding Redaction cannot read")
+
+// decodeBody makes a response's body plain bytes for Redaction. A body
+// encoded once with gzip is decoded; one with any other encoding, or with
+// more than one, is refused, since the Secret could hide inside it.
+func decodeBody(res *http.Response) error {
+	if res.Request.Method == http.MethodHead || res.StatusCode == http.StatusNoContent || res.StatusCode == http.StatusNotModified {
+		return nil
+	}
+	var encodings []string
+	for _, v := range res.Header.Values("Content-Encoding") {
+		for enc := range strings.SplitSeq(v, ",") {
+			if enc = strings.TrimSpace(enc); enc != "" && !strings.EqualFold(enc, "identity") {
+				encodings = append(encodings, enc)
+			}
+		}
+	}
+	switch {
+	case len(encodings) == 0:
+		return nil
+	case len(encodings) == 1 && strings.EqualFold(encodings[0], "gzip"):
+		res.Header.Del("Content-Encoding")
+		res.Header.Del("Content-Length")
+		res.ContentLength = -1
+		res.Body = &gzipBody{body: res.Body}
+		return nil
+	default:
+		return fmt.Errorf("%w: %s", errUnreadableEncoding, strings.Join(encodings, ", "))
+	}
+}
+
+// gzipBody decodes a gzip body, starting on the first Read so the response's
+// headers need not wait for its body.
+type gzipBody struct {
+	body io.ReadCloser
+	zr   *gzip.Reader
+	err  error
+}
+
+func (g *gzipBody) Read(p []byte) (int, error) {
+	if g.zr == nil && g.err == nil {
+		g.zr, g.err = gzip.NewReader(g.body)
+	}
+	if g.err != nil {
+		return 0, g.err
+	}
+	return g.zr.Read(p)
+}
+
+func (g *gzipBody) Close() error { return g.body.Close() }
 
 // forwardedPath returns the escaped path after /proxy/{secret_name}/{upstream},
 // with its leading slash. It refuses dot segments, including percent-encoded
