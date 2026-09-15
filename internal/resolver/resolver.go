@@ -1,6 +1,6 @@
 // Package resolver is the Secret Resolver: it resolves a Secret Name through
 // a config snapshot to a Backend location and fetches the Secret through the
-// Plugin Host on every Delivery.
+// Plugin Host, on every Delivery unless the Secret Name sets a cache TTL.
 package resolver
 
 import (
@@ -15,21 +15,35 @@ import (
 // Resolver is the Secret Resolver.
 type Resolver struct {
 	plugins *pluginhost.Host
+	cache   *cache
 }
 
-// New returns a Resolver that fetches through plugins.
+// New returns a Resolver that fetches through plugins. Close it to wipe the
+// Secrets it caches.
 func New(plugins *pluginhost.Host) *Resolver {
-	return &Resolver{plugins: plugins}
+	return &Resolver{plugins: plugins, cache: newCache()}
 }
 
-// Resolve fetches the Secret for secretName as the config snapshot cfg maps
-// it. The caller must Release it.
+// Resolve returns the Secret for secretName as the config snapshot cfg maps
+// it, from the cache while the Secret Name's cache TTL allows. The caller must
+// Release it.
 func (r *Resolver) Resolve(ctx context.Context, cfg *config.Config, secretName string) (*secret.Secret, error) {
 	s, ok := cfg.Secrets[secretName]
 	if !ok {
 		return nil, fmt.Errorf("unknown Secret Name %q", secretName)
 	}
-	return r.plugins.Get(ctx, s.Backend, s.Location)
+	fetch := func() (*secret.Secret, error) { return r.plugins.Get(ctx, s.Backend, s.Location) }
+	if s.CacheTTL == 0 {
+		r.cache.forget(secretName)
+		return fetch()
+	}
+	return r.cache.get(secretName, s.Backend, s.Location, s.CacheTTL, fetch)
+}
+
+// Close wipes every cached Secret. Resolve still works after Close, without
+// caching.
+func (r *Resolver) Close() {
+	r.cache.close()
 }
 
 // CourierKey fetches the Courier Key at key. The caller must Release it and

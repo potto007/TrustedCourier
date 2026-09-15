@@ -85,6 +85,8 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	// and while Audit Records cannot be stored. Once both APIs have drained,
 	// the last records are stored and signed before the database closes.
 	secrets := resolver.New(plugins)
+	// Runs once both APIs have drained, so no Delivery still needs the cache.
+	defer secrets.Close()
 	if key := cfg.Audit.SigningKey; key != nil {
 		auditLog.Start(func(ctx context.Context) (*secret.Secret, error) { return secrets.CourierKey(ctx, *key) })
 	}
