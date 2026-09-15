@@ -1,10 +1,12 @@
 package agentapi
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net"
@@ -53,9 +55,12 @@ func newTransport(up config.Upstream) *http.Transport {
 		Proxy:       http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		// Verification is never optional: there is no setting to skip it.
-		TLSClientConfig:       &tls.Config{RootCAs: up.RootCAs, MinVersion: tls.VersionTLS12},
-		TLSHandshakeTimeout:   10 * time.Second,
-		ForceAttemptHTTP2:     true,
+		TLSClientConfig:     &tls.Config{RootCAs: up.RootCAs, MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:   true,
+		// The proxy decodes gzip itself, after checking every
+		// Content-Encoding the Upstream sent (see decodeBody).
+		DisableCompression:    true,
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       90 * time.Second,
 		ExpectContinueTimeout: time.Second,
@@ -156,10 +161,10 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			pr.Out.Header.Del(AgentTokenHeader)
 			pr.Out.Header.Del(tokenHeader)
 			pr.Out.Header.Set(rt.template.Name, header)
-			// Redaction must see the whole response as plain bytes. Without
-			// the Agent's Accept-Encoding the transport asks for gzip and
-			// decodes it; a range could carry the Secret in pieces.
-			pr.Out.Header.Del("Accept-Encoding")
+			// Redaction must see the whole response as plain bytes: the
+			// proxy asks for gzip and decodes it, and a range could carry
+			// the Secret in pieces.
+			pr.Out.Header.Set("Accept-Encoding", "gzip")
 			pr.Out.Header.Del("Range")
 			pr.Out.Header.Del("If-Range")
 		},
@@ -167,15 +172,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		// Redirects reach the Agent as they are: the transport never follows
 		// them, so the Secret is never sent to another host.
 		ModifyResponse: func(res *http.Response) error {
-			if err := unreadableEncoding(res); err != nil {
+			if err := decodeBody(res); err != nil {
 				return err
 			}
-			// A 1xx response clears the headers noStore set, so set them
-			// again here rather than risk duplicates.
-			w.Header().Del("Cache-Control")
-			w.Header().Del("X-Content-Type-Options")
-			res.Header.Set("Cache-Control", "no-store")
-			res.Header.Set("X-Content-Type-Options", "nosniff")
 			log.Info("Delivery allowed", "upstream_status", res.StatusCode)
 			return nil
 		},
@@ -254,16 +253,36 @@ func newRedactingWriter(w http.ResponseWriter, secret string) *redactingWriter {
 }
 
 // redactHeader masks the Secret in every header value and drops any header
-// whose name contains it, since a masked name is not a valid one.
+// whose name contains it, since a masked name is not a valid one. Names are
+// matched in any case: Go canonicalizes them, and HTTP/2 lowercases them on
+// the wire. So are the names Trailer announces.
 func (w *redactingWriter) redactHeader() {
+	if w.secret == "" {
+		return
+	}
 	h := w.Header()
+	secret := strings.ToLower(w.secret)
 	for name, values := range h {
-		if w.secret != "" && strings.Contains(name, w.secret) {
+		if strings.Contains(strings.ToLower(name), secret) {
 			delete(h, name)
 			continue
 		}
 		for i, v := range values {
 			values[i] = redact.String(v, w.secret)
+		}
+	}
+	if announced := h.Values("Trailer"); len(announced) > 0 {
+		var kept []string
+		for _, v := range announced {
+			for name := range strings.SplitSeq(v, ",") {
+				if name = strings.TrimSpace(name); name != "" && !strings.Contains(strings.ToLower(name), secret) {
+					kept = append(kept, name)
+				}
+			}
+		}
+		h.Del("Trailer")
+		if len(kept) > 0 {
+			h.Set("Trailer", strings.Join(kept, ", "))
 		}
 	}
 }
@@ -272,6 +291,10 @@ func (w *redactingWriter) WriteHeader(code int) {
 	w.redactHeader()
 	if code >= http.StatusOK {
 		w.wroteHeader = true
+		// A 1xx response clears the header map noStore filled, so the final
+		// response gets these again, in place of the Upstream's own.
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 	}
 	w.ResponseWriter.WriteHeader(code)
 }
@@ -296,22 +319,54 @@ func (w *redactingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter
 
 var errUnreadableEncoding = errors.New("the response has a Content-Encoding Redaction cannot read")
 
-// unreadableEncoding refuses a response whose body is still encoded after
-// the transport decoded any gzip it asked for, since Redaction could not see
-// the Secret inside it.
-func unreadableEncoding(res *http.Response) error {
+// decodeBody makes a response's body plain bytes for Redaction. A body
+// encoded once with gzip is decoded; one with any other encoding, or with
+// more than one, is refused, since the Secret could hide inside it.
+func decodeBody(res *http.Response) error {
 	if res.Request.Method == http.MethodHead || res.StatusCode == http.StatusNoContent || res.StatusCode == http.StatusNotModified {
 		return nil
 	}
+	var encodings []string
 	for _, v := range res.Header.Values("Content-Encoding") {
 		for enc := range strings.SplitSeq(v, ",") {
 			if enc = strings.TrimSpace(enc); enc != "" && !strings.EqualFold(enc, "identity") {
-				return fmt.Errorf("%w: %s", errUnreadableEncoding, enc)
+				encodings = append(encodings, enc)
 			}
 		}
 	}
-	return nil
+	switch {
+	case len(encodings) == 0:
+		return nil
+	case len(encodings) == 1 && strings.EqualFold(encodings[0], "gzip"):
+		res.Header.Del("Content-Encoding")
+		res.Header.Del("Content-Length")
+		res.ContentLength = -1
+		res.Body = &gzipBody{body: res.Body}
+		return nil
+	default:
+		return fmt.Errorf("%w: %s", errUnreadableEncoding, strings.Join(encodings, ", "))
+	}
 }
+
+// gzipBody decodes a gzip body, starting on the first Read so the response's
+// headers need not wait for its body.
+type gzipBody struct {
+	body io.ReadCloser
+	zr   *gzip.Reader
+	err  error
+}
+
+func (g *gzipBody) Read(p []byte) (int, error) {
+	if g.zr == nil && g.err == nil {
+		g.zr, g.err = gzip.NewReader(g.body)
+	}
+	if g.err != nil {
+		return 0, g.err
+	}
+	return g.zr.Read(p)
+}
+
+func (g *gzipBody) Close() error { return g.body.Close() }
 
 // forwardedPath returns the escaped path after /proxy/{secret_name}/{upstream},
 // with its leading slash. It refuses dot segments, including percent-encoded

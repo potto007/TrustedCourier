@@ -236,7 +236,8 @@ components:
         The Upstream's response, status, headers, and body as the Upstream
         sent them, except that `Cache-Control` is `no-store` and Redaction
         masks every exact match of the Secret, in headers, body, and trailers,
-        with a run of `*` of the same length. Redirects are never followed: a
+        with a run of `*` (another byte if the Secret contains `*`) of the
+        same length. Redirects are never followed: a
         3xx and its `Location` reach the Agent unchanged. Server-sent event
         streams pass through as they arrive, held back only by bytes that
         could begin the Secret. A gzip body arrives decoded, and `Range`

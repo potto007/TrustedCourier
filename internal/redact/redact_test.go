@@ -88,6 +88,19 @@ func TestWriterMasksWithAByteTheNeedleDoesNotContain(t *testing.T) {
 	}
 }
 
+func TestWriterMaskKeepsJSONAndHTMLIntact(t *testing.T) {
+	var out bytes.Buffer
+	w := redact.NewWriter(&out, `Pa*ss!word`)
+	_, _ = w.Write([]byte(`{"error":"invalid key Pa*ss!word"}`))
+	_ = w.Close()
+	got := out.String()
+	masked := got[len(`{"error":"invalid key `) : len(got)-len(`"}`)]
+	if len(masked) != len(`Pa*ss!word`) || bytes.ContainsAny([]byte(masked), "Pa*ss!word\"\\<>&'") ||
+		bytes.Count([]byte(masked), []byte(masked[:1])) != len(masked) {
+		t.Fatalf("got %q, want one repeated byte that is not in the needle and not JSON- or HTML-significant", got)
+	}
+}
+
 func TestWriterWithAnEmptyNeedlePassesThrough(t *testing.T) {
 	var out bytes.Buffer
 	w := redact.NewWriter(&out, "")

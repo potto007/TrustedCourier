@@ -38,6 +38,16 @@ func (w *Writer) Write(p []byte) (int, error) {
 	if len(w.needle) == 0 {
 		return w.w.Write(p)
 	}
+	if w.pending == 0 && !bytes.Contains(p, w.needle) {
+		// Nothing to mask: write p itself, less any partial match.
+		hold := partialMatch(p[max(0, len(p)-len(w.needle)+1):], w.needle)
+		if _, err := w.w.Write(p[:len(p)-hold]); err != nil {
+			return 0, err
+		}
+		w.buf = append(w.buf[:0], p[len(p)-hold:]...)
+		w.pending = hold
+		return len(p), nil
+	}
 	w.buf = append(w.buf[:w.pending], p...)
 	end := mask(w.buf, w.needle, w.mask)
 	hold := partialMatch(w.buf[max(end, len(w.buf)-len(w.needle)+1):], w.needle)
@@ -46,6 +56,8 @@ func (w *Writer) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	w.pending = copy(w.buf, w.buf[send:])
+	// The held bytes' old place may be past the next append's end.
+	clear(w.buf[w.pending:])
 	return len(p), nil
 }
 
@@ -99,16 +111,17 @@ func partialMatch(b, needle []byte) int {
 	return 0
 }
 
-// maskFor returns '*', or if needle contains it, the first other printable
-// byte needle does not contain, so a mask cannot combine with the bytes
-// around it into a new match. A needle holding every candidate gets '*'.
+// maskBytes are the bytes a mask may be made of, in order of preference. None
+// means anything in JSON or HTML, so a masked document still parses.
+const maskBytes = "*x-_.~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwyz"
+
+// maskFor returns the first of maskBytes that needle does not contain, so a
+// mask cannot combine with the bytes around it into a new match. A needle
+// holding every one of them gets '*'.
 func maskFor(needle string) byte {
-	if strings.IndexByte(needle, '*') < 0 {
-		return '*'
-	}
-	for c := byte('!'); c <= '~'; c++ {
-		if strings.IndexByte(needle, c) < 0 {
-			return c
+	for i := range len(maskBytes) {
+		if strings.IndexByte(needle, maskBytes[i]) < 0 {
+			return maskBytes[i]
 		}
 	}
 	return '*'

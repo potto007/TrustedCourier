@@ -110,15 +110,21 @@ func (u *Upstream) echo(w http.ResponseWriter, r *http.Request) {
 	if s, err := strconv.Atoi(q.Get("status")); err == nil {
 		status = s
 	}
+	if q.Has("name") {
+		// The echoed value's last word, lowercased, as a header name.
+		words := strings.Fields(v)
+		w.Header()[strings.ToLower(words[len(words)-1])] = []string{"1"}
+	}
 	body := []byte(v)
+	acceptsGzip := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
 	switch enc := q.Get("encoding"); {
-	case enc == "gzip" && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip"):
-		var b bytes.Buffer
-		zw := gzip.NewWriter(&b)
-		_, _ = zw.Write(body)
-		_ = zw.Close()
-		body = b.Bytes()
+	case enc == "gzip" && acceptsGzip:
+		body = gzipped(body)
 		w.Header().Set("Content-Encoding", "gzip")
+	case enc == "gzip-twice" && acceptsGzip:
+		// Two header lines, each naming one of two layers.
+		body = gzipped(gzipped(body))
+		w.Header()["Content-Encoding"] = []string{"gzip", "gzip"}
 	case enc == "br":
 		w.Header().Set("Content-Encoding", "br")
 	}
@@ -127,6 +133,14 @@ func (u *Upstream) echo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
+}
+
+func gzipped(b []byte) []byte {
+	var out bytes.Buffer
+	zw := gzip.NewWriter(&out)
+	_, _ = zw.Write(b)
+	_ = zw.Close()
+	return out.Bytes()
 }
 
 // echoEvents streams "data: first" and then an event carrying the echoed

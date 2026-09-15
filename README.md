@@ -211,7 +211,7 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 - WebSockets and other protocol upgrades are refused. An `h2c` offer, as `curl --http2` sends, is answered over HTTP/1.1.
 - A response may stream for as long as the Upstream keeps sending. An Upstream that sends nothing for 5 minutes, or an Agent that stops reading for 30 seconds, ends the Delivery.
 - Redaction: an Upstream that echoes the Secret back, as some do in a 401 body, sends the Agent a run of `*` of the same length instead, in headers, body, and trailers. Only exact matches are caught, not a base64 or escaped copy. A stream is held back only by trailing bytes that could begin the Secret.
-- So Redaction can read every response, the Agent's `Accept-Encoding`, `Range`, and `If-Range` are not forwarded. A gzip response arrives decoded; any other `Content-Encoding` gets 502.
+- So Redaction can read every response, TrustedCourier asks the Upstream for gzip in place of the Agent's `Accept-Encoding` and does not forward `Range` or `If-Range`. A gzip response arrives decoded; any other or repeated `Content-Encoding` gets 502.
 
 | Status | When |
 | --- | --- |

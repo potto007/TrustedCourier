@@ -19,7 +19,8 @@ func assertNoSecret(t *testing.T, res agentResponse) {
 	t.Helper()
 	for name, values := range res.Header {
 		for _, v := range values {
-			if strings.Contains(name+v, fakeSecret) {
+			// Header names reach the Agent in any case: HTTP/2 lowercases them.
+			if strings.Contains(strings.ToLower(name), fakeSecret) || strings.Contains(strings.ToLower(v), fakeSecret) {
 				t.Errorf("the Agent received the Secret in %s: %q", name, v)
 			}
 		}
@@ -86,12 +87,28 @@ func TestProxyDeliveryRedactsTheSecretFromResponses(t *testing.T) {
 		assertNoSecret(t, got)
 	})
 
-	t.Run("in an encoding Redaction cannot read", func(t *testing.T) {
-		got := proxy(t, srv, http.MethodGet, "/proxy/openai/api/echo?encoding=br&header=Authorization", bearer(token), "")
-		if got.Status != http.StatusBadGateway || got.Header.Get("Content-Encoding") != "" {
-			t.Fatalf("proxy = %d %q %v, want 502", got.Status, got.Body, got.Header)
+	t.Run("echoed in a header name", func(t *testing.T) {
+		got := proxy(t, srv, http.MethodGet, "/proxy/openai/api/echo?name=1&header=Authorization", bearer(token), "")
+		if got.Status != http.StatusOK {
+			t.Fatalf("proxy = %d %q, want 200", got.Status, got.Body)
 		}
 		assertNoSecret(t, got)
+	})
+
+	t.Run("in an encoding Redaction cannot read", func(t *testing.T) {
+		header := bearer(token)
+		header.Set("Accept-Encoding", "gzip")
+		for _, enc := range []string{"br", "gzip-twice"} {
+			// The 103 clears the response's headers, which a 502 must still carry.
+			got := proxy(t, srv, http.MethodGet, "/proxy/openai/api/echo?early=1&header=Authorization&encoding="+enc, header, "")
+			if got.Status != http.StatusBadGateway || got.Header.Get("Content-Encoding") != "" {
+				t.Fatalf("%s: proxy = %d %q %v, want 502", enc, got.Status, got.Body, got.Header)
+			}
+			if got.Header.Get("Cache-Control") != "no-store" || got.Header.Get("X-Content-Type-Options") != "nosniff" {
+				t.Errorf("%s: 502 headers %v, want Cache-Control no-store and nosniff", enc, got.Header)
+			}
+			assertNoSecret(t, got)
+		}
 		if !strings.Contains(srv.Stderr(), "Redaction cannot read") {
 			t.Errorf("server log does not record the refused encoding:\n%s", srv.Stderr())
 		}
