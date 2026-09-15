@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/potto007/TrustedCourier/internal/access"
 	"github.com/potto007/TrustedCourier/internal/config"
+	"github.com/potto007/TrustedCourier/internal/redact"
 	"github.com/potto007/TrustedCourier/internal/secret"
 )
 
@@ -143,7 +145,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	defer timer.Stop()
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Now().Add(proxyIdleTimeout))
-	pw := &progressWriter{ResponseWriter: w, rc: rc, timer: timer}
+	// The Secret is the part of the header between the template's text.
+	rw := newRedactingWriter(w, header[len(rt.template.Prefix):len(header)-len(rt.template.Suffix)])
+	pw := &progressWriter{ResponseWriter: rw, rc: rc, timer: timer}
 
 	(&httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -152,18 +156,35 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			pr.Out.Header.Del(AgentTokenHeader)
 			pr.Out.Header.Del(tokenHeader)
 			pr.Out.Header.Set(rt.template.Name, header)
+			// Redaction must see the whole response as plain bytes. Without
+			// the Agent's Accept-Encoding the transport asks for gzip and
+			// decodes it; a range could carry the Secret in pieces.
+			pr.Out.Header.Del("Accept-Encoding")
+			pr.Out.Header.Del("Range")
+			pr.Out.Header.Del("If-Range")
 		},
 		Transport: rt.transport,
 		// Redirects reach the Agent as they are: the transport never follows
 		// them, so the Secret is never sent to another host.
 		ModifyResponse: func(res *http.Response) error {
-			// noStore already set these; avoid duplicates.
-			res.Header.Del("Cache-Control")
-			res.Header.Del("X-Content-Type-Options")
+			if err := unreadableEncoding(res); err != nil {
+				return err
+			}
+			// A 1xx response clears the headers noStore set, so set them
+			// again here rather than risk duplicates.
+			w.Header().Del("Cache-Control")
+			w.Header().Del("X-Content-Type-Options")
+			res.Header.Set("Cache-Control", "no-store")
+			res.Header.Set("X-Content-Type-Options", "nosniff")
 			log.Info("Delivery allowed", "upstream_status", res.StatusCode)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, errUnreadableEncoding) {
+				log.Error("Delivery failed: Redaction cannot read the Upstream's response", "error", err)
+				writeError(w, http.StatusBadGateway, "the Upstream's response could not be delivered")
+				return
+			}
 			if idle.Load() {
 				log.Error("Delivery failed: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
 				writeError(w, http.StatusGatewayTimeout, "the Upstream did not respond in time")
@@ -178,6 +199,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}).ServeHTTP(pw, r.WithContext(ctx))
+	// Not deferred: when the body copy fails, ReverseProxy aborts the
+	// response with a panic, and the held-back bytes must not follow.
+	rw.finish()
 }
 
 const (
@@ -214,6 +238,80 @@ func (p *progressWriter) Write(b []byte) (int, error) {
 
 // Unwrap lets http.ResponseController flush the underlying writer.
 func (p *progressWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
+
+// redactingWriter performs Redaction on a proxied response: it masks the
+// Secret in the headers of every response, 1xx included, in the body, and in
+// the trailers.
+type redactingWriter struct {
+	http.ResponseWriter
+	secret      string
+	body        *redact.Writer
+	wroteHeader bool
+}
+
+func newRedactingWriter(w http.ResponseWriter, secret string) *redactingWriter {
+	return &redactingWriter{ResponseWriter: w, secret: secret, body: redact.NewWriter(w, secret)}
+}
+
+// redactHeader masks the Secret in every header value and drops any header
+// whose name contains it, since a masked name is not a valid one.
+func (w *redactingWriter) redactHeader() {
+	h := w.Header()
+	for name, values := range h {
+		if w.secret != "" && strings.Contains(name, w.secret) {
+			delete(h, name)
+			continue
+		}
+		for i, v := range values {
+			values[i] = redact.String(v, w.secret)
+		}
+	}
+}
+
+func (w *redactingWriter) WriteHeader(code int) {
+	w.redactHeader()
+	if code >= http.StatusOK {
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *redactingWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.body.Write(p)
+}
+
+// finish writes the body's held-back bytes, which the response ended before
+// they could become the Secret, and masks the trailers.
+func (w *redactingWriter) finish() {
+	_ = w.body.Close()
+	w.redactHeader()
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer. A flush
+// sends only what Redaction has already released.
+func (w *redactingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+var errUnreadableEncoding = errors.New("the response has a Content-Encoding Redaction cannot read")
+
+// unreadableEncoding refuses a response whose body is still encoded after
+// the transport decoded any gzip it asked for, since Redaction could not see
+// the Secret inside it.
+func unreadableEncoding(res *http.Response) error {
+	if res.Request.Method == http.MethodHead || res.StatusCode == http.StatusNoContent || res.StatusCode == http.StatusNotModified {
+		return nil
+	}
+	for _, v := range res.Header.Values("Content-Encoding") {
+		for enc := range strings.SplitSeq(v, ",") {
+			if enc = strings.TrimSpace(enc); enc != "" && !strings.EqualFold(enc, "identity") {
+				return fmt.Errorf("%w: %s", errUnreadableEncoding, enc)
+			}
+		}
+	}
+	return nil
+}
 
 // forwardedPath returns the escaped path after /proxy/{secret_name}/{upstream},
 // with its leading slash. It refuses dot segments, including percent-encoded

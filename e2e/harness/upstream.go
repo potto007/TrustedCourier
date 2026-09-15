@@ -1,6 +1,8 @@
 package harness
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -9,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,8 +23,9 @@ const UpstreamRedirectLocation = "https://elsewhere.example/landing?from=upstrea
 // Upstream is a fake Upstream: a local TLS server that records every request
 // it receives. GET /redirect answers 302 to UpstreamRedirectLocation, GET
 // /events streams two server-sent events and holds back the second until
-// ReleaseEvents, and every other request gets 200 with a body naming the
-// method and path it saw.
+// ReleaseEvents, GET /echo and /echo-events echo a credential back (see
+// echo), and every other request gets 200 with a body naming the method and
+// path it saw.
 type Upstream struct {
 	// URL is the base URL, such as https://127.0.0.1:41234.
 	URL string
@@ -82,6 +87,68 @@ func (u *Upstream) Requests() []UpstreamRequest {
 // ReleaseEvents lets every /events stream send its second event.
 func (u *Upstream) ReleaseEvents() { u.releaseOnce.Do(func() { close(u.release) }) }
 
+// echoed is what /echo and /echo-events send back, as an Upstream echoes a
+// rejected credential: the text query parameter, then the value of the
+// request header the header query parameter names.
+func echoed(r *http.Request) string {
+	q := r.URL.Query()
+	return q.Get("text") + r.Header.Get(q.Get("header"))
+}
+
+// echo answers with the echoed value as the body and the X-Echo header, with
+// the status the status query parameter gives (200 by default) and an exact
+// Content-Length. With early, it first sends 103 Early Hints carrying X-Echo.
+// With encoding=gzip it compresses the body if the request accepts gzip; with
+// encoding=br it labels the body br without compressing it.
+func (u *Upstream) echo(w http.ResponseWriter, r *http.Request) {
+	v, q := echoed(r), r.URL.Query()
+	if q.Has("early") {
+		w.Header().Set("X-Echo", v)
+		w.WriteHeader(http.StatusEarlyHints)
+	}
+	status := http.StatusOK
+	if s, err := strconv.Atoi(q.Get("status")); err == nil {
+		status = s
+	}
+	body := []byte(v)
+	switch enc := q.Get("encoding"); {
+	case enc == "gzip" && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip"):
+		var b bytes.Buffer
+		zw := gzip.NewWriter(&b)
+		_, _ = zw.Write(body)
+		_ = zw.Close()
+		body = b.Bytes()
+		w.Header().Set("Content-Encoding", "gzip")
+	case enc == "br":
+		w.Header().Set("Content-Encoding", "br")
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("X-Echo", v)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+// echoEvents streams "data: first" and then an event carrying the echoed
+// value, split in half: it flushes the first half and holds back the second
+// until ReleaseEvents. It sends the echoed value again as the X-Echo trailer.
+func (u *Upstream) echoEvents(w http.ResponseWriter, r *http.Request) {
+	v := echoed(r)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Trailer", "X-Echo")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "data: first\n\ndata: key "+v[:len(v)/2])
+	http.NewResponseController(w).Flush()
+	select {
+	case <-u.release:
+	case <-r.Context().Done():
+		return
+	case <-time.After(15 * time.Second):
+	}
+	_, _ = io.WriteString(w, v[len(v)/2:]+"\n\n")
+	w.Header().Set("X-Echo", v)
+}
+
 func (u *Upstream) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	u.mu.Lock()
@@ -111,6 +178,10 @@ func (u *Upstream) serve(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(15 * time.Second):
 		}
 		_, _ = io.WriteString(w, "data: second\n\n")
+	case "/echo":
+		u.echo(w, r)
+	case "/echo-events":
+		u.echoEvents(w, r)
 	default:
 		w.Header().Set("Content-Type", "text/plain")
 		w.Header().Set("X-Upstream", "fake")
