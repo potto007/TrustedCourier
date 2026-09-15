@@ -116,7 +116,7 @@ func TestProxyDeliveryInjectsTheSecret(t *testing.T) {
 		t.Errorf("the Upstream's response headers did not reach the Agent: %v", got.Header)
 	}
 
-	reqs := tc.Upstream.Requests()
+	reqs := tc.Upstream().Requests()
 	if len(reqs) != 1 {
 		t.Fatalf("the Upstream received %d requests, want 1", len(reqs))
 	}
@@ -130,7 +130,7 @@ func TestProxyDeliveryInjectsTheSecret(t *testing.T) {
 	if up.Body != `{"model":"m"}` || up.Header.Get("X-Agent-Header") != "kept" || up.Header.Get("Content-Type") != "application/json" {
 		t.Errorf("the Agent's body and headers were not forwarded: %+v", up)
 	}
-	if want := strings.TrimPrefix(tc.Upstream.URL, "https://"); up.Host != want {
+	if want := strings.TrimPrefix(tc.Upstream().URL, "https://"); up.Host != want {
 		t.Errorf("the Upstream received Host %q, want %q", up.Host, want)
 	}
 	assertNoAgentToken(t, up, token)
@@ -156,11 +156,11 @@ func TestProxyDeliveryFindsTheAgentTokenInTheCredentialSlot(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			before := len(tc.Upstream.Requests())
+			before := len(tc.Upstream().Requests())
 			if got := proxy(t, srv, http.MethodGet, c.path, c.header, ""); got.Status != http.StatusOK {
 				t.Fatalf("proxy = %d %q, want 200", got.Status, got.Body)
 			}
-			reqs := tc.Upstream.Requests()
+			reqs := tc.Upstream().Requests()
 			if len(reqs) != before+1 {
 				t.Fatalf("the Upstream received %d requests, want 1", len(reqs)-before)
 			}
@@ -200,7 +200,7 @@ func TestProxyDeliveryRefusesAgentTokensItCannotUse(t *testing.T) {
 			}
 		})
 	}
-	if n := len(tc.Upstream.Requests()); n != 0 {
+	if n := len(tc.Upstream().Requests()); n != 0 {
 		t.Fatalf("the Upstream received %d refused requests", n)
 	}
 }
@@ -256,7 +256,7 @@ func TestProxyDeliveryDenialsAreIdentical(t *testing.T) {
 			t.Errorf("%s: %d %q %v, want the Reveal Delivery 403: %q %v", c.name, got.Status, got.Body, got.Header, want.Body, want.Header)
 		}
 	}
-	if n := len(tc.Upstream.Requests()); n != 0 {
+	if n := len(tc.Upstream().Requests()); n != 0 {
 		t.Fatalf("the Upstream received %d denied requests", n)
 	}
 }
@@ -298,7 +298,7 @@ func TestProxyDeliveryExposesOneRoutePerUpstream(t *testing.T) {
 	if got := proxy(t, srv, http.MethodGet, "/proxy/multi/second", bearer(token), ""); got.Status != http.StatusOK {
 		t.Fatalf("proxy to second's base URL = %d %q, want 200", got.Status, got.Body)
 	}
-	if reqs := tc.Upstream.Requests(); len(reqs) != 1 || reqs[0].Path != "/v1/models" {
+	if reqs := tc.Upstream().Requests(); len(reqs) != 1 || reqs[0].Path != "/v1/models" {
 		t.Errorf("first Upstream received %+v, want only /v1/models", reqs)
 	}
 	reqs := second.Requests()
@@ -336,7 +336,7 @@ func TestProxyDeliveryReturnsRedirectsUnfollowed(t *testing.T) {
 	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != harness.UpstreamRedirectLocation {
 		t.Fatalf("proxy redirect = %d Location %q, want 302 to %q", resp.StatusCode, resp.Header.Get("Location"), harness.UpstreamRedirectLocation)
 	}
-	if n := len(tc.Upstream.Requests()); n != 1 {
+	if n := len(tc.Upstream().Requests()); n != 1 {
 		t.Fatalf("the Upstream received %d requests, want 1", n)
 	}
 }
@@ -378,7 +378,7 @@ func TestProxyDeliveryStreamsServerSentEvents(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the first event did not arrive while the stream was still open")
 	}
-	tc.Upstream.ReleaseEvents()
+	tc.Upstream().ReleaseEvents()
 	if line := <-lines; line != "data: second" {
 		t.Fatalf("second event = %q, want data: second", line)
 	}
@@ -418,7 +418,7 @@ func TestProxyDeliverySpeaksHTTP1AndHTTP2(t *testing.T) {
 		secretName string
 		up         *harness.Upstream
 		wantProto  int
-	}{{"openai", tc.Upstream, 2}, {"h1only", h1, 1}}
+	}{{"openai", tc.Upstream(), 2}, {"h1only", h1, 1}}
 	for agentProto, client := range clients {
 		for _, u := range upstreams {
 			t.Run(fmt.Sprintf("Agent HTTP/%d to Upstream HTTP/%d", agentProto, u.wantProto), func(t *testing.T) {
@@ -475,7 +475,7 @@ func foreignCA(t *testing.T, dir string) string {
 
 func TestProxyDeliveryVerifiesUpstreamTLS(t *testing.T) {
 	tc := harness.New(t)
-	up := tc.Upstream
+	up := tc.Upstream()
 	port := up.URL[strings.LastIndex(up.URL, ":")+1:]
 	secret := func(name, upstream string) string {
 		return fmt.Sprintf(`
@@ -537,7 +537,7 @@ func TestProxyDeliveryRefusesProtocolUpgrades(t *testing.T) {
 	if got := proxy(t, srv, http.MethodGet, "/proxy/openai/api/v1/realtime", header, ""); got.Status != http.StatusBadRequest {
 		t.Fatalf("upgrade = %d %q, want 400", got.Status, got.Body)
 	}
-	if n := len(tc.Upstream.Requests()); n != 0 {
+	if n := len(tc.Upstream().Requests()); n != 0 {
 		t.Fatalf("the Upstream received %d upgrade requests", n)
 	}
 
@@ -550,7 +550,7 @@ func TestProxyDeliveryRefusesProtocolUpgrades(t *testing.T) {
 	if got := proxy(t, srv, http.MethodGet, "/proxy/openai/api/v1/models", h2c, ""); got.Status != http.StatusOK {
 		t.Fatalf("request offering h2c = %d %q, want 200", got.Status, got.Body)
 	}
-	reqs := tc.Upstream.Requests()
+	reqs := tc.Upstream().Requests()
 	if len(reqs) != 1 {
 		t.Fatalf("the Upstream received %d requests, want 1", len(reqs))
 	}

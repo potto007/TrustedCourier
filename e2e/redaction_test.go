@@ -118,12 +118,12 @@ func TestProxyDeliveryRedactsTheSecretFromResponses(t *testing.T) {
 		header := bearer(token)
 		header.Set("Range", "bytes=10-13")
 		header.Set("If-Range", `"etag"`)
-		before := len(tc.Upstream.Requests())
+		before := len(tc.Upstream().Requests())
 		got := proxy(t, srv, http.MethodGet, "/proxy/openai/api/echo?header=Authorization", header, "")
 		if got.Status != http.StatusOK || got.Body != "Bearer ************" {
 			t.Fatalf("proxy = %d %q, want 200 with the whole masked body", got.Status, got.Body)
 		}
-		reqs := tc.Upstream.Requests()
+		reqs := tc.Upstream().Requests()
 		if len(reqs) != before+1 {
 			t.Fatalf("the Upstream received %d requests, want 1", len(reqs)-before)
 		}
@@ -192,7 +192,7 @@ func TestProxyDeliveryRedactsTheSecretSplitAcrossAStream(t *testing.T) {
 			t.Fatalf("while the stream is held, the Agent received %q, want %q", got, early)
 		}
 	}
-	tc.Upstream.ReleaseEvents()
+	tc.Upstream().ReleaseEvents()
 	for c := range chunks {
 		got += c
 	}

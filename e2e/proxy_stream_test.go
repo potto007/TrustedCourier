@@ -79,7 +79,7 @@ func TestProxyDeliveryDropsQueryParametersItCannotParse(t *testing.T) {
 	if got := proxy(t, srv, http.MethodGet, "/proxy/openai/api/v1/models?model=a;model=b&ok=1", bearer(token), ""); got.Status != http.StatusOK {
 		t.Fatalf("proxy = %d %q, want 200", got.Status, got.Body)
 	}
-	reqs := tc.Upstream.Requests()
+	reqs := tc.Upstream().Requests()
 	if len(reqs) != 1 || reqs[0].RawQuery != "ok=1" {
 		t.Fatalf("the Upstream received %+v, want only the query ok=1", reqs)
 	}

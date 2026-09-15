@@ -130,8 +130,9 @@ type Installation struct {
 	ConfigMode os.FileMode
 	dir        string
 
-	// Upstream is the fake Upstream BaseConfig pins its Secret Names to.
-	Upstream *Upstream
+	// upstream is the fake Upstream BaseConfig pins its Secret Names to, once
+	// started.
+	upstream *Upstream
 
 	mu sync.Mutex
 	// secretValues are the Secret values tests gave the fake Backend Plugin.
@@ -159,8 +160,19 @@ func New(t *testing.T) *Installation {
 		Socket:     filepath.Join(dir, "admin.sock"),
 		ConfigMode: 0o600,
 	}
-	in.Upstream = in.StartUpstream(true)
 	return in
+}
+
+// Upstream returns the fake Upstream BaseConfig pins its Secret Names to,
+// starting it on the first call, so tests that never proxy start none.
+func (in *Installation) Upstream() *Upstream {
+	in.t.Helper()
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if in.upstream == nil {
+		in.upstream = in.StartUpstream(true)
+	}
+	return in.upstream
 }
 
 // ConfigVars are available to config templates as {{.DataDir}}, {{.Socket}},
@@ -175,8 +187,13 @@ type ConfigVars struct {
 	Unhealthy PluginBinary
 	Crashing  PluginBinary
 	Malformed PluginBinary
-	Upstream  *Upstream
+
+	in *Installation
 }
+
+// Upstream is the installation's fake Upstream, started only when a config
+// template uses it.
+func (v ConfigVars) Upstream() *Upstream { return v.in.Upstream() }
 
 // InstallPlugin copies bin into dir with the given mode and returns its path,
 // so a test can later replace it.
@@ -308,7 +325,7 @@ func (in *Installation) writeConfig(tmpl string) string {
 		Unhealthy: UnhealthyPlugin,
 		Crashing:  CrashingPlugin,
 		Malformed: MalformedPlugin,
-		Upstream:  in.Upstream,
+		in:        in,
 	}
 	if err := parsed.Execute(&buf, vars); err != nil {
 		in.t.Fatalf("render config template: %v", err)
