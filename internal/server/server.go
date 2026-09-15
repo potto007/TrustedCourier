@@ -80,7 +80,7 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
 	if agentLn != nil {
 		serving++
-		agent := agentapi.NewServer(svc, resolver.New(cfg, plugins), log)
+		agent := agentapi.NewServer(svc, resolver.New(cfg, plugins), cfg, log)
 		go func() { errc <- agent.Serve(serveCtx, agentLn) }()
 		log.Info("Agent API listening", "address", agentLn.Addr().String())
 	}

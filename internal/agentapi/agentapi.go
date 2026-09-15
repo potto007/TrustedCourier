@@ -1,5 +1,5 @@
 // Package agentapi is the Agent API: the HTTP API Agents call with an Agent
-// Token. It serves Reveal Delivery.
+// Token. It serves Reveal Delivery and Proxy Delivery.
 package agentapi
 
 import (
@@ -50,20 +50,29 @@ type Server struct {
 	access  *access.Service
 	secrets *resolver.Resolver
 	log     *slog.Logger
+	routes  map[routeKey]*route
+	slots   map[string][]config.HeaderTemplate
 }
 
-// NewServer returns an Agent API server that authenticates Agents with svc
-// and fetches Secrets through secrets.
-func NewServer(svc *access.Service, secrets *resolver.Resolver, log *slog.Logger) *Server {
-	return &Server{access: svc, secrets: secrets, log: log}
+// NewServer returns an Agent API server that authenticates Agents with svc,
+// fetches Secrets through secrets, and proxies to the Upstreams in cfg.
+func NewServer(svc *access.Service, secrets *resolver.Resolver, cfg *config.Config, log *slog.Logger) *Server {
+	return &Server{access: svc, secrets: secrets, log: log, routes: newRoutes(cfg), slots: newSlots(cfg)}
 }
 
 // Serve serves the Agent API on ln until ctx is done.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/reveal/{secret_name}", s.reveal)
+	mux.HandleFunc("/proxy/{secret_name}/{upstream}", s.proxy)
+	mux.HandleFunc("/proxy/{secret_name}/{upstream}/{rest...}", s.proxy)
 
+	// The listener is loopback plain HTTP, so HTTP/2 is by prior knowledge.
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
 	srv := &http.Server{
+		Protocols:         protocols,
 		Handler:           noStore(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		// A client that stops reading must not pin a Secret's locked memory.
@@ -105,15 +114,8 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	value, err := s.secrets.Resolve(r.Context(), name)
-	switch {
-	case errors.Is(err, secret.ErrLockedMemory):
-		log.Error("Delivery failed: no locked memory to hold the Secret; raise RLIMIT_MEMLOCK", "error", err)
-		writeError(w, http.StatusServiceUnavailable, "the Secret cannot be held safely right now; try again later")
-		return
-	case err != nil:
-		log.Error("Delivery failed: Secret not fetched", "error", err)
-		writeError(w, http.StatusBadGateway, "the Secret could not be fetched")
+	value, ok := s.resolve(w, r, log, name)
+	if !ok {
 		return
 	}
 	defer value.Release()
@@ -125,6 +127,23 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Info("Delivery allowed")
+}
+
+// resolve fetches the Secret for name. Otherwise it writes the error and
+// reports false. The caller must Release the Secret.
+func (s *Server) resolve(w http.ResponseWriter, r *http.Request, log *slog.Logger, name string) (*secret.Secret, bool) {
+	value, err := s.secrets.Resolve(r.Context(), name)
+	switch {
+	case errors.Is(err, secret.ErrLockedMemory):
+		log.Error("Delivery failed: no locked memory to hold the Secret; raise RLIMIT_MEMLOCK", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "the Secret cannot be held safely right now; try again later")
+		return nil, false
+	case err != nil:
+		log.Error("Delivery failed: Secret not fetched", "error", err)
+		writeError(w, http.StatusBadGateway, "the Secret could not be fetched")
+		return nil, false
+	}
+	return value, true
 }
 
 // authenticate returns the Agent Token presented in the Authorization header
@@ -141,6 +160,12 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (access.Ag
 		presented = append(presented, token)
 	}
 	presented = append(presented, r.Header.Values(AgentTokenHeader)...)
+	return s.verifyAgentToken(w, r, presented)
+}
+
+// verifyAgentToken authenticates the one Agent Token in presented. Otherwise
+// it writes a 401, or a 500 when the check itself failed, and reports false.
+func (s *Server) verifyAgentToken(w http.ResponseWriter, r *http.Request, presented []string) (access.AgentToken, bool) {
 	switch len(presented) {
 	case 0:
 		unauthorized(w, "Agent Token required")

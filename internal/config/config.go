@@ -4,11 +4,14 @@ package config
 
 import (
 	"bytes"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,6 +58,41 @@ type SecretName struct {
 	Backend string
 	// Location is the Secret's location in that Backend.
 	Location string
+	// InjectionTemplate says where Proxy Delivery puts the Secret. Nil
+	// exactly when Upstreams is empty.
+	InjectionTemplate *InjectionTemplate
+	// Upstreams are the Upstreams the Secret is pinned to, by name.
+	Upstreams map[string]Upstream
+}
+
+// InjectionTemplate is where Proxy Delivery puts a Secret in a request, and
+// so where it finds the Agent Token.
+type InjectionTemplate struct {
+	// Header is the header the Secret goes in.
+	Header HeaderTemplate
+}
+
+// HeaderTemplate puts the Secret in a header as Prefix, the Secret, Suffix.
+type HeaderTemplate struct {
+	// Name is the canonical header name.
+	Name   string
+	Prefix string
+	Suffix string
+}
+
+// SecretPlaceholder marks where the Secret goes in a header template.
+const SecretPlaceholder = "{secret}"
+
+// Upstream is one Upstream a Secret Name is pinned to.
+type Upstream struct {
+	Name string
+	// Scheme and Host of the Upstream; Scheme is always https.
+	Scheme, Host string
+	// BasePath is the escaped path requests are forwarded under, without a
+	// trailing slash. Empty for the root.
+	BasePath string
+	// RootCAs verify the Upstream's certificate. Nil means the system roots.
+	RootCAs *x509.CertPool
 }
 
 // BackendPlugin is a Backend Plugin binary the Operator approved (ADR-0004).
@@ -115,8 +153,24 @@ type fileAgentAPI struct {
 }
 
 type fileSecretName struct {
-	Backend  string `yaml:"backend"`
-	Location string `yaml:"location"`
+	Backend           string                  `yaml:"backend"`
+	Location          string                  `yaml:"location"`
+	InjectionTemplate *fileInjectionTemplate  `yaml:"injection_template"`
+	Upstreams         map[string]fileUpstream `yaml:"upstreams"`
+}
+
+type fileInjectionTemplate struct {
+	Header *fileHeaderTemplate `yaml:"header"`
+}
+
+type fileHeaderTemplate struct {
+	Name  string `yaml:"name"`
+	Value string `yaml:"value"`
+}
+
+type fileUpstream struct {
+	URL      string `yaml:"url"`
+	CABundle string `yaml:"ca_bundle"`
 }
 
 type fileBackendPlugin struct {
@@ -211,18 +265,23 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 		cfg.BackendPlugins[name] = plugin
 	}
 	for _, name := range slices.Sorted(maps.Keys(raw.Secrets)) {
-		s, err := raw.Secrets[name].validate(name, cfg.BackendPlugins)
+		s, err := raw.Secrets[name].validate(name, baseDir, cfg.BackendPlugins)
 		if err != nil {
 			return nil, err
 		}
 		cfg.Secrets[name] = s
 	}
-	// A Policy entry naming an undefined Secret Name is a typo or a
-	// half-finished change; refuse it rather than deny Agents at runtime.
+	// A Policy entry naming an undefined Secret Name, or allowing a Proxy
+	// Delivery that has nowhere to go, is a typo or a half-finished change;
+	// refuse it rather than deny Agents at runtime.
 	for _, name := range slices.Sorted(maps.Keys(cfg.Policies)) {
 		for _, a := range cfg.Policies[name].Secrets {
-			if _, ok := cfg.Secrets[a.SecretName]; !ok {
+			s, ok := cfg.Secrets[a.SecretName]
+			if !ok {
 				return nil, fmt.Errorf("Policy %q names Secret Name %q, which is not defined under secrets", name, a.SecretName)
+			}
+			if slices.Contains(a.Delivery, DeliveryProxy) && len(s.Upstreams) == 0 {
+				return nil, fmt.Errorf("Policy %q allows Proxy Delivery of Secret Name %q, which has no upstreams", name, a.SecretName)
 			}
 		}
 	}
@@ -248,7 +307,7 @@ func checkLoopback(listen string) error {
 	return nil
 }
 
-func (s fileSecretName) validate(name string, plugins map[string]BackendPlugin) (SecretName, error) {
+func (s fileSecretName) validate(name, baseDir string, plugins map[string]BackendPlugin) (SecretName, error) {
 	if !namePattern.MatchString(name) {
 		return SecretName{}, fmt.Errorf("invalid Secret Name %q: use up to 64 letters, digits, '.', '_' or '-', starting with a letter or digit", name)
 	}
@@ -264,7 +323,106 @@ func (s fileSecretName) validate(name string, plugins map[string]BackendPlugin) 
 	if _, ok := plugins[s.Backend]; !ok {
 		return SecretName{}, fmt.Errorf("Secret Name %q: unknown backend %q; name one of backend_plugins", name, s.Backend)
 	}
-	return SecretName{Name: name, Backend: s.Backend, Location: s.Location}, nil
+	out := SecretName{Name: name, Backend: s.Backend, Location: s.Location}
+
+	switch {
+	case s.InjectionTemplate == nil && len(s.Upstreams) == 0:
+		return out, nil
+	case s.InjectionTemplate == nil:
+		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template is required with upstreams", name)
+	case len(s.Upstreams) == 0:
+		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template needs upstreams to deliver to", name)
+	}
+	tmpl, err := s.InjectionTemplate.validate()
+	if err != nil {
+		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template: %w", name, err)
+	}
+	out.InjectionTemplate = &tmpl
+	out.Upstreams = make(map[string]Upstream, len(s.Upstreams))
+	for _, upName := range slices.Sorted(maps.Keys(s.Upstreams)) {
+		up, err := s.Upstreams[upName].validate(upName, baseDir)
+		if err != nil {
+			return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
+		}
+		out.Upstreams[upName] = up
+	}
+	return out, nil
+}
+
+// headerNamePattern is an HTTP field name token (RFC 9110).
+var headerNamePattern = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+// reservedHeaders cannot carry a Secret: they are hop-by-hop, which the
+// forwarding strips, framing the transport sets itself, or the fallback
+// Agent Token header, which Proxy Delivery removes.
+var reservedHeaders = []string{
+	"Connection", "Content-Length", "Host", "Keep-Alive", "Proxy-Authenticate",
+	"Proxy-Authorization", "Proxy-Connection", "Te", "Trailer",
+	"Transfer-Encoding", "Upgrade", "X-Tc-Agent-Token",
+}
+
+func (t fileInjectionTemplate) validate() (InjectionTemplate, error) {
+	if t.Header == nil {
+		return InjectionTemplate{}, errors.New("set header")
+	}
+	h := t.Header
+	if !headerNamePattern.MatchString(h.Name) {
+		return InjectionTemplate{}, fmt.Errorf("invalid header name %q", h.Name)
+	}
+	name := http.CanonicalHeaderKey(h.Name)
+	if slices.Contains(reservedHeaders, name) {
+		return InjectionTemplate{}, fmt.Errorf("header %q is reserved and cannot carry a Secret", h.Name)
+	}
+	if strings.Count(h.Value, SecretPlaceholder) != 1 {
+		return InjectionTemplate{}, fmt.Errorf("header value must contain %s exactly once", SecretPlaceholder)
+	}
+	if strings.ContainsFunc(h.Value, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return InjectionTemplate{}, errors.New("header value contains a control character")
+	}
+	prefix, suffix, _ := strings.Cut(h.Value, SecretPlaceholder)
+	return InjectionTemplate{Header: HeaderTemplate{Name: name, Prefix: prefix, Suffix: suffix}}, nil
+}
+
+func (u fileUpstream) validate(name, baseDir string) (Upstream, error) {
+	if !namePattern.MatchString(name) {
+		return Upstream{}, fmt.Errorf("invalid Upstream name %q: use up to 64 letters, digits, '.', '_' or '-', starting with a letter or digit", name)
+	}
+	if u.URL == "" {
+		return Upstream{}, fmt.Errorf("Upstream %q: url is required", name)
+	}
+	parsed, err := url.Parse(u.URL)
+	switch {
+	case err != nil:
+		return Upstream{}, fmt.Errorf("Upstream %q: %w", name, err)
+	case parsed.Scheme != "https":
+		return Upstream{}, fmt.Errorf("Upstream %q: url must use https; Upstream TLS is always verified", name)
+	case parsed.User != nil:
+		return Upstream{}, fmt.Errorf("Upstream %q: url must not contain user information", name)
+	case parsed.Host == "" || parsed.Opaque != "":
+		return Upstream{}, fmt.Errorf("Upstream %q: url needs a host", name)
+	case parsed.RawQuery != "" || parsed.ForceQuery:
+		return Upstream{}, fmt.Errorf("Upstream %q: url must not contain a query", name)
+	case parsed.Fragment != "":
+		return Upstream{}, fmt.Errorf("Upstream %q: url must not contain a fragment", name)
+	}
+	out := Upstream{
+		Name:     name,
+		Scheme:   parsed.Scheme,
+		Host:     parsed.Host,
+		BasePath: strings.TrimRight(parsed.EscapedPath(), "/"),
+	}
+	if u.CABundle != "" {
+		path := resolve(baseDir, u.CABundle)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return Upstream{}, fmt.Errorf("Upstream %q: ca_bundle: %w", name, err)
+		}
+		out.RootCAs = x509.NewCertPool()
+		if !out.RootCAs.AppendCertsFromPEM(data) {
+			return Upstream{}, fmt.Errorf("Upstream %q: ca_bundle %s holds no certificates", name, path)
+		}
+	}
+	return out, nil
 }
 
 var sha256Pattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
