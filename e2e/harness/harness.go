@@ -367,6 +367,13 @@ func (in *Installation) writeConfig(tmpl string) string {
 	return path
 }
 
+// RewriteConfig replaces the running server's config file with the rendered
+// configTemplate, for a later reload.
+func (s *Server) RewriteConfig(configTemplate string) {
+	s.in.t.Helper()
+	s.in.writeConfig(configTemplate)
+}
+
 // Server is a TrustedCourier process.
 type Server struct {
 	in        *Installation

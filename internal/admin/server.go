@@ -95,17 +95,17 @@ type Server struct {
 	access  *access.Service
 	plugins *pluginhost.Host
 	audit   *audit.Log
-	cfg     *config.Config
+	cfg     *config.Running
 	// agentURL is the Agent API's base URL, or empty when it is not served.
 	agentURL string
 	log      *slog.Logger
 }
 
-// NewServer returns an admin API server for cfg that admits connections from
-// cfg's allowed UIDs presenting the Operator Credential. agentURL is the Agent
-// API's base URL, such as http://127.0.0.1:8200, or empty when it is not
-// served.
-func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, cfg *config.Config, agentURL string, log *slog.Logger) *Server {
+// NewServer returns an admin API server for the running config that admits
+// connections from its allowed UIDs presenting the Operator Credential.
+// agentURL is the Agent API's base URL, such as http://127.0.0.1:8200, or
+// empty when it is not served.
+func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, cfg *config.Running, agentURL string, log *slog.Logger) *Server {
 	return &Server{access: svc, plugins: plugins, audit: auditLog, cfg: cfg, agentURL: agentURL, log: log}
 }
 
@@ -118,6 +118,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	mux.HandleFunc("GET /v1/status", s.status)
 	mux.HandleFunc("POST /v1/audit/verify", s.verifyAudit)
 	mux.HandleFunc("GET /v1/secret-names/{name}/env", s.secretNameEnv)
+	mux.HandleFunc("POST /v1/config/reload", s.reloadConfig)
 
 	srv := &http.Server{
 		Handler:           s.requirePeer(s.requireOperator(mux)),
@@ -154,7 +155,7 @@ func (s *Server) requirePeer(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "admin socket: connecting user is not allowed")
 			return
 		}
-		if !slices.Contains(s.cfg.Admin.AllowedUIDs, p.uid) {
+		if !slices.Contains(s.cfg.Snapshot().Admin.AllowedUIDs, p.uid) {
 			s.log.Warn("admin connection refused: local user not allowed", "uid", p.uid)
 			writeError(w, http.StatusForbidden, "admin socket: connecting user is not allowed")
 			return
@@ -266,7 +267,7 @@ func (s *Server) verifyAudit(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	sn, ok := s.cfg.Secrets[name]
+	sn, ok := s.cfg.Snapshot().Secrets[name]
 	switch {
 	case !ok:
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Secret Name %q is not defined", name))
@@ -306,6 +307,17 @@ func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 		out.Env = append(out.Env, EnvVar{Name: v.Name, Value: value})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) reloadConfig(w http.ResponseWriter, _ *http.Request) {
+	cfg, err := s.cfg.Reload()
+	if err != nil {
+		s.log.Warn("config reload refused; the running config stays in effect", "error", err)
+		writeError(w, http.StatusBadRequest, "config not reloaded, the running config stays in effect: "+err.Error())
+		return
+	}
+	s.log.Info("config reloaded", "path", cfg.Path, "policies", len(cfg.Policies), "secret_names", len(cfg.Secrets))
+	writeJSON(w, http.StatusOK, ConfigReload{Path: cfg.Path, Policies: len(cfg.Policies), SecretNames: len(cfg.Secrets)})
 }
 
 func toAPI(t access.AgentToken, now time.Time) AgentToken {

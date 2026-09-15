@@ -63,7 +63,8 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		defer func() { _ = agentLn.Close() }()
 	}
 
-	svc := access.New(db, cfg)
+	running := config.NewRunning(cfg)
+	svc := access.New(db, running)
 	if err := svc.EnsureOperatorCredential(ctx, func(credential string) error {
 		_, err := fmt.Fprintf(stdout, "Operator Credential (shown once; store it now, it cannot be shown again):\n%s\n", credential)
 		return err
@@ -83,7 +84,7 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	// The Agent API refuses Deliveries until the audit signing key is loaded,
 	// and while Audit Records cannot be stored. Once both APIs have drained,
 	// the last records are stored and signed before the database closes.
-	secrets := resolver.New(cfg, plugins)
+	secrets := resolver.New(plugins)
 	if key := cfg.Audit.SigningKey; key != nil {
 		auditLog.Start(func(ctx context.Context) (*secret.Secret, error) { return secrets.CourierKey(ctx, *key) })
 	}
@@ -103,12 +104,12 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		agentURL = "http://" + agentLn.Addr().String()
 	}
 	go func() {
-		errc <- admin.NewServer(svc, plugins, auditLog, cfg, agentURL, log).Serve(serveCtx, ln)
+		errc <- admin.NewServer(svc, plugins, auditLog, running, agentURL, log).Serve(serveCtx, ln)
 	}()
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
 	if agentLn != nil {
 		serving++
-		agent := agentapi.NewServer(svc, secrets, auditLog, cfg, log)
+		agent := agentapi.NewServer(svc, secrets, auditLog, running, log)
 		go func() { errc <- agent.Serve(serveCtx, agentLn) }()
 		log.Info("Agent API listening", "address", agentLn.Addr().String())
 	}

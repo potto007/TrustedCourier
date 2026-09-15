@@ -31,12 +31,13 @@ var encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 // Service is the Access module.
 type Service struct {
 	db  *sql.DB
-	cfg *config.Config
+	cfg *config.Running
 	now func() time.Time
 }
 
-// New returns a Service over db that checks Policy names against cfg.
-func New(db *sql.DB, cfg *config.Config) *Service {
+// New returns a Service over db that checks Policy names against the running
+// config.
+func New(db *sql.DB, cfg *config.Running) *Service {
 	return &Service{db: db, cfg: cfg, now: time.Now}
 }
 
@@ -115,8 +116,9 @@ func (s *Service) IssueAgentToken(ctx context.Context, policies []string, expire
 		return IssuedAgentToken{}, invalid("at least one Policy is required")
 	}
 	var names []string
+	cfg := s.cfg.Snapshot()
 	for _, name := range policies {
-		if _, ok := s.cfg.Policies[name]; !ok {
+		if _, ok := cfg.Policies[name]; !ok {
 			return IssuedAgentToken{}, invalid("unknown Policy %q", name)
 		}
 		if !slices.Contains(names, name) {
@@ -281,16 +283,16 @@ const (
 	DenialPath              Denial = "no Policy allows the path"
 )
 
-// Authorize reports whether tok's Policies allow Delivery of secretName in
-// mode, and if not, why. A Policy must name the Delivery mode explicitly;
-// allowing proxy never allows reveal.
-func (s *Service) Authorize(tok AgentToken, secretName string, mode config.DeliveryMode) (Denial, bool) {
-	if _, ok := s.cfg.Secrets[secretName]; !ok {
+// Authorize reports whether tok's Policies in the config snapshot cfg allow
+// Delivery of secretName in mode, and if not, why. A Policy must name the
+// Delivery mode explicitly; allowing proxy never allows reveal.
+func Authorize(cfg *config.Config, tok AgentToken, secretName string, mode config.DeliveryMode) (Denial, bool) {
+	if _, ok := cfg.Secrets[secretName]; !ok {
 		return DenialUnknownSecretName, false
 	}
 	for _, name := range tok.Policies {
 		// A Policy removed from the config since issuance allows nothing.
-		for _, a := range s.cfg.Policies[name].Secrets {
+		for _, a := range cfg.Policies[name].Secrets {
 			if a.SecretName == secretName && slices.Contains(a.Delivery, mode) {
 				return "", true
 			}
@@ -299,17 +301,18 @@ func (s *Service) Authorize(tok AgentToken, secretName string, mode config.Deliv
 	return DenialPolicy, false
 }
 
-// AuthorizeProxy reports whether tok's Policies allow Proxy Delivery of
-// secretName for a request with method to escapedPath, the escaped path after
-// the Upstream name, and if not, why. One Policy entry must allow both the
-// method and the path; an entry without limits allows any of either.
-func (s *Service) AuthorizeProxy(tok AgentToken, secretName, method, escapedPath string) (Denial, bool) {
-	if _, ok := s.cfg.Secrets[secretName]; !ok {
+// AuthorizeProxy reports whether tok's Policies in the config snapshot cfg
+// allow Proxy Delivery of secretName for a request with method to
+// escapedPath, the escaped path after the Upstream name, and if not, why. One
+// Policy entry must allow both the method and the path; an entry without
+// limits allows any of either.
+func AuthorizeProxy(cfg *config.Config, tok AgentToken, secretName, method, escapedPath string) (Denial, bool) {
+	if _, ok := cfg.Secrets[secretName]; !ok {
 		return DenialUnknownSecretName, false
 	}
 	denial := DenialPolicy
 	for _, name := range tok.Policies {
-		for _, a := range s.cfg.Policies[name].Secrets {
+		for _, a := range cfg.Policies[name].Secrets {
 			if a.SecretName != secretName || !slices.Contains(a.Delivery, config.DeliveryProxy) {
 				continue
 			}

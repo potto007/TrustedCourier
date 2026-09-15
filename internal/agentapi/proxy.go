@@ -38,19 +38,44 @@ type route struct {
 type routeKey struct{ secretName, upstream string }
 
 // newRoutes builds a route for every Upstream of every Secret Name, each with
-// its own transport so an Upstream's CA bundle verifies only that Upstream.
-func newRoutes(cfg *config.Config) map[routeKey]*route {
+// its own transport so an Upstream's CA bundle verifies only that Upstream. A
+// route whose Upstream is unchanged from the same route in old keeps its
+// transport, and so its open connections, across a reload.
+func newRoutes(cfg *config.Config, old map[routeKey]*route) map[routeKey]*route {
 	routes := make(map[routeKey]*route)
 	for name, s := range cfg.Secrets {
 		for upName, up := range s.Upstreams {
-			routes[routeKey{name, upName}] = &route{
-				template:  *s.InjectionTemplate,
-				upstream:  up,
-				transport: newTransport(up),
+			key := routeKey{name, upName}
+			rt := &route{template: *s.InjectionTemplate, upstream: up}
+			if prev := old[key]; prev != nil && sameTransport(prev.upstream, up) {
+				rt.transport = prev.transport
+			} else {
+				rt.transport = newTransport(up)
 			}
+			routes[key] = rt
 		}
 	}
 	return routes
+}
+
+// sameTransport reports whether a and b can share a transport: same host and
+// the same roots verifying it.
+func sameTransport(a, b config.Upstream) bool {
+	return a.Scheme == b.Scheme && a.Host == b.Host && a.RootCAs.Equal(b.RootCAs)
+}
+
+// closeUnused closes the idle connections of every transport in old that
+// routes no longer use. Deliveries still using one finish undisturbed.
+func closeUnused(old, routes map[routeKey]*route) {
+	kept := make(map[http.RoundTripper]bool, len(routes))
+	for _, rt := range routes {
+		kept[rt.transport] = true
+	}
+	for _, rt := range old {
+		if t, ok := rt.transport.(*http.Transport); ok && !kept[t] {
+			t.CloseIdleConnections()
+		}
+	}
 }
 
 func newTransport(up config.Upstream) *http.Transport {
@@ -102,13 +127,14 @@ func newSlots(cfg *config.Config) slots {
 }
 
 func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
-	tok, from, ok := s.authenticateProxy(w, r)
+	snap := s.currentSnapshot()
+	tok, from, ok := s.authenticateProxy(w, r, snap.slots)
 	if !ok {
 		return
 	}
 	name, upName := r.PathValue("secret_name"), r.PathValue("upstream")
 	log := s.log.With("delivery", config.DeliveryProxy, "agent_token_id", tok.ID, "secret_name", name, "upstream", upName)
-	rt := s.routes[routeKey{name, upName}]
+	rt := snap.routes[routeKey{name, upName}]
 	rec := &audit.Record{AgentTokenID: tok.ID, SecretName: name, Delivery: config.DeliveryProxy, Upstream: upName}
 	if rt != nil {
 		rec.UpstreamHost = rt.upstream.Host
@@ -139,7 +165,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reason, allowed := s.access.AuthorizeProxy(tok, name, r.Method, rest)
+	reason, allowed := access.AuthorizeProxy(snap.cfg, tok, name, r.Method, rest)
 	if allowed && rt == nil {
 		reason, allowed = "unknown Upstream", false
 	}
@@ -150,7 +176,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.Decision = audit.Allowed
 
-	value, ok := s.resolve(w, r, log, rec, name)
+	value, ok := s.resolve(w, r, log, rec, snap.cfg, name)
 	if !ok {
 		return
 	}
@@ -653,7 +679,7 @@ func (w headerValueWriter) Write(p []byte) (int, error) {
 	return w.b.Write(p)
 }
 
-// authenticateProxy finds the Agent Token in a credential slot or in
+// authenticateProxy finds the Agent Token in one of slots or in
 // AgentTokenHeader and authenticates it, returning the header it came from.
 //
 // Every slot any header Injection Template defines is read on every route, so
@@ -661,12 +687,12 @@ func (w headerValueWriter) Write(p []byte) (int, error) {
 // which Secret Names exist from which slots were read. A slot counts only when
 // it holds something shaped like an Agent Token, so an SDK's placeholder API
 // key next to AgentTokenHeader is not a second token.
-func (s *Server) authenticateProxy(w http.ResponseWriter, r *http.Request) (access.AgentToken, slot, bool) {
+func (s *Server) authenticateProxy(w http.ResponseWriter, r *http.Request, slots slots) (access.AgentToken, slot, bool) {
 	var presented []string
 	var from []slot
-	for _, name := range slices.Sorted(maps.Keys(s.slots.headers)) {
+	for _, name := range slices.Sorted(maps.Keys(slots.headers)) {
 		for _, v := range r.Header.Values(name) {
-			for _, t := range s.slots.headers[name] {
+			for _, t := range slots.headers[name] {
 				if tok, ok := extract(v, t); ok && strings.HasPrefix(tok, access.AgentTokenPrefix) {
 					presented, from = append(presented, tok), append(from, slot{header: name})
 					break
@@ -675,16 +701,16 @@ func (s *Server) authenticateProxy(w http.ResponseWriter, r *http.Request) (acce
 		}
 	}
 	for _, v := range r.Header.Values("Authorization") {
-		for _, t := range s.slots.basicAuth {
+		for _, t := range slots.basicAuth {
 			if tok, ok := extractBasicAuth(v, t); ok && strings.HasPrefix(tok, access.AgentTokenPrefix) {
 				presented, from = append(presented, tok), append(from, slot{header: "Authorization"})
 				break
 			}
 		}
 	}
-	if len(s.slots.queries) > 0 {
+	if len(slots.queries) > 0 {
 		query := r.URL.Query()
-		for _, name := range s.slots.queries {
+		for _, name := range slots.queries {
 			for _, v := range query[name] {
 				if strings.HasPrefix(v, access.AgentTokenPrefix) {
 					presented, from = append(presented, v), append(from, slot{query: name})
