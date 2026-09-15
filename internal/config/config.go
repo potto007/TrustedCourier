@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/potto007/TrustedCourier/sdk/plugin/client"
 	"go.yaml.in/yaml/v3"
@@ -41,6 +42,35 @@ type Config struct {
 	BackendPlugins map[string]BackendPlugin
 	// Secrets are the Secret Names Agents may ask for, by name.
 	Secrets map[string]SecretName
+	// Audit configures how the audit chain is signed.
+	Audit Audit
+}
+
+// Checkpoint cadences used when the config sets none.
+const (
+	DefaultCheckpointRecords  = 1000
+	DefaultCheckpointInterval = time.Minute
+)
+
+// Audit configures the audit chain's signed checkpoints (ADR-0007).
+type Audit struct {
+	// SigningKey is where the audit signing key lives. Nil when the config
+	// names none, which it must when the Agent API is served.
+	SigningKey *CourierKey
+	// CheckpointRecords is how many Audit Records may follow the last
+	// checkpoint before the next is signed.
+	CheckpointRecords int
+	// CheckpointInterval is how long a record may go unsigned before a
+	// checkpoint covers it.
+	CheckpointInterval time.Duration
+}
+
+// CourierKey is where a Courier Key lives in a Backend.
+type CourierKey struct {
+	// Backend names the entry in BackendPlugins that holds the key.
+	Backend string
+	// Location is the key's location in that Backend.
+	Location string
 }
 
 // AgentAPI configures the Agent API listener.
@@ -186,6 +216,24 @@ type fileConfig struct {
 	Policies       map[string]filePolicy        `yaml:"policies"`
 	BackendPlugins map[string]fileBackendPlugin `yaml:"backend_plugins"`
 	Secrets        map[string]fileSecretName    `yaml:"secrets"`
+	Audit          fileAudit                    `yaml:"audit"`
+}
+
+type fileAudit struct {
+	SigningKey  *fileCourierKey `yaml:"signing_key"`
+	Checkpoints fileCheckpoints `yaml:"checkpoints"`
+}
+
+type fileCourierKey struct {
+	Backend  string `yaml:"backend"`
+	Location string `yaml:"location"`
+}
+
+type fileCheckpoints struct {
+	// Records is kept as a node, so a key left without a value is told apart
+	// from an omitted one (Kind 0).
+	Records  yaml.Node `yaml:"records"`
+	Interval string    `yaml:"interval"`
 }
 
 type fileAgentAPI struct {
@@ -347,7 +395,69 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 		}
 		cfg.AgentAPI.Listen = raw.AgentAPI.Listen
 	}
+	if err := raw.Audit.validate(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// validate sets cfg.Audit. It needs cfg's Backend Plugins, Secret Names, and
+// Agent API already validated.
+func (a fileAudit) validate(cfg *Config) error {
+	if a.SigningKey == nil {
+		if cfg.AgentAPI.Listen != "" {
+			return errors.New("audit.signing_key is required with agent_api.listen: every Delivery attempt is audited, and TrustedCourier signs the audit chain with that Courier Key")
+		}
+	} else {
+		key, err := a.SigningKey.validate(cfg.BackendPlugins)
+		if err != nil {
+			return fmt.Errorf("audit.signing_key: %w", err)
+		}
+		// A Courier Key is never delivered to Agents.
+		for _, name := range slices.Sorted(maps.Keys(cfg.Secrets)) {
+			if s := cfg.Secrets[name]; s.Backend == key.Backend && s.Location == key.Location {
+				return fmt.Errorf("Secret Name %q maps to the audit signing key's location; a Courier Key is never delivered to Agents", name)
+			}
+		}
+		cfg.Audit.SigningKey = &key
+	}
+
+	cfg.Audit.CheckpointRecords = DefaultCheckpointRecords
+	if n := a.Checkpoints.Records; n.Kind != 0 {
+		var records int
+		if n.ShortTag() == "!!null" || n.Decode(&records) != nil || records < 1 {
+			return fmt.Errorf("audit.checkpoints.records must be at least 1; omit it for the default of %d", DefaultCheckpointRecords)
+		}
+		cfg.Audit.CheckpointRecords = records
+	}
+	cfg.Audit.CheckpointInterval = DefaultCheckpointInterval
+	if a.Checkpoints.Interval != "" {
+		d, err := time.ParseDuration(a.Checkpoints.Interval)
+		switch {
+		case err != nil:
+			return fmt.Errorf("audit.checkpoints.interval %q is not a duration such as 1m", a.Checkpoints.Interval)
+		case d < time.Second:
+			return fmt.Errorf("audit.checkpoints.interval %q must be at least 1s", a.Checkpoints.Interval)
+		}
+		cfg.Audit.CheckpointInterval = d
+	}
+	return nil
+}
+
+func (k fileCourierKey) validate(plugins map[string]BackendPlugin) (CourierKey, error) {
+	switch {
+	case k.Backend == "":
+		return CourierKey{}, errors.New("backend is required")
+	case k.Location == "":
+		return CourierKey{}, errors.New("location is required")
+	}
+	if err := client.ValidateLocation(k.Location); err != nil {
+		return CourierKey{}, err
+	}
+	if _, ok := plugins[k.Backend]; !ok {
+		return CourierKey{}, fmt.Errorf("unknown backend %q; name one of backend_plugins", k.Backend)
+	}
+	return CourierKey{Backend: k.Backend, Location: k.Location}, nil
 }
 
 // checkLoopback accepts only a loopback IP address and port: the Agent API

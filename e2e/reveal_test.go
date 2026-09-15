@@ -15,11 +15,20 @@ import (
 // revealConfig serves the Agent API on loopback over BaseConfig, whose
 // github-reveal Policy allows Reveal Delivery of github and whose
 // openai-proxy Policy allows only Proxy Delivery of openai. It adds the Secret
-// Name unlisted, which no Policy lists.
+// Name unlisted, which no Policy lists. It ends with auditConfig.
 var revealConfig = strings.Replace(harness.BaseConfig, "\nsecrets:\n",
 	"\nsecrets:\n  unlisted:\n    backend: fake\n    location: kv/openai\n", 1) + `
 agent_api:
   listen: 127.0.0.1:0
+` + auditConfig
+
+// auditConfig signs the audit chain with the fake Backend Plugin's audit
+// signing key. It ends inside audit, so a test can append checkpoints.
+const auditConfig = `
+audit:
+  signing_key:
+    backend: fake
+    location: ` + harness.AuditSigningKeyLocation + `
 `
 
 // fakePluginConfig declares only the fake Backend Plugin, for configs built
@@ -119,7 +128,7 @@ func TestBackendFailureHidesTheBackendFromTheAgent(t *testing.T) {
 	srv := tc.Start(strings.Replace(revealConfig, "{{.Fake.Path}}", path, 1))
 	waitForPlugin(t, srv, "fake", running)
 	token := "Bearer " + issueAgentToken(t, srv, "github-reveal", "1h").Token
-	tc.SetBackendSecrets(path, map[string]string{"kv/openai": "test-value-1"})
+	tc.SetBackendSecrets(path, map[string]string{"kv/openai": "test-value-1", harness.AuditSigningKeyLocation: harness.AuditSigningKey})
 
 	got := reveal(t, srv, token, "github")
 	if got.Status != http.StatusBadGateway {

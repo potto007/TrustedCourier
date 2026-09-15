@@ -18,7 +18,11 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -60,6 +64,20 @@ var Secrets = map[string]string{
 	"kv/github": "test-value-2",
 	// Non-ASCII, with a multi-byte character across its midpoint.
 	"kv/üabc": "test-value-3",
+	// The audit signing key the e2e harness configures.
+	"courier/audit-signing-key": auditSigningKey(),
+}
+
+// auditSigningKey is a test-only Ed25519 key as PKCS #8 PEM, derived from a
+// fixed seed so the e2e harness can derive the same key. The harness keeps a
+// copy of this derivation.
+func auditSigningKey() string {
+	seed := sha256.Sum256([]byte("TrustedCourier fake audit signing key"))
+	der, err := x509.MarshalPKCS8PrivateKey(ed25519.NewKeyFromSeed(seed[:]))
+	if err != nil {
+		panic(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 }
 
 type backend struct {

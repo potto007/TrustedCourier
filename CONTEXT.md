@@ -89,3 +89,7 @@ _Avoid_: Scrubbing, masking, filtering
 **Audit Record**:
 The tamper-evident record of one Delivery attempt, allowed or denied. Never contains a Secret's value or request or response bodies.
 _Avoid_: Log entry, event, access log
+
+**Signed checkpoint**:
+A signature by the audit signing key over the audit chain's head at one Audit Record, naming the checkpoint before it, so a rewritten chain is detectable from the database alone.
+_Avoid_: Seal, anchor, snapshot

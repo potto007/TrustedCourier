@@ -310,23 +310,37 @@ func status(args []string, stdout io.Writer) error {
 		return writeJSON(stdout, st)
 	}
 	if len(st.BackendPlugins) == 0 {
-		_, err := fmt.Fprintln(stdout, "No Backend Plugins configured.")
+		fmt.Fprintln(stdout, "No Backend Plugins configured.")
+	} else {
+		tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "BACKEND PLUGIN\tSTATE\tHEALTH\tCAPABILITIES\tRESTARTS\tDETAIL")
+		for _, p := range st.BackendPlugins {
+			health := "unhealthy"
+			if p.Healthy {
+				health = "healthy"
+			}
+			caps := strings.Join(p.Capabilities, ",")
+			if caps == "" {
+				caps = "-"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n", p.Name, p.State, health, caps, p.Restarts, p.Detail)
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+	}
+	key := st.AuditSigningKey
+	if key.Loaded {
+		_, err = fmt.Fprintln(stdout, "\nAudit signing key: loaded")
+	} else {
+		_, err = fmt.Fprintf(stdout, "\nAudit signing key: not loaded (%s)\n", key.Detail)
+	}
+	if err != nil || st.AuditRecords.Pending == 0 {
 		return err
 	}
-	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "BACKEND PLUGIN\tSTATE\tHEALTH\tCAPABILITIES\tRESTARTS\tDETAIL")
-	for _, p := range st.BackendPlugins {
-		health := "unhealthy"
-		if p.Healthy {
-			health = "healthy"
-		}
-		caps := strings.Join(p.Capabilities, ",")
-		if caps == "" {
-			caps = "-"
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n", p.Name, p.State, health, caps, p.Restarts, p.Detail)
-	}
-	return tw.Flush()
+	_, err = fmt.Fprintf(stdout, "Audit Records: %d waiting to be stored; Deliveries are refused (%s)\n",
+		st.AuditRecords.Pending, st.AuditRecords.Detail)
+	return err
 }
 
 // env prints the environment variables an Agent needs to use a Secret Name
@@ -396,7 +410,7 @@ func auditVerify(args []string, stdout io.Writer) error {
 	case *asJSON:
 		err = writeJSON(stdout, v)
 	case v.Break == nil:
-		_, err = fmt.Fprintf(stdout, "Audit chain intact: %s\n", auditRecords(v.Records))
+		_, err = fmt.Fprintf(stdout, "Audit chain intact: %s, %s\n", auditRecords(v.Records), plural(v.Checkpoints, "signed checkpoint"))
 	default:
 		_, err = fmt.Fprintf(stdout, "Audit chain broken at record %d: %s\n%s before it intact\n",
 			v.Break.Seq, v.Break.Problem, auditRecords(v.Records))
@@ -410,11 +424,13 @@ func auditVerify(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func auditRecords(n int64) string {
+func auditRecords(n int64) string { return plural(n, "Audit Record") }
+
+func plural(n int64, noun string) string {
 	if n == 1 {
-		return "1 Audit Record"
+		return "1 " + noun
 	}
-	return fmt.Sprintf("%d Audit Records", n)
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 func pluginSHA256(args []string, stdout io.Writer) error {
