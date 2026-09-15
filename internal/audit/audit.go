@@ -131,6 +131,19 @@ const (
 // ErrNoSigningKey reports that the audit signing key is not loaded.
 var ErrNoSigningKey = errors.New("the audit signing key is not loaded, so the signed checkpoints cannot be verified; tc status says why")
 
+// Why Ready refuses Deliveries.
+var (
+	ErrKeyNotLoaded = errors.New("the audit signing key is not loaded")
+	ErrNotStoring   = errors.New("Audit Records cannot be stored")
+)
+
+// pending is an Audit Record waiting to be stored, with the time it was
+// made.
+type pending struct {
+	r  Record
+	ms int64
+}
+
 // Log appends Audit Records and signs checkpoints. It is safe for concurrent
 // use.
 type Log struct {
@@ -151,11 +164,19 @@ type Log struct {
 	// key signs checkpoints. Nil until loaded; keyDetail says why.
 	key       *secret.Ed25519Key
 	keyDetail string
+	// backlog holds the records not yet stored, oldest first, and storeErr
+	// why the oldest could not be.
+	backlog  []pending
+	storeErr string
 
-	// ready is set once key is loaded.
-	ready atomic.Bool
-	stop  context.CancelFunc
-	wg    sync.WaitGroup
+	// keyLoaded is set once key is loaded, and backlogged while backlog is
+	// not empty, so Ready never waits on mu.
+	keyLoaded  atomic.Bool
+	backlogged atomic.Bool
+	// ctx ends when Close is called, stopping background work.
+	ctx  context.Context
+	stop context.CancelFunc
+	wg   sync.WaitGroup
 }
 
 // genesis is the previous hash of the first record.
@@ -166,6 +187,7 @@ var genesis = make([]byte, sha256.Size)
 // loaded the audit signing key.
 func Open(ctx context.Context, db *sql.DB, stream io.Writer, checkpoints Checkpoints, log *slog.Logger) (*Log, error) {
 	l := &Log{db: db, stream: stream, now: time.Now, checkpoints: checkpoints, log: log, head: genesis, keyDetail: "not configured"}
+	l.ctx, l.stop = context.WithCancel(context.Background())
 	err := db.QueryRowContext(ctx, "SELECT seq, hash FROM audit_records ORDER BY seq DESC LIMIT 1").Scan(&l.seq, &l.head)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("read the audit chain head: %w", err)
@@ -181,21 +203,36 @@ func Open(ctx context.Context, db *sql.DB, stream io.Writer, checkpoints Checkpo
 // until it succeeds or Close is called, then signs a checkpoint every
 // Interval while records are waiting for one. Call it at most once.
 func (l *Log) Start(fetch FetchKey) {
-	ctx, cancel := context.WithCancel(context.Background())
-	l.stop = cancel
 	l.mu.Lock()
 	l.keyDetail = "loading"
 	l.mu.Unlock()
 	l.wg.Go(func() {
-		if l.loadKey(ctx, fetch) {
-			l.signEveryInterval(ctx)
+		if l.loadKey(l.ctx, fetch) {
+			l.signEveryInterval(l.ctx)
 		}
 	})
 }
 
-// Ready reports whether the audit signing key is loaded. Deliveries are
-// refused until it is.
-func (l *Log) Ready() bool { return l.ready.Load() }
+// Ready returns nil when Deliveries may be served: the audit signing key is
+// loaded and every Audit Record so far is stored. Otherwise it returns
+// ErrKeyNotLoaded or ErrNotStoring.
+func (l *Log) Ready() error {
+	switch {
+	case !l.keyLoaded.Load():
+		return ErrKeyNotLoaded
+	case l.backlogged.Load():
+		return ErrNotStoring
+	}
+	return nil
+}
+
+// Backlog reports how many Audit Records are waiting to be stored, and why
+// the oldest could not be.
+func (l *Log) Backlog() (pending int, detail string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.backlog), l.storeErr
+}
 
 // KeyStatus reports whether the audit signing key is loaded, and why not when
 // it is not.
@@ -215,7 +252,7 @@ func (l *Log) loadKey(ctx context.Context, fetch FetchKey) bool {
 			l.mu.Lock()
 			l.key, l.keyDetail = key, ""
 			l.mu.Unlock()
-			l.ready.Store(true)
+			l.keyLoaded.Store(true)
 			l.log.Info("audit signing key loaded")
 			return true
 		}
@@ -264,24 +301,32 @@ func (l *Log) signEveryInterval(ctx context.Context) {
 	}
 }
 
-// Close stops loading the key and signing on an interval, signs a checkpoint
-// for any records still waiting for one, and releases the key. Call it once
-// nothing appends any more, before db closes.
+// Close stops background work, makes a last attempt to store any records
+// waiting to be, logging each that still cannot be, signs a checkpoint for
+// any records waiting for one, and releases the key. Call it once nothing
+// appends any more, before db closes.
 func (l *Log) Close() error {
-	if l.stop != nil {
-		l.stop()
-	}
+	l.stop()
 	l.wg.Wait()
-	l.ready.Store(false)
+	l.keyLoaded.Store(false)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	storeErr := l.flush(context.Background())
+	if len(l.backlog) > 0 {
+		// Records hold no Secret values, so the log is a safe last resort.
+		for _, p := range l.backlog {
+			line, _ := json.Marshal(newEntry(0, p.ms, p.r, nil))
+			l.log.Error("Audit Record lost at shutdown: it could not be stored", "record", string(line))
+		}
+		storeErr = fmt.Errorf("%d Audit Records lost at shutdown: %w", len(l.backlog), storeErr)
+	}
 	if l.key == nil {
-		return nil
+		return storeErr
 	}
 	err := l.checkpoint(context.Background())
 	l.key.Release()
 	l.key, l.keyDetail = nil, "released at shutdown"
-	return err
+	return errors.Join(storeErr, err)
 }
 
 // checkpoint signs and stores a checkpoint of the chain head when the key is
@@ -306,12 +351,83 @@ func (l *Log) checkpoint(ctx context.Context) error {
 
 // Append stores r as the next Audit Record, streams it, and signs a
 // checkpoint when Records records follow the last one.
+//
+// When r cannot be stored, it waits in memory with every later record, and
+// Ready refuses Deliveries until all of them are stored, in order, by a
+// background retry or a later Append.
 func (l *Log) Append(ctx context.Context, r Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.backlog = append(l.backlog, pending{r: r, ms: l.now().UnixMilli()})
+	return l.flush(ctx)
+}
 
-	now := l.now().UnixMilli()
-	e := newEntry(l.seq+1, now, r, l.head)
+// How long a retry of records that could not be stored waits.
+const (
+	minStoreRetry = 250 * time.Millisecond
+	maxStoreRetry = 5 * time.Second
+)
+
+// flush stores the backlog in order, stopping at the first record that
+// cannot be stored. l.mu must be held.
+func (l *Log) flush(ctx context.Context) error {
+	var errs []error
+	for len(l.backlog) > 0 {
+		err := l.store(ctx, l.backlog[0])
+		var stored *storedError
+		if err != nil && !errors.As(err, &stored) {
+			l.storeErr = err.Error()
+			if !l.backlogged.Swap(true) {
+				l.log.Error("Audit Records cannot be stored; Deliveries are refused until they are", "error", err)
+				if l.ctx.Err() == nil {
+					l.wg.Go(l.retryStore)
+				}
+			}
+			return errors.Join(append(errs, err)...)
+		}
+		l.backlog = l.backlog[1:]
+		errs = append(errs, err)
+	}
+	l.storeErr = ""
+	if l.backlogged.Swap(false) {
+		l.log.Info("Audit Records stored again; Deliveries resume")
+	}
+	return errors.Join(errs...)
+}
+
+// retryStore flushes the backlog with backoff until it is empty or Close is
+// called.
+func (l *Log) retryStore() {
+	retry := minStoreRetry
+	for {
+		select {
+		case <-l.ctx.Done():
+			return
+		case <-time.After(retry):
+		}
+		l.mu.Lock()
+		_ = l.flush(context.Background())
+		done := len(l.backlog) == 0
+		l.mu.Unlock()
+		if done {
+			return
+		}
+		retry = min(retry*2, maxStoreRetry)
+	}
+}
+
+// storedError is a failure after a record was stored, such as streaming it.
+type storedError struct{ err error }
+
+func (e *storedError) Error() string { return e.err.Error() }
+func (e *storedError) Unwrap() error { return e.err }
+
+// store stores p as the next record, streams it, and signs a checkpoint when
+// one is due. An error after the record is stored is a *storedError. l.mu
+// must be held.
+func (l *Log) store(ctx context.Context, p pending) error {
+	now := p.ms
+	e := newEntry(l.seq+1, now, p.r, l.head)
 	sum, err := e.hash()
 	if err != nil {
 		return err
@@ -331,19 +447,20 @@ func (l *Log) Append(ctx context.Context, r Record) error {
 	l.seq, l.head = e.Seq, sum
 
 	e.Hash = hex.EncodeToString(sum)
-	line, err := json.Marshal(e)
-	if err != nil {
-		return err
-	}
 	var streamErr, checkpointErr error
-	if _, err := l.stream.Write(append(line, '\n')); err != nil {
+	if line, err := json.Marshal(e); err != nil {
+		streamErr = fmt.Errorf("Audit Record %d stored but not streamed: %w", e.Seq, err)
+	} else if _, err := l.stream.Write(append(line, '\n')); err != nil {
 		streamErr = fmt.Errorf("Audit Record %d stored but not streamed: %w", e.Seq, err)
 	}
 	// A failed checkpoint is retried on the next append.
 	if l.seq-l.cpSeq >= int64(l.checkpoints.Records) {
 		checkpointErr = l.checkpoint(ctx)
 	}
-	return errors.Join(streamErr, checkpointErr)
+	if err := errors.Join(streamErr, checkpointErr); err != nil {
+		return &storedError{err}
+	}
+	return nil
 }
 
 func newEntry(seq, ms int64, r Record, prevHash []byte) entry {

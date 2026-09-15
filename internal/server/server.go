@@ -80,16 +80,16 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	}()
 	plugins.Start(pluginCtx)
 
-	// The Agent API refuses Deliveries until the audit signing key is loaded.
-	// Once both APIs have drained, the last records are signed before the
-	// database closes.
+	// The Agent API refuses Deliveries until the audit signing key is loaded,
+	// and while Audit Records cannot be stored. Once both APIs have drained,
+	// the last records are stored and signed before the database closes.
 	secrets := resolver.New(cfg, plugins)
 	if key := cfg.Audit.SigningKey; key != nil {
 		auditLog.Start(func(ctx context.Context) (*secret.Secret, error) { return secrets.CourierKey(ctx, *key) })
 	}
 	defer func() {
 		if err := auditLog.Close(); err != nil {
-			log.Error("final audit checkpoint failed", "error", err)
+			log.Error("closing the audit log failed", "error", err)
 		}
 	}()
 

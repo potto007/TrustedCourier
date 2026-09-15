@@ -335,6 +335,11 @@ func status(args []string, stdout io.Writer) error {
 	} else {
 		_, err = fmt.Fprintf(stdout, "\nAudit signing key: not loaded (%s)\n", key.Detail)
 	}
+	if err != nil || st.AuditRecords.Pending == 0 {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "Audit Records: %d waiting to be stored; Deliveries are refused (%s)\n",
+		st.AuditRecords.Pending, st.AuditRecords.Detail)
 	return err
 }
 

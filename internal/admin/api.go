@@ -42,6 +42,16 @@ type IssuedAgentToken struct {
 type Status struct {
 	BackendPlugins  []BackendPluginStatus `json:"backend_plugins"`
 	AuditSigningKey AuditSigningKeyStatus `json:"audit_signing_key"`
+	AuditRecords    AuditRecordsStatus    `json:"audit_records"`
+}
+
+// AuditRecordsStatus is whether Audit Records are being stored. The Agent API
+// refuses Deliveries while any are waiting to be.
+type AuditRecordsStatus struct {
+	// Pending is how many Audit Records are waiting to be stored.
+	Pending int `json:"pending"`
+	// Detail is why the oldest could not be stored, or empty.
+	Detail string `json:"detail"`
 }
 
 // AuditSigningKeyStatus is whether the audit signing key is loaded. The Agent
