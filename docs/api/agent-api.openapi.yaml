@@ -85,6 +85,8 @@ paths:
       summary: Proxy Delivery
       security:
         - credentialSlot: []
+        - credentialSlotQuery: []
+        - credentialSlotBasicAuth: []
         - agentTokenHeader: []
       responses:
         "400":
@@ -185,7 +187,27 @@ components:
         the Agent sends `Authorization: Bearer <Agent Token>`; with
         `X-Api-Key: {secret}`, it sends `X-Api-Key: <Agent Token>`. The
         template's literal text matches case-insensitively. The Agent Token
-        is never read from the URL. Present it exactly once.
+        is never read from the URL, except from a query parameter a query
+        Injection Template names (see `credentialSlotQuery`). For a basic
+        auth template, the Agent Token is the username or password the
+        Secret would be, beside the template's literal other field. Present
+        it exactly once.
+    credentialSlotQuery:
+      type: apiKey
+      in: query
+      name: key
+      description: |
+        Proxy Delivery only. With a query Injection Template such as
+        `query: {name: key}`, the Agent sends `?key=<Agent Token>`.
+        TrustedCourier removes the parameter and sends the Secret, escaped,
+        under the template's name. The name here is an example.
+    credentialSlotBasicAuth:
+      type: http
+      scheme: basic
+      description: |
+        Proxy Delivery only. With a basic auth Injection Template, the Agent
+        sends basic auth with the Agent Token as whichever of username and
+        password the template gives to the Secret, and the literal other.
 
   schemas:
     Error:

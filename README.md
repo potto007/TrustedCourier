@@ -45,10 +45,11 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Plugin SDK and conformance kit skeleton | done |
 | Secret Names mapped to Backend locations in config | done |
 | Reveal Delivery on a loopback Agent API | done |
-| Proxy Delivery with a header Injection Template, OpenAPI spec for the Agent API | done |
+| Proxy Delivery with header, query, and basic auth Injection Templates, OpenAPI spec for the Agent API | done |
+| Presets for OpenAI, Anthropic, and GitHub, `tc env` | done |
 | Redaction | done |
 | OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
-| Method and path limits, query and basic auth Injection Templates, Presets | [#7](https://github.com/potto007/TrustedCourier/issues/7), [#8](https://github.com/potto007/TrustedCourier/issues/8) |
+| Method and path limits | [#7](https://github.com/potto007/TrustedCourier/issues/7) |
 | Hash-chained Audit Records, `tc audit verify` | done |
 | Signed audit checkpoints | [#10](https://github.com/potto007/TrustedCourier/issues/10) |
 | TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
@@ -233,6 +234,65 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 
 The Agent API is described by an OpenAPI 3.1 spec in [`docs/api/agent-api.openapi.yaml`](docs/api/agent-api.openapi.yaml). Routes, credential slots, and Upstream trust are recorded in [ADR-0013](docs/decisions/0013-proxy-delivery-routes-slots-and-upstream-trust.md), and Redaction in [ADR-0014](docs/decisions/0014-redaction-masks-in-place.md).
 
+#### Injection Templates
+
+An Injection Template is one of three kinds:
+
+```yaml
+injection_template:
+  header:
+    name: X-Api-Key
+    value: "{secret}"        # {secret} once, with any text around it
+---
+injection_template:
+  query:
+    name: key                # ?key=<Secret>
+---
+injection_template:
+  basic_auth:
+    username: AC123          # literal
+    password: "{secret}"     # {secret} is the whole username or the whole password
+```
+
+The Agent presents its Agent Token where the Secret would go: `X-Api-Key: tcat_...`, `?key=tcat_...`, or basic auth with username `AC123` and password `tcat_...`. For a query template, TrustedCourier removes the Agent Token's parameter and adds the Secret, escaped, as the last parameter, replacing any value the Agent sent under that name. A query parameter no Injection Template names is never read for an Agent Token.
+
+Redaction masks every form of the Secret the request carried: the Secret itself, the escaped Secret for a query template, and the base64 credential for basic auth.
+
+#### Presets
+
+A Preset supplies the Injection Template and Upstream for a well-known service:
+
+```yaml
+secrets:
+  openai:
+    backend: openbao
+    location: secret/data/openai#key
+    preset: openai
+```
+
+| Preset | Injection Template | Upstream `api` |
+| --- | --- | --- |
+| `openai` | `Bearer {secret}` in the `Authorization` header | `https://api.openai.com/v1` |
+| `anthropic` | `X-Api-Key: {secret}` | `https://api.anthropic.com` |
+| `github` | `token {secret}` in the `Authorization` header | `https://api.github.com` |
+
+`preset` cannot sit beside `injection_template`. `upstreams` beside a Preset replace its Upstreams, for GitHub Enterprise Server or a gateway. Presets live in [`internal/config/presets.yaml`](internal/config/presets.yaml), in the Secret Name's own format, so adding one is adding an entry. Recorded in [ADR-0017](docs/decisions/0017-injection-template-kinds-presets-and-tc-env.md).
+
+#### `tc env`
+
+`tc env` prints what an Agent needs for a Secret Name:
+
+```sh
+./tc env openai
+```
+
+```
+OPENAI_BASE_URL=http://127.0.0.1:8200/proxy/openai/api
+OPENAI_API_KEY=<Agent Token>
+```
+
+Replace `<Agent Token>` with a token from `tc token issue`; the server keeps only hashes, so it cannot print one. Presets name their SDK's variables. Other Secret Names get `<NAME>_BASE_URL` and `<NAME>_API_KEY`, or `<NAME>_USERNAME` and `<NAME>_PASSWORD` for basic auth, with the literal field filled in. A Secret Name with several Upstreams needs `--upstream <name>`. `--json` prints an object of variable to value.
+
 ### Reveal Delivery
 
 Map a Secret Name to its location in a Backend, let a Policy reveal it, and turn on the Agent API:
@@ -306,6 +366,7 @@ tc server run --config <path>
 tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | --expires-at <RFC 3339>) [--json]
 tc token list [--json]
 tc token revoke <id>
+tc env <secret-name> [--upstream <name>] [--json]
 tc status [--json]
 tc audit verify [--json]
 tc plugin sha256 <path>
@@ -314,7 +375,7 @@ tc plugin sha256 <path>
 | Variable | Meaning |
 | --- | --- |
 | `TC_ADMIN_SOCKET` | Admin socket path. Defaults to `/run/trustedcourier/admin.sock`. |
-| `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command, `status`, and `audit verify` require it. |
+| `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command, `env`, `status`, and `audit verify` require it. |
 
 Exit codes are 0 for success, 1 for a failed operation, and 2 for a malformed command line.
 
@@ -338,9 +399,13 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `secrets` | no | Map of Secret Name to where its Secret lives. |
 | `secrets.<name>.backend` | yes | The `backend_plugins` entry that holds the Secret. |
 | `secrets.<name>.location` | yes | The Secret's location in that Backend, up to 1024 bytes without control characters. |
-| `secrets.<name>.injection_template.header.name` | with `upstreams` | The header Proxy Delivery puts the Secret in. Hop-by-hop headers, `Host`, `Content-Length`, and `X-TC-Agent-Token` are refused. |
-| `secrets.<name>.injection_template.header.value` | with `upstreams` | The header's value, with `{secret}` exactly once where the Secret goes, such as `Bearer {secret}`. |
-| `secrets.<name>.upstreams` | with `injection_template` | Map of Upstream name to Upstream. Each is served at `/proxy/<Secret Name>/<Upstream name>`. |
+| `secrets.<name>.preset` | no | A built-in Preset (`openai`, `anthropic`, `github`) supplying the Injection Template and Upstreams. Not with `injection_template`. `upstreams` beside it replace the Preset's. |
+| `secrets.<name>.injection_template` | with `upstreams`, unless `preset` | Exactly one of `header`, `query`, and `basic_auth`. |
+| `secrets.<name>.injection_template.query.name` | for `query` | The query parameter the Secret goes in: up to 64 letters, digits, `.`, `_`, `~`, and `-`. |
+| `secrets.<name>.injection_template.basic_auth.username`, `.password` | for `basic_auth` | One is exactly `{secret}`, the other literal (may be omitted for empty). A literal username cannot contain `:`. |
+| `secrets.<name>.injection_template.header.name` | for `header` | The header Proxy Delivery puts the Secret in. Hop-by-hop headers, `Host`, `Content-Length`, and `X-TC-Agent-Token` are refused. |
+| `secrets.<name>.injection_template.header.value` | for `header` | The header's value, with `{secret}` exactly once where the Secret goes, such as `Bearer {secret}`. |
+| `secrets.<name>.upstreams` | with `injection_template`; optional with `preset` | Map of Upstream name to Upstream. Each is served at `/proxy/<Secret Name>/<Upstream name>`. |
 | `secrets.<name>.upstreams.<name>.url` | yes | The Upstream's `https` base URL, optionally with a path. No user information, query, or fragment. |
 | `secrets.<name>.upstreams.<name>.ca_bundle` | no | PEM file of CA certificates that replace the system roots for this Upstream. |
 | `agent_api.listen` | no | Loopback IP address and port for the Agent API, such as `127.0.0.1:8200` or `[::1]:8200`. Omit it to serve no Agent API. |
