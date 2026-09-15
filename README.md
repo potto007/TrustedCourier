@@ -40,6 +40,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Admin API on a unix socket, gated by local user and Operator Credential | done |
 | `tc token issue`, `list`, `revoke` | done |
 | Policies declared and validated in config | done |
+| `tc reload` for Policies, Secret Names, and Upstreams | done |
 | Backend Plugins pinned by SHA-256, run as a separate user, supervised | done |
 | `tc status`, `tc plugin sha256` | done |
 | Plugin SDK and conformance kit skeleton | done |
@@ -428,6 +429,7 @@ tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | -
 tc token list [--json]
 tc token revoke <id>
 tc env <secret-name> [--upstream <name>] [--json]
+tc reload [--json]
 tc status [--json]
 tc audit verify [--json]
 tc plugin sha256 <path>
@@ -436,7 +438,7 @@ tc plugin sha256 <path>
 | Variable | Meaning |
 | --- | --- |
 | `TC_ADMIN_SOCKET` | Admin socket path. Defaults to `/run/trustedcourier/admin.sock`. |
-| `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command, `env`, `status`, and `audit verify` require it. |
+| `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command, `env`, `reload`, `status`, and `audit verify` require it. |
 
 Exit codes are 0 for success, 1 for a failed operation, and 2 for a malformed command line.
 
@@ -480,6 +482,17 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, can list each only once, may list only Secret Names defined under `secrets`, and may allow `proxy` only for Secret Names with `upstreams`. `methods` and `paths` need `proxy` in `delivery`, cannot be empty lists or keys without a value, and are refused when they hold an unknown method or a path prefix with a dot segment, an empty segment, `?`, `#`, `;` (raw or `%3B`), or an encoded slash or backslash. A typo there stops the server at startup instead of denying Agents at runtime. Upstream names follow the same rules as Secret Names.
 
 Two things trip people up with the admin socket. The default `/run/trustedcourier/` usually needs root to create, so for a non-root server pick a path you own, such as one under `$XDG_RUNTIME_DIR`. And unix socket paths are limited to about 104 to 108 bytes depending on the OS, so a deeply nested path fails with `bind: invalid argument`.
+
+### Reloading
+
+`tc reload` has the server reload the config file it started from, without a restart:
+
+```sh
+./tc reload
+Config reloaded from /etc/trustedcourier/trustedcourier.yaml (Policies: 3, Secret Names: 4)
+```
+
+Policies, Secret Names, Upstreams, Injection Templates, and Presets take effect for every request that starts after the reload. A Delivery already under way finishes on the config it started with. Removing a Policy removes its access from every Agent Token that names it at once, though `tc token list` still shows the name. The file is validated as at startup; if anything is wrong, `tc reload` exits 1 with the reason and the running config stays in effect. `data_dir`, `admin`, `agent_api`, `backend_plugins`, and `audit` change only on restart, so a file that changes any of them is refused whole, naming them ([ADR-0021](docs/decisions/0021-config-reload-swaps-snapshots.md)).
 
 ## Security properties today
 
