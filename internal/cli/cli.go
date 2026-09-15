@@ -29,6 +29,7 @@ const usage = `Usage:
   tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | --expires-at <RFC 3339>) [--json]
   tc token list [--json]
   tc token revoke <id>
+  tc env <secret-name> [--upstream <name>] [--json]
   tc status [--json]
   tc audit verify [--json]
   tc plugin sha256 <path>
@@ -65,6 +66,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	if len(args) >= 1 && args[0] == "status" {
 		return status(args[1:], stdout)
+	}
+	if len(args) >= 1 && args[0] == "env" {
+		return env(args[1:], stdout)
 	}
 	if len(args) < 2 {
 		return fmt.Errorf("%w: missing command", errUsage)
@@ -323,6 +327,49 @@ func status(args []string, stdout io.Writer) error {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n", p.Name, p.State, health, caps, p.Restarts, p.Detail)
 	}
 	return tw.Flush()
+}
+
+// env prints the environment variables an Agent needs to use a Secret Name
+// through Proxy Delivery, one NAME=value per line.
+func env(args []string, stdout io.Writer) error {
+	fs := newFlagSet("env")
+	upstream := fs.String("upstream", "", "Upstream name, when the Secret Name has several")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	// Flags may also follow the Secret Name.
+	var positional []string
+	for fs.NArg() > 0 {
+		positional = append(positional, fs.Arg(0))
+		if err := parseFlags(fs, fs.Args()[1:]); err != nil {
+			return err
+		}
+	}
+	if len(positional) != 1 {
+		return fmt.Errorf("%w: env: exactly one Secret Name is required", errUsage)
+	}
+	client, err := adminClient()
+	if err != nil {
+		return err
+	}
+	e, err := client.SecretNameEnv(context.Background(), positional[0], *upstream)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		vars := make(map[string]string, len(e.Env))
+		for _, v := range e.Env {
+			vars[v.Name] = v.Value
+		}
+		return writeJSON(stdout, vars)
+	}
+	for _, v := range e.Env {
+		if _, err := fmt.Fprintf(stdout, "%s=%s\n", v.Name, v.Value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // errAuditBroken fails tc audit verify after it has reported the break.

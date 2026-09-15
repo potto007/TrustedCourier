@@ -67,6 +67,19 @@ func (c *Client) VerifyAudit(ctx context.Context) (AuditVerification, error) {
 	return v, err
 }
 
+// SecretNameEnv returns the environment an Agent needs to use secretName
+// through Proxy Delivery to upstream, which may be empty when the Secret Name
+// has only one Upstream.
+func (c *Client) SecretNameEnv(ctx context.Context, secretName, upstream string) (SecretNameEnv, error) {
+	path := "/v1/secret-names/" + url.PathEscape(secretName) + "/env"
+	if upstream != "" {
+		path += "?" + url.Values{"upstream": {upstream}}.Encode()
+	}
+	var env SecretNameEnv
+	err := c.do(ctx, http.MethodGet, path, nil, &env)
+	return env, err
+}
+
 // RevokeAgentToken revokes the Agent Token with id.
 func (c *Client) RevokeAgentToken(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/agent-tokens/"+url.PathEscape(id), nil, nil)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/potto007/TrustedCourier/internal/access"
 	"github.com/potto007/TrustedCourier/internal/audit"
+	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/httpserve"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
 )
@@ -90,17 +92,21 @@ func removeStaleSocket(socket string) error {
 
 // Server serves the admin API.
 type Server struct {
-	access      *access.Service
-	plugins     *pluginhost.Host
-	audit       *audit.Log
-	allowedUIDs []int
-	log         *slog.Logger
+	access  *access.Service
+	plugins *pluginhost.Host
+	audit   *audit.Log
+	cfg     *config.Config
+	// agentURL is the Agent API's base URL, or empty when it is not served.
+	agentURL string
+	log      *slog.Logger
 }
 
-// NewServer returns an admin API server that admits connections from
-// allowedUIDs presenting the Operator Credential.
-func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, allowedUIDs []int, log *slog.Logger) *Server {
-	return &Server{access: svc, plugins: plugins, audit: auditLog, allowedUIDs: allowedUIDs, log: log}
+// NewServer returns an admin API server for cfg that admits connections from
+// cfg's allowed UIDs presenting the Operator Credential. agentURL is the Agent
+// API's base URL, such as http://127.0.0.1:8200, or empty when it is not
+// served.
+func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, cfg *config.Config, agentURL string, log *slog.Logger) *Server {
+	return &Server{access: svc, plugins: plugins, audit: auditLog, cfg: cfg, agentURL: agentURL, log: log}
 }
 
 // Serve serves the admin API on ln until ctx is done.
@@ -111,6 +117,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	mux.HandleFunc("DELETE /v1/agent-tokens/{id}", s.revokeAgentToken)
 	mux.HandleFunc("GET /v1/status", s.status)
 	mux.HandleFunc("POST /v1/audit/verify", s.verifyAudit)
+	mux.HandleFunc("GET /v1/secret-names/{name}/env", s.secretNameEnv)
 
 	srv := &http.Server{
 		Handler:           s.requirePeer(s.requireOperator(mux)),
@@ -147,7 +154,7 @@ func (s *Server) requirePeer(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "admin socket: connecting user is not allowed")
 			return
 		}
-		if !slices.Contains(s.allowedUIDs, p.uid) {
+		if !slices.Contains(s.cfg.Admin.AllowedUIDs, p.uid) {
 			s.log.Warn("admin connection refused: local user not allowed", "uid", p.uid)
 			writeError(w, http.StatusForbidden, "admin socket: connecting user is not allowed")
 			return
@@ -247,6 +254,50 @@ func (s *Server) verifyAudit(w http.ResponseWriter, r *http.Request) {
 	if v.Break != nil {
 		out.Break = &AuditBreak{Seq: v.Break.Seq, Problem: v.Break.Problem}
 		s.log.Warn("audit chain broken", "seq", v.Break.Seq, "problem", v.Break.Problem)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	sn, ok := s.cfg.Secrets[name]
+	switch {
+	case !ok:
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Secret Name %q is not defined", name))
+		return
+	case len(sn.Upstreams) == 0:
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Secret Name %q has no upstreams, so no Agent can use it through Proxy Delivery", name))
+		return
+	case s.agentURL == "":
+		writeError(w, http.StatusBadRequest, "the Agent API is not served; set agent_api.listen")
+		return
+	}
+	upstream := r.URL.Query().Get("upstream")
+	names := slices.Sorted(maps.Keys(sn.Upstreams))
+	switch _, ok := sn.Upstreams[upstream]; {
+	case upstream == "" && len(names) == 1:
+		upstream = names[0]
+	case upstream == "":
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Secret Name %q has several Upstreams; choose one with --upstream (%s)", name, strings.Join(names, ", ")))
+		return
+	case !ok:
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Secret Name %q has no Upstream %q; it has %s", name, upstream, strings.Join(names, ", ")))
+		return
+	}
+	out := SecretNameEnv{SecretName: name, Upstream: upstream, Env: []EnvVar{}}
+	for _, v := range sn.Env {
+		var value string
+		switch v.Source {
+		case config.EnvBaseURL:
+			value = s.agentURL + "/proxy/" + name + "/" + upstream
+		case config.EnvAgentToken:
+			value = AgentTokenPlaceholder
+		case config.EnvUsername:
+			value = sn.InjectionTemplate.BasicAuth.Username
+		case config.EnvPassword:
+			value = sn.InjectionTemplate.BasicAuth.Password
+		}
+		out.Env = append(out.Env, EnvVar{Name: v.Name, Value: value})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
