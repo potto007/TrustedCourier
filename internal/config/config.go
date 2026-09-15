@@ -242,10 +242,12 @@ type filePolicy struct {
 }
 
 type fileSecretAccess struct {
-	Name     string    `yaml:"name"`
-	Delivery []string  `yaml:"delivery"`
-	Methods  *[]string `yaml:"methods"` // nil when omitted
-	Paths    *[]string `yaml:"paths"`   // nil when omitted
+	Name     string   `yaml:"name"`
+	Delivery []string `yaml:"delivery"`
+	// Methods and Paths are kept as nodes, so a key left without a value is
+	// told apart from an omitted one (Kind 0).
+	Methods yaml.Node `yaml:"methods"`
+	Paths   yaml.Node `yaml:"paths"`
 }
 
 // Load reads and validates the config file at path. Relative paths in the
@@ -641,21 +643,26 @@ func (p filePolicy) validate(name string) (Policy, error) {
 }
 
 // validateLimits sets the methods and paths that limit access's Proxy
-// Delivery. An empty list is refused rather than read as allowing nothing or
-// everything.
+// Delivery. An empty list, or a key without a value, is refused rather than
+// read as allowing nothing or everything.
 func (s fileSecretAccess) validateLimits(access *SecretAccess) error {
-	if s.Methods == nil && s.Paths == nil {
+	methods, hasMethods, err := limitList(s.Methods, "methods", "method")
+	if err != nil {
+		return err
+	}
+	paths, hasPaths, err := limitList(s.Paths, "paths", "path")
+	if err != nil {
+		return err
+	}
+	if !hasMethods && !hasPaths {
 		return nil
 	}
 	if !slices.Contains(access.Delivery, DeliveryProxy) {
 		return errors.New("methods and paths limit Proxy Delivery, which the entry does not allow")
 	}
-	if s.Methods != nil {
-		if len(*s.Methods) == 0 {
-			return errors.New("methods is empty; omit it to allow any method")
-		}
+	if hasMethods {
 		access.Methods = []string{}
-		for _, m := range *s.Methods {
+		for _, m := range methods {
 			method := strings.ToUpper(m)
 			if !slices.Contains(ProxyMethods, method) {
 				return fmt.Errorf("unknown method %q (want %s)", m, strings.Join(ProxyMethods, ", "))
@@ -665,12 +672,9 @@ func (s fileSecretAccess) validateLimits(access *SecretAccess) error {
 			}
 		}
 	}
-	if s.Paths != nil {
-		if len(*s.Paths) == 0 {
-			return errors.New("paths is empty; omit it to allow any path")
-		}
+	if hasPaths {
 		access.Paths = []PathPrefix{}
-		for _, p := range *s.Paths {
+		for _, p := range paths {
 			prefix, err := ParsePathPrefix(p)
 			if err != nil {
 				return fmt.Errorf("path %q: %w", p, err)
@@ -679,6 +683,24 @@ func (s fileSecretAccess) validateLimits(access *SecretAccess) error {
 		}
 	}
 	return nil
+}
+
+// limitList decodes the list under key, reporting whether the key was set.
+// A key without a value is set but empty.
+func limitList(n yaml.Node, key, item string) ([]string, bool, error) {
+	if n.Kind == 0 {
+		return nil, false, nil
+	}
+	var list []string
+	if n.ShortTag() != "!!null" {
+		if err := n.Decode(&list); err != nil {
+			return nil, true, fmt.Errorf("%s must be a list: %w", key, err)
+		}
+	}
+	if len(list) == 0 {
+		return nil, true, fmt.Errorf("%s is empty; omit it to allow any %s", key, item)
+	}
+	return list, true, nil
 }
 
 func resolve(baseDir, path string) string {

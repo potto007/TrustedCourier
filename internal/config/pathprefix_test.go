@@ -79,7 +79,7 @@ func TestPathPrefixTrailingSlashIsIgnored(t *testing.T) {
 func TestInvalidPathPrefixesAreRefused(t *testing.T) {
 	for _, s := range []string{
 		"", "repos", "/repos/../x", "/repos/./x", "/repos/%2e%2e", "/repos//x",
-		"/a?b", "/a#b", "/a%2Fb", "/a%5Cb", `/a\b`, "/a%zz", "/a;b", "/a%00", "/a b",
+		"/a?b", "/a#b", "/a%2Fb", "/a%5Cb", `/a\b`, "/a%zz", "/a;b", "/a%3Bb", "/a%00", "/a b",
 		"/%c0%ae",
 	} {
 		if _, err := ParsePathPrefix(s); err == nil {

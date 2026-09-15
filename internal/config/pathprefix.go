@@ -43,8 +43,8 @@ func ParsePathPrefix(s string) (PathPrefix, error) {
 			return PathPrefix{}, err
 		case !utf8.ValidString(seg):
 			return PathPrefix{}, errors.New("must decode to valid UTF-8")
-		case hasControl(seg) || strings.ContainsAny(seg, `/\`):
-			return PathPrefix{}, errors.New("must not encode a slash, backslash, or control character")
+		case hasControl(seg) || strings.ContainsAny(seg, `/\;`):
+			return PathPrefix{}, errors.New("must not encode a slash, backslash, ';', or control character")
 		case seg == "." || seg == "..":
 			return PathPrefix{}, errors.New("must not contain dot segments")
 		}

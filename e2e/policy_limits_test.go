@@ -133,6 +133,11 @@ secrets:
 		name, config, wantErr string
 	}{
 		{"empty methods", policy(proxy + "        methods: []\n"), `Policy "p": Secret Name "github": methods is empty`},
+		// A key left without a value, as after commenting out every item,
+		// must not lift the limit.
+		{"methods without a value", policy(proxy + "        methods:\n        paths: [/user]\n"), `Policy "p": Secret Name "github": methods is empty`},
+		{"null paths", policy(proxy + "        methods: [GET]\n        paths: ~\n"), `Policy "p": Secret Name "github": paths is empty`},
+		{"methods not a list", policy(proxy + "        methods: GET\n"), `Policy "p": Secret Name "github": methods`},
 		{"unknown method", policy(proxy + "        methods: [GET, FETCH]\n"), `unknown method "FETCH"`},
 		{"CONNECT", policy(proxy + "        methods: [CONNECT]\n"), `unknown method "CONNECT"`},
 		{"empty paths", policy(proxy + "        paths: []\n"), `Policy "p": Secret Name "github": paths is empty`},
