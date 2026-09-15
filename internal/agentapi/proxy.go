@@ -157,8 +157,8 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	cred, err := render(rt.template, value)
 	value.Release()
 	if err != nil {
-		log.Error("Delivery failed: the Secret cannot go in the Injection Template's header", "error", err)
-		rec.Failure = "the Secret cannot go in the Injection Template's header"
+		log.Error("Delivery failed: the Secret cannot go where the Injection Template puts it", "error", err)
+		rec.Failure = "the Secret cannot go where the Injection Template puts it"
 		writeError(w, http.StatusBadGateway, "the Secret could not be delivered")
 		return
 	}

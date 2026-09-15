@@ -291,7 +291,7 @@ OPENAI_BASE_URL=http://127.0.0.1:8200/proxy/openai/api
 OPENAI_API_KEY=<Agent Token>
 ```
 
-Replace `<Agent Token>` with a token from `tc token issue`; the server keeps only hashes, so it cannot print one. Presets name their SDK's variables. Other Secret Names get `<NAME>_BASE_URL` and `<NAME>_API_KEY`, or `<NAME>_USERNAME` and `<NAME>_PASSWORD` for basic auth, with the literal field filled in. A Secret Name with several Upstreams needs `--upstream <name>`. `--json` prints an object of variable to value.
+Replace `<Agent Token>` with a token from `tc token issue`; the server keeps only hashes, so it cannot print one. Presets name their SDK's variables. Other Secret Names get `<NAME>_BASE_URL` and `<NAME>_API_KEY`, or `<NAME>_USERNAME` and `<NAME>_PASSWORD` for basic auth, with the literal field filled in and left out when it is empty. Values are printed as is, without shell quoting. A Secret Name with several Upstreams needs `--upstream <name>`. `--json` prints an object of variable to value.
 
 ### Reveal Delivery
 
