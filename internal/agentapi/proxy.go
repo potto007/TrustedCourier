@@ -182,6 +182,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 				case idle.Load():
 					log.Error("Delivery cut off: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
 					rec.Failure = "the Upstream sent nothing in time"
+				case r.Context().Err() != nil && s.stopping.Load():
+					log.Warn("Delivery cut off by server shutdown")
+					rec.Failure = "cut off by server shutdown"
 				case r.Context().Err() != nil:
 					log.Info("Delivery abandoned by the Agent")
 					rec.Failure = "abandoned by the Agent"
@@ -240,6 +243,11 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 				log.Error("Delivery failed: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
 				rec.Failure = "the Upstream sent nothing in time"
 				writeError(w, http.StatusGatewayTimeout, "the Upstream did not respond in time")
+				return
+			}
+			if r.Context().Err() != nil && s.stopping.Load() {
+				log.Warn("Delivery cut off by server shutdown", "error", err)
+				rec.Failure = "cut off by server shutdown"
 				return
 			}
 			if r.Context().Err() != nil {

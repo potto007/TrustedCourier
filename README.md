@@ -286,9 +286,9 @@ Every Delivery attempt made with a valid Agent Token, allowed or denied, produce
 | `decision`, `reason` | `allowed`, or `denied` with the reason the Agent never sees, such as `no Policy allows it` or `unknown Upstream`. |
 | `upstream_status` | The Upstream's status code, or `null` when it never answered. |
 | `failure` | Why an allowed Delivery did not complete, such as `the Secret could not be fetched` or `the Upstream's response broke off`. |
-| `prev_hash`, `hash` | The previous record's hash, and this record's: the SHA-256 of this JSON object without `hash`. The first `prev_hash` is 64 zeros. |
+| `prev_hash`, `hash` | The previous record's hash, and this record's: the SHA-256 of the line with its final `,"hash":"..."` member removed. The first `prev_hash` is 64 zeros. |
 
-Records never contain a Secret's value, request or response bodies, paths, or error text from a Backend or Upstream.
+Records never contain a Secret's value, request or response bodies, paths, or error text from a Backend or Upstream. To check a streamed record, hash the line exactly as received, minus the `hash` member. Re-encoding the JSON can change the bytes. A Proxy Delivery still streaming 5 seconds after SIGTERM is cut off and recorded with the failure `cut off by server shutdown`.
 
 `tc audit verify` walks the chain in SQLite and reports the first break. A deleted record, an altered one, or one that no longer chains all count:
 
@@ -297,7 +297,7 @@ Audit chain broken at record 2: record 2 does not match its hash
 1 Audit Record before it intact
 ```
 
-It exits 0 when the chain is intact and 1 when it is broken, and takes `--json`. Removing records from the end of the chain is caught while the server that wrote them runs. Removal while it was stopped needs the signed checkpoints of [#10](https://github.com/potto007/TrustedCourier/issues/10). The stream, the chain's format, and which requests count are recorded in [ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md).
+It exits 0 when the chain is intact and 1 when it is broken, and takes `--json`. Removing or replacing records at the end of the chain, or adding one after it, is caught while the server that wrote them runs. Removal while it was stopped needs the signed checkpoints of [#10](https://github.com/potto007/TrustedCourier/issues/10). The stream, the chain's format, and which requests count are recorded in [ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md).
 
 ## CLI
 

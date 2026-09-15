@@ -138,7 +138,7 @@ func (l *Log) Append(ctx context.Context, r Record) error {
 		return err
 	}
 	if _, err := l.stream.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("stream Audit Record %d: %w", e.Seq, err)
+		return fmt.Errorf("Audit Record %d stored but not streamed: %w", e.Seq, err)
 	}
 	return nil
 }
@@ -185,34 +185,49 @@ const verifyPage = 1000
 
 // Verify walks the chain in SQLite from its first record and reports the first
 // break: a missing record, a record that no longer matches its hash, or one
-// that does not chain to the record before it. It also reports records this
-// process appended that have since been removed from the end of the chain or
-// replaced there.
+// that does not chain to the record before it. It also compares the chain's
+// end with the last record this process appended, so records removed or
+// replaced there, or written after it by anyone else, are reported too.
 func (l *Log) Verify(ctx context.Context) (Verification, error) {
-	l.mu.Lock()
-	headSeq, head := l.seq, l.head
-	l.mu.Unlock()
-
 	var v Verification
 	prev := genesis
-	for {
-		n, err := l.verifyPage(ctx, &v, &prev, headSeq, head)
-		if err != nil || v.Break != nil {
-			return v, err
-		}
-		if n < verifyPage {
-			break
-		}
+	// Walk most of the chain while Deliveries go on appending, then the rest
+	// under the lock, where the end cannot move.
+	if err := l.verifyRest(ctx, &v, &prev); err != nil || v.Break != nil {
+		return v, err
 	}
-	if v.Records < headSeq {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.verifyRest(ctx, &v, &prev); err != nil || v.Break != nil {
+		return v, err
+	}
+	switch {
+	case v.Records < l.seq:
 		v.Break = &Break{Seq: v.Records + 1, Problem: fmt.Sprintf("record %d is missing", v.Records+1)}
+	case v.Records > l.seq:
+		v.Records = l.seq
+		v.Break = &Break{Seq: l.seq + 1, Problem: fmt.Sprintf("record %d was not appended by TrustedCourier", l.seq+1)}
+	case !bytes.Equal(prev, l.head):
+		v.Records = l.seq - 1
+		v.Break = &Break{Seq: l.seq, Problem: fmt.Sprintf("record %d is not the record TrustedCourier appended", l.seq)}
 	}
 	return v, nil
 }
 
+// verifyRest checks the records after v.Records, page by page, until it
+// reaches the end of the chain or a break.
+func (l *Log) verifyRest(ctx context.Context, v *Verification, prev *[]byte) error {
+	for {
+		n, err := l.verifyPage(ctx, v, prev)
+		if err != nil || v.Break != nil || n < verifyPage {
+			return err
+		}
+	}
+}
+
 // verifyPage checks the records after v.Records, up to verifyPage of them,
 // and returns how many it read.
-func (l *Log) verifyPage(ctx context.Context, v *Verification, prev *[]byte, headSeq int64, head []byte) (int, error) {
+func (l *Log) verifyPage(ctx context.Context, v *Verification, prev *[]byte) (int, error) {
 	rows, err := l.db.QueryContext(ctx,
 		`SELECT seq, time, agent_token_id, secret_name, delivery, upstream, upstream_host,
 		 decision, reason, upstream_status, failure, prev_hash, hash
@@ -248,8 +263,6 @@ func (l *Log) verifyPage(ctx context.Context, v *Verification, prev *[]byte, hea
 			v.Break = &Break{Seq: seq, Problem: fmt.Sprintf("record %d does not match its hash", seq)}
 		case !bytes.Equal(prevHash, *prev):
 			v.Break = &Break{Seq: seq, Problem: fmt.Sprintf("record %d does not chain to the record before it", seq)}
-		case seq == headSeq && !bytes.Equal(storedHash, head):
-			v.Break = &Break{Seq: seq, Problem: fmt.Sprintf("record %d is not the record TrustedCourier appended", seq)}
 		}
 		if v.Break != nil {
 			return n, nil

@@ -13,6 +13,8 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
@@ -54,6 +56,12 @@ type Server struct {
 	log     *slog.Logger
 	routes  map[routeKey]*route
 	slots   map[string][]config.HeaderTemplate
+
+	// inflight is read-locked by every request, so Serve can wait for the
+	// ones shutdown cut off to write their Audit Records.
+	inflight sync.RWMutex
+	// stopping is set once the server has begun shutting down.
+	stopping atomic.Bool
 }
 
 // NewServer returns an Agent API server that authenticates Agents with svc,
@@ -74,9 +82,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
+	handler := noStore(mux)
 	srv := &http.Server{
-		Protocols:         protocols,
-		Handler:           noStore(mux),
+		Protocols: protocols,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s.inflight.RLock()
+			defer s.inflight.RUnlock()
+			handler.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		// A client that stops reading must not pin a Secret's locked memory.
 		WriteTimeout:   30 * time.Second,
@@ -84,7 +97,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		MaxHeaderBytes: 64 << 10,
 		ErrorLog:       slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 	}
-	return httpserve.Serve(ctx, srv, ln)
+	stop := context.AfterFunc(ctx, func() { s.stopping.Store(true) })
+	defer stop()
+	err := httpserve.Serve(ctx, srv, ln)
+	// Every Delivery attempt still gets its Audit Record, even when shutdown
+	// cut it off.
+	s.inflight.Lock()
+	return err
 }
 
 // noStore keeps every Agent API response, Secret or not, out of caches.
@@ -142,7 +161,7 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 // the write.
 func (s *Server) record(r *http.Request, log *slog.Logger, rec *audit.Record) {
 	if err := s.audit.Append(context.WithoutCancel(r.Context()), *rec); err != nil {
-		log.Error("Audit Record not written", "error", err)
+		log.Error("Audit Record failed", "error", err)
 	}
 }
 
