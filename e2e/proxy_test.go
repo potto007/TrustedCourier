@@ -307,7 +307,9 @@ func TestProxyDeliveryExposesOneRoutePerUpstream(t *testing.T) {
 	}
 
 	// Dot segments could climb out of an Upstream's base path.
-	for _, path := range []string{"/proxy/multi/second/%2e%2e/admin", "/proxy/multi/second/v1/%2E%2e/%2e%2E/admin", "/proxy/multi/second/v1/x%2F..%2Fy", "/proxy/multi/second/v1/.%2e/z"} {
+	for _, path := range []string{"/proxy/multi/second/%2e%2e/admin", "/proxy/multi/second/v1/%2E%2e/%2e%2E/admin", "/proxy/multi/second/v1/x%2F..%2Fy", "/proxy/multi/second/v1/.%2e/z",
+		// Servlet containers read "..;" as "..".
+		"/proxy/multi/second/..;/admin", "/proxy/multi/second/v1/%2e%2e;jsessionid=x/admin", "/proxy/multi/second/.;/admin"} {
 		if got := proxy(t, srv, http.MethodGet, path, bearer(token), ""); got.Status != http.StatusBadRequest {
 			t.Errorf("%s = %d %q, want 400", path, got.Status, got.Body)
 		}
@@ -537,6 +539,25 @@ func TestProxyDeliveryRefusesProtocolUpgrades(t *testing.T) {
 	}
 	if n := len(tc.Upstream.Requests()); n != 0 {
 		t.Fatalf("the Upstream received %d upgrade requests", n)
+	}
+
+	// curl --http2 offers h2c on plain HTTP; the request is served as
+	// HTTP/1.1 and the offer goes no further.
+	h2c := bearer(token)
+	h2c.Set("Connection", "Upgrade, HTTP2-Settings")
+	h2c.Set("Upgrade", "h2c")
+	h2c.Set("HTTP2-Settings", "AAMAAABkAARAAAAAAAIAAAAA")
+	if got := proxy(t, srv, http.MethodGet, "/proxy/openai/api/v1/models", h2c, ""); got.Status != http.StatusOK {
+		t.Fatalf("request offering h2c = %d %q, want 200", got.Status, got.Body)
+	}
+	reqs := tc.Upstream.Requests()
+	if len(reqs) != 1 {
+		t.Fatalf("the Upstream received %d requests, want 1", len(reqs))
+	}
+	for _, name := range []string{"Upgrade", "Http2-Settings", "Connection"} {
+		if v := reqs[0].Header.Values(name); len(v) != 0 {
+			t.Errorf("the Upstream received %s %q", name, v)
+		}
 	}
 }
 

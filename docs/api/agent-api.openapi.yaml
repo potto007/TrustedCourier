@@ -97,6 +97,8 @@ paths:
           $ref: "#/components/responses/ProxyFailed"
         "503":
           $ref: "#/components/responses/NoLockedMemory"
+        "504":
+          $ref: "#/components/responses/ProxyTimeout"
         default:
           $ref: "#/components/responses/Upstream"
     head: *proxyOperation
@@ -145,8 +147,8 @@ components:
       description: |
         The rest of the path, which may contain slashes. It is forwarded
         under the Upstream's base URL as sent, and the query string is
-        forwarded unchanged. Dot segments, including percent-encoded ones,
-        get 400.
+        forwarded unchanged. Dot segments, including percent-encoded ones
+        and ones with `;` parameters such as `..;`, get 400.
       schema:
         type: string
 
@@ -239,6 +241,15 @@ components:
       description: |
         The path contains a dot segment, or the request asks for a protocol
         upgrade such as a WebSocket, which Proxy Delivery does not support.
+        An `h2c` offer is not an error: it is answered over HTTP/1.1.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ProxyTimeout:
+      description: |
+        The Upstream sent no response for 5 minutes. A response that has
+        started streaming and then goes silent that long is cut off instead.
       content:
         application/json:
           schema:

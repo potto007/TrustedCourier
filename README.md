@@ -208,17 +208,19 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 - Upstream URLs must be `https`, and TLS is always verified. There is no setting to skip it. For an internal CA, set `ca_bundle` on the Upstream to a PEM file; it replaces the system roots for that Upstream only.
 - Redirects are never followed. The 3xx and its `Location` reach the Agent unchanged, so the Secret is never re-sent to another host.
 - HTTP/1.1 and HTTP/2 both work, to the Agent API (HTTP/2 with prior knowledge, since it is plain HTTP for now) and to the Upstream. Server-sent event streams pass through as they arrive.
-- WebSockets and other protocol upgrades are refused.
+- WebSockets and other protocol upgrades are refused. An `h2c` offer, as `curl --http2` sends, is answered over HTTP/1.1.
+- A response may stream for as long as the Upstream keeps sending. An Upstream that sends nothing for 5 minutes, or an Agent that stops reading for 30 seconds, ends the Delivery.
 - Redaction is not in yet ([#6](https://github.com/potto007/TrustedCourier/issues/6)): an Upstream that echoes its credential back sends the Secret to the Agent.
 
 | Status | When |
 | --- | --- |
 | Upstream's | The request reached the Upstream. Its response comes back with `Cache-Control: no-store`. |
-| 400 | The path contains a dot segment (`..`, `%2e%2e`), or the request asks for a protocol upgrade. |
+| 400 | The path contains a dot segment (`..`, `%2e%2e`, `..;`), or the request asks for a protocol upgrade. |
 | 401 | The Agent Token is missing, presented twice, unknown, expired, or revoked. |
 | 403 | Anything else, including an unknown Upstream name. The body is the same as Reveal Delivery's 403. |
 | 502 | The Backend could not return the Secret, or the Upstream could not be reached or its certificate did not verify. Details go to the server log only. |
 | 503 | The server has no locked memory left to hold the Secret. |
+| 504 | The Upstream sent no response for 5 minutes. |
 
 The Agent API is described by an OpenAPI 3.1 spec in [`docs/api/agent-api.openapi.yaml`](docs/api/agent-api.openapi.yaml). Routes, credential slots, and Upstream trust are recorded in [ADR-0013](docs/decisions/0013-proxy-delivery-routes-slots-and-upstream-trust.md).
 

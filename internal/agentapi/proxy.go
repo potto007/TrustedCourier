@@ -1,6 +1,7 @@
 package agentapi
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
@@ -76,7 +78,13 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// WebSockets are out of scope (ADR-0002), and an upgraded connection
-	// would carry bytes TrustedCourier never inspects.
+	// would carry bytes TrustedCourier never inspects. The server declines
+	// an h2c offer, as curl --http2 sends, by answering in HTTP/1.1, so the
+	// offer is dropped rather than forwarded.
+	if strings.EqualFold(r.Header.Get("Upgrade"), "h2c") {
+		r.Header.Del("Upgrade")
+		r.Header.Del("Http2-Settings")
+	}
 	if r.Header.Get("Upgrade") != "" {
 		writeError(w, http.StatusBadRequest, "Proxy Delivery does not support protocol upgrades")
 		return
@@ -121,9 +129,22 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	target.Path, _ = url.PathUnescape(escaped)
 	target.RawPath = escaped
 
-	// Streams such as server-sent events may outlast the write timeout, and
-	// no Secret is held in locked memory while they run.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	// A proxied response may stream for as long as the Upstream keeps
+	// sending, but may not stall: the request holds the Secret's header copy
+	// until it ends. An Upstream silent for proxyIdleTimeout cancels it, and
+	// an Agent that stops reading for proxyWriteStall fails its writes.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	var idle atomic.Bool
+	timer := time.AfterFunc(proxyIdleTimeout, func() {
+		idle.Store(true)
+		cancel()
+	})
+	defer timer.Stop()
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(proxyIdleTimeout))
+	pw := &progressWriter{ResponseWriter: w, rc: rc, timer: timer}
+
 	(&httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL = target
@@ -143,6 +164,11 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if idle.Load() {
+				log.Error("Delivery failed: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
+				writeError(w, http.StatusGatewayTimeout, "the Upstream did not respond in time")
+				return
+			}
 			if r.Context().Err() != nil {
 				log.Info("Delivery abandoned by the Agent", "error", err)
 				return
@@ -151,8 +177,43 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadGateway, "the Upstream could not be reached")
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
-	}).ServeHTTP(w, r)
+	}).ServeHTTP(pw, r.WithContext(ctx))
 }
+
+const (
+	// proxyIdleTimeout bounds how long an Upstream may send nothing, before
+	// or during its response.
+	proxyIdleTimeout = 5 * time.Minute
+	// proxyWriteStall bounds how long an Agent may stop reading a proxied
+	// response, as the server's write timeout does for Reveal Delivery.
+	proxyWriteStall = 30 * time.Second
+)
+
+// progressWriter pushes the idle timer and the write deadline forward
+// whenever the Upstream's response makes progress.
+type progressWriter struct {
+	http.ResponseWriter
+	rc    *http.ResponseController
+	timer *time.Timer
+}
+
+func (p *progressWriter) progress() {
+	p.timer.Reset(proxyIdleTimeout)
+	_ = p.rc.SetWriteDeadline(time.Now().Add(proxyWriteStall))
+}
+
+func (p *progressWriter) WriteHeader(code int) {
+	p.progress()
+	p.ResponseWriter.WriteHeader(code)
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	p.progress()
+	return p.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.ResponseController flush the underlying writer.
+func (p *progressWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
 
 // forwardedPath returns the escaped path after /proxy/{secret_name}/{upstream},
 // with its leading slash. It refuses dot segments, including percent-encoded
@@ -170,7 +231,8 @@ func forwardedPath(escaped string) (string, bool) {
 			return "", false
 		}
 		for part := range strings.FieldsFuncSeq(decoded, func(r rune) bool { return r == '/' || r == '\\' }) {
-			if part == "." || part == ".." {
+			// Servlet containers read "..;params" as "..".
+			if name, _, _ := strings.Cut(part, ";"); name == "." || name == ".." {
 				return "", false
 			}
 		}
