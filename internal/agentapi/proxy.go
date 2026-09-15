@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
+	"github.com/potto007/TrustedCourier/internal/audit"
 	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/redact"
 	"github.com/potto007/TrustedCourier/internal/secret"
@@ -85,6 +86,19 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	name, upName := r.PathValue("secret_name"), r.PathValue("upstream")
+	log := s.log.With("delivery", config.DeliveryProxy, "agent_token_id", tok.ID, "secret_name", name, "upstream", upName)
+	rt := s.routes[routeKey{name, upName}]
+	rec := &audit.Record{AgentTokenID: tok.ID, SecretName: name, Delivery: config.DeliveryProxy, Upstream: upName}
+	if rt != nil {
+		rec.UpstreamHost = rt.upstream.Host
+	}
+	defer s.record(r, log, rec)
+	refuse := func(reason string) {
+		log.Info("Delivery denied", "reason", reason)
+		rec.Decision, rec.Reason = audit.Denied, reason
+	}
+
 	// WebSockets are out of scope (ADR-0002), and an upgraded connection
 	// would carry bytes TrustedCourier never inspects. The server declines
 	// an h2c offer, as curl --http2 sends, by answering in HTTP/1.1, so the
@@ -94,29 +108,29 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		r.Header.Del("Http2-Settings")
 	}
 	if r.Header.Get("Upgrade") != "" {
+		refuse("protocol upgrade")
 		writeError(w, http.StatusBadRequest, "Proxy Delivery does not support protocol upgrades")
 		return
 	}
 	rest, ok := forwardedPath(r.URL.EscapedPath())
 	if !ok {
+		refuse("the path contains a dot segment")
 		writeError(w, http.StatusBadRequest, "the path must not contain dot segments")
 		return
 	}
-	name, upName := r.PathValue("secret_name"), r.PathValue("upstream")
-	log := s.log.With("delivery", config.DeliveryProxy, "agent_token_id", tok.ID, "secret_name", name, "upstream", upName)
 
 	reason, allowed := s.access.Authorize(tok, name, config.DeliveryProxy)
-	rt := s.routes[routeKey{name, upName}]
 	if allowed && rt == nil {
 		reason, allowed = "unknown Upstream", false
 	}
 	if !allowed {
-		log.Info("Delivery denied", "reason", reason)
+		refuse(string(reason))
 		writeError(w, http.StatusForbidden, deniedMessage)
 		return
 	}
+	rec.Decision = audit.Allowed
 
-	value, ok := s.resolve(w, r, log, name)
+	value, ok := s.resolve(w, r, log, rec, name)
 	if !ok {
 		return
 	}
@@ -124,6 +138,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	value.Release()
 	if err != nil {
 		log.Error("Delivery failed: the Secret cannot go in the Injection Template's header", "error", err)
+		rec.Failure = "the Secret cannot go in the Injection Template's header"
 		writeError(w, http.StatusBadGateway, "the Secret could not be delivered")
 		return
 	}
@@ -166,12 +181,19 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case idle.Load():
 					log.Error("Delivery cut off: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
+					rec.Failure = "the Upstream sent nothing in time"
+				case r.Context().Err() != nil && s.stopping.Load():
+					log.Warn("Delivery cut off by server shutdown")
+					rec.Failure = "cut off by server shutdown"
 				case r.Context().Err() != nil:
 					log.Info("Delivery abandoned by the Agent")
+					rec.Failure = "abandoned by the Agent"
 				case pw.writeErr() != nil:
 					log.Error("Delivery cut off: the response could not be written to the Agent", "error", pw.writeErr())
+					rec.Failure = "the response could not be written to the Agent"
 				default:
 					log.Error("Delivery cut off: the Upstream's response broke off")
+					rec.Failure = "the Upstream's response broke off"
 				}
 			}
 			panic(p)
@@ -203,6 +225,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		// Redirects reach the Agent as they are: the transport never follows
 		// them, so the Secret is never sent to another host.
 		ModifyResponse: func(res *http.Response) error {
+			rec.UpstreamStatus = res.StatusCode
 			if err := decodeBody(res); err != nil {
 				return err
 			}
@@ -212,19 +235,28 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if errors.Is(err, errUnreadableEncoding) {
 				log.Error("Delivery failed: Redaction cannot read the Upstream's response", "error", err)
+				rec.Failure = "Redaction cannot read the Upstream's response"
 				writeError(w, http.StatusBadGateway, "the Upstream's response could not be delivered")
 				return
 			}
 			if idle.Load() {
 				log.Error("Delivery failed: the Upstream sent nothing in time", "timeout", proxyIdleTimeout)
+				rec.Failure = "the Upstream sent nothing in time"
 				writeError(w, http.StatusGatewayTimeout, "the Upstream did not respond in time")
+				return
+			}
+			if r.Context().Err() != nil && s.stopping.Load() {
+				log.Warn("Delivery cut off by server shutdown", "error", err)
+				rec.Failure = "cut off by server shutdown"
 				return
 			}
 			if r.Context().Err() != nil {
 				log.Info("Delivery abandoned by the Agent", "error", err)
+				rec.Failure = "abandoned by the Agent"
 				return
 			}
 			log.Error("Delivery failed: Upstream not reached", "error", err)
+			rec.Failure = "the Upstream could not be reached"
 			writeError(w, http.StatusBadGateway, "the Upstream could not be reached")
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),

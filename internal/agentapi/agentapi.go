@@ -13,9 +13,12 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
+	"github.com/potto007/TrustedCourier/internal/audit"
 	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/httpserve"
 	"github.com/potto007/TrustedCourier/internal/resolver"
@@ -49,15 +52,23 @@ func Listen(addr string) (net.Listener, error) {
 type Server struct {
 	access  *access.Service
 	secrets *resolver.Resolver
+	audit   *audit.Log
 	log     *slog.Logger
 	routes  map[routeKey]*route
 	slots   map[string][]config.HeaderTemplate
+
+	// inflight is read-locked by every request, so Serve can wait for the
+	// ones shutdown cut off to write their Audit Records.
+	inflight sync.RWMutex
+	// stopping is set once the server has begun shutting down.
+	stopping atomic.Bool
 }
 
 // NewServer returns an Agent API server that authenticates Agents with svc,
-// fetches Secrets through secrets, and proxies to the Upstreams in cfg.
-func NewServer(svc *access.Service, secrets *resolver.Resolver, cfg *config.Config, log *slog.Logger) *Server {
-	return &Server{access: svc, secrets: secrets, log: log, routes: newRoutes(cfg), slots: newSlots(cfg)}
+// fetches Secrets through secrets, records every Delivery attempt in
+// auditLog, and proxies to the Upstreams in cfg.
+func NewServer(svc *access.Service, secrets *resolver.Resolver, auditLog *audit.Log, cfg *config.Config, log *slog.Logger) *Server {
+	return &Server{access: svc, secrets: secrets, audit: auditLog, log: log, routes: newRoutes(cfg), slots: newSlots(cfg)}
 }
 
 // Serve serves the Agent API on ln until ctx is done.
@@ -71,9 +82,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
+	handler := noStore(mux)
 	srv := &http.Server{
-		Protocols:         protocols,
-		Handler:           noStore(mux),
+		Protocols: protocols,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s.inflight.RLock()
+			defer s.inflight.RUnlock()
+			handler.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		// A client that stops reading must not pin a Secret's locked memory.
 		WriteTimeout:   30 * time.Second,
@@ -81,7 +97,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		MaxHeaderBytes: 64 << 10,
 		ErrorLog:       slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 	}
-	return httpserve.Serve(ctx, srv, ln)
+	stop := context.AfterFunc(ctx, func() { s.stopping.Store(true) })
+	defer stop()
+	err := httpserve.Serve(ctx, srv, ln)
+	// Every Delivery attempt still gets its Audit Record, even when shutdown
+	// cut it off.
+	s.inflight.Lock()
+	return err
 }
 
 // noStore keeps every Agent API response, Secret or not, out of caches.
@@ -107,14 +129,18 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("secret_name")
 	log := s.log.With("delivery", config.DeliveryReveal, "agent_token_id", tok.ID, "secret_name", name)
+	rec := &audit.Record{AgentTokenID: tok.ID, SecretName: name, Delivery: config.DeliveryReveal}
+	defer s.record(r, log, rec)
 
 	if reason, allowed := s.access.Authorize(tok, name, config.DeliveryReveal); !allowed {
 		log.Info("Delivery denied", "reason", reason)
+		rec.Decision, rec.Reason = audit.Denied, string(reason)
 		writeError(w, http.StatusForbidden, deniedMessage)
 		return
 	}
+	rec.Decision = audit.Allowed
 
-	value, ok := s.resolve(w, r, log, name)
+	value, ok := s.resolve(w, r, log, rec, name)
 	if !ok {
 		return
 	}
@@ -124,22 +150,34 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if _, err := value.WriteTo(w); err != nil {
 		log.Warn("Delivery interrupted", "error", err)
+		rec.Failure = "the Secret could not be written to the Agent"
 		return
 	}
 	log.Info("Delivery allowed")
 }
 
-// resolve fetches the Secret for name. Otherwise it writes the error and
-// reports false. The caller must Release the Secret.
-func (s *Server) resolve(w http.ResponseWriter, r *http.Request, log *slog.Logger, name string) (*secret.Secret, bool) {
+// record appends the Audit Record for a Delivery attempt once it has ended.
+// The Agent may be gone by then, so its request's cancellation does not stop
+// the write.
+func (s *Server) record(r *http.Request, log *slog.Logger, rec *audit.Record) {
+	if err := s.audit.Append(context.WithoutCancel(r.Context()), *rec); err != nil {
+		log.Error("Audit Record failed", "error", err)
+	}
+}
+
+// resolve fetches the Secret for name. Otherwise it writes the error, notes
+// the failure in rec, and reports false. The caller must Release the Secret.
+func (s *Server) resolve(w http.ResponseWriter, r *http.Request, log *slog.Logger, rec *audit.Record, name string) (*secret.Secret, bool) {
 	value, err := s.secrets.Resolve(r.Context(), name)
 	switch {
 	case errors.Is(err, secret.ErrLockedMemory):
 		log.Error("Delivery failed: no locked memory to hold the Secret; raise RLIMIT_MEMLOCK", "error", err)
+		rec.Failure = "no locked memory to hold the Secret"
 		writeError(w, http.StatusServiceUnavailable, "the Secret cannot be held safely right now; try again later")
 		return nil, false
 	case err != nil:
 		log.Error("Delivery failed: Secret not fetched", "error", err)
+		rec.Failure = "the Secret could not be fetched"
 		writeError(w, http.StatusBadGateway, "the Secret could not be fetched")
 		return nil, false
 	}

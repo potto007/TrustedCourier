@@ -13,6 +13,8 @@ import (
 const shutdownTimeout = 5 * time.Second
 
 // Serve serves srv on ln until ctx is done, then shuts srv down gracefully.
+// Connections still active after shutdownTimeout are closed. Their handlers
+// may still be running when Serve returns.
 func Serve(ctx context.Context, srv *http.Server, ln net.Listener) error {
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -23,7 +25,11 @@ func Serve(ctx context.Context, srv *http.Server, ln net.Listener) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return err
+			if !errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			// A long stream must not hold the process up.
+			_ = srv.Close()
 		}
 		if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
 			return err

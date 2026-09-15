@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
+	"github.com/potto007/TrustedCourier/internal/audit"
 	"github.com/potto007/TrustedCourier/internal/httpserve"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
 )
@@ -91,14 +92,15 @@ func removeStaleSocket(socket string) error {
 type Server struct {
 	access      *access.Service
 	plugins     *pluginhost.Host
+	audit       *audit.Log
 	allowedUIDs []int
 	log         *slog.Logger
 }
 
 // NewServer returns an admin API server that admits connections from
 // allowedUIDs presenting the Operator Credential.
-func NewServer(svc *access.Service, plugins *pluginhost.Host, allowedUIDs []int, log *slog.Logger) *Server {
-	return &Server{access: svc, plugins: plugins, allowedUIDs: allowedUIDs, log: log}
+func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, allowedUIDs []int, log *slog.Logger) *Server {
+	return &Server{access: svc, plugins: plugins, audit: auditLog, allowedUIDs: allowedUIDs, log: log}
 }
 
 // Serve serves the admin API on ln until ctx is done.
@@ -108,6 +110,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	mux.HandleFunc("POST /v1/agent-tokens", s.issueAgentToken)
 	mux.HandleFunc("DELETE /v1/agent-tokens/{id}", s.revokeAgentToken)
 	mux.HandleFunc("GET /v1/status", s.status)
+	mux.HandleFunc("POST /v1/audit/verify", s.verifyAudit)
 
 	srv := &http.Server{
 		Handler:           s.requirePeer(s.requireOperator(mux)),
@@ -230,6 +233,20 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 			Capabilities: p.Capabilities,
 			Restarts:     p.Restarts,
 		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) verifyAudit(w http.ResponseWriter, r *http.Request) {
+	v, err := s.audit.Verify(r.Context())
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	out := AuditVerification{Intact: v.Break == nil, Records: v.Records}
+	if v.Break != nil {
+		out.Break = &AuditBreak{Seq: v.Break.Seq, Problem: v.Break.Problem}
+		s.log.Warn("audit chain broken", "seq", v.Break.Seq, "problem", v.Break.Problem)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

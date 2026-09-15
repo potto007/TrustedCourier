@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +25,8 @@ import (
 	"testing"
 	"text/template"
 	"time"
+
+	_ "modernc.org/sqlite" // registers the "sqlite" driver for TamperDatabase
 )
 
 var tcBinary string
@@ -508,6 +512,30 @@ func (s *Server) AgentURL() string {
 	}
 }
 
+// AuditRecords waits until the server has streamed at least n Audit Records
+// and returns every one streamed so far, one JSON object per element. The
+// stream is the complete stdout lines holding a JSON object; the Operator
+// Credential banner is not one.
+func (s *Server) AuditRecords(n int) []string {
+	s.in.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var records []string
+		for line := range strings.Lines(s.Stdout()) {
+			if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "\n") {
+				records = append(records, strings.TrimSuffix(line, "\n"))
+			}
+		}
+		if len(records) >= n {
+			return records
+		}
+		if time.Now().After(deadline) {
+			s.in.t.Fatalf("the server streamed %d Audit Records, want %d\nstdout:\n%s\nstderr:\n%s", len(records), n, s.Stdout(), s.Stderr())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // Stdout returns everything the server wrote to stdout so far.
 func (s *Server) Stdout() string { return readFile(s.stdout) }
 
@@ -560,6 +588,21 @@ func (in *Installation) TC(env []string, args ...string) Result {
 		res.Stderr += "\nharness: race detected in the tc CLI"
 	}
 	return res
+}
+
+// TamperDatabase runs statement against the installation's SQLite database
+// directly, as anyone with write access to the data directory could.
+func (in *Installation) TamperDatabase(statement string) {
+	in.t.Helper()
+	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(in.DataDir, "trustedcourier.db"), RawQuery: "_pragma=busy_timeout(5000)"}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		in.t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(statement); err != nil {
+		in.t.Fatalf("tamper with the database: %v", err)
+	}
 }
 
 // FilesContain reports whether any file under the installation's data
