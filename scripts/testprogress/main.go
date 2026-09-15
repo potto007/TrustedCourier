@@ -1,7 +1,8 @@
 // Command testprogress runs a `go test -json` command, writes its readable
 // output to a log, and reports progress beside it for the work-band UI plugin:
 // one JSON line per update in <log>.progress.jsonl, and DONE or FAILED as the
-// log's last line. It exits with the command's exit code.
+// log's last line. It lists the tests first, so the band can show how many
+// are left. It exits with the command's exit code.
 //
 //	go run ./scripts/testprogress -log /tmp/e2e.log -label "TrustedCourier e2e" -- go test -race -json ./...
 package main
@@ -29,6 +30,7 @@ func main() {
 		os.Exit(2)
 	}
 
+	total := countTests(flag.Args())
 	cmd := exec.Command(flag.Arg(0), flag.Args()[1:]...)
 	pr, pw := io.Pipe()
 	cmd.Stdout, cmd.Stderr = pw, pw
@@ -43,7 +45,7 @@ func main() {
 		done <- err
 	}()
 
-	err := run(pr, func() error { return <-done }, *logPath, *label)
+	err := run(pr, func() error { return <-done }, *logPath, *label, total)
 	var exit *exec.ExitError
 	switch {
 	case errors.As(err, &exit) && exit.ExitCode() > 0:
@@ -52,6 +54,41 @@ func main() {
 		fmt.Fprintln(os.Stderr, "testprogress:", err)
 		os.Exit(1)
 	}
+}
+
+// countTests returns how many top-level tests a `go test` command line will
+// run, by listing them with -list first, or 0 when that is not known: the
+// command is not go test, or listing failed, as on a build error the run
+// itself will report. The list compiles the test binaries, which the run
+// then reuses from the build cache.
+func countTests(args []string) int {
+	if len(args) < 2 || args[0] != "go" || args[1] != "test" {
+		return 0
+	}
+	list := make([]string, 0, len(args)+2)
+	for _, a := range args {
+		// -json would wrap each name in an output event.
+		if a != "-json" {
+			list = append(list, a)
+		}
+	}
+	out, err := exec.Command(list[0], append(list[1:], "-list", "^Test")...).Output()
+	if err != nil {
+		return 0
+	}
+	return countListed(string(out))
+}
+
+// countListed counts the test names in `go test -list '^Test'` output, which
+// also holds an ok or ? line per package.
+func countListed(out string) int {
+	n := 0
+	for line := range strings.Lines(out) {
+		if strings.HasPrefix(line, "Test") {
+			n++
+		}
+	}
+	return n
 }
 
 // event is one line of `go test -json` output.
@@ -70,6 +107,7 @@ type progress struct {
 	Phase   string `json:"phase"`
 	Label   string `json:"label,omitempty"`
 	Done    int    `json:"done"`
+	Total   int    `json:"total,omitempty"`
 	Pass    int    `json:"pass"`
 	Fail    int    `json:"fail"`
 	Skip    int    `json:"skip"`
@@ -85,9 +123,10 @@ const appendInterval = time.Second
 // FAILED by what wait returns. Only top-level tests are counted. A package
 // that fails to build, or fails without a failing test (e.g. TestMain exit,
 // panic, timeout), counts as one failure. Lines that are not events, such as
-// go's own stderr, go to the log as they are. It returns wait's error joined
-// with any write error.
-func run(events io.Reader, wait func() error, logPath, label string) error {
+// go's own stderr, go to the log as they are. total, when not 0, is how many
+// top-level tests the run holds. It returns wait's error joined with any
+// write error.
+func run(events io.Reader, wait func() error, logPath, label string, total int) error {
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return err
@@ -102,7 +141,7 @@ func run(events io.Reader, wait func() error, logPath, label string) error {
 	var (
 		writeErr   error
 		endsLine   = true
-		p          = progress{V: 1, Phase: "test", Label: label}
+		p          = progress{V: 1, Phase: "test", Label: label, Total: total}
 		now, last  time.Time
 		appended   bool
 		pending    bool

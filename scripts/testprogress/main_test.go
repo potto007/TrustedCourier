@@ -66,7 +66,7 @@ func TestRunWritesTheLogProgressAndFailedSentinel(t *testing.T) {
 	log := start(t)
 	failure := errors.New("exit status 1")
 
-	if err := run(strings.NewReader(events), func() error { return failure }, log, "TrustedCourier e2e"); !errors.Is(err, failure) {
+	if err := run(strings.NewReader(events), func() error { return failure }, log, "TrustedCourier e2e", 0); !errors.Is(err, failure) {
 		t.Fatalf("run = %v, want the command's error", err)
 	}
 
@@ -115,13 +115,44 @@ func TestRunWritesTheLogProgressAndFailedSentinel(t *testing.T) {
 	}
 }
 
+func TestRunReportsTheTotalWhenKnown(t *testing.T) {
+	log := start(t)
+	if err := run(strings.NewReader(events), func() error { return nil }, log, "", 12); err != nil {
+		t.Fatalf("run = %v", err)
+	}
+	for _, l := range readLines(t, log+".progress.jsonl") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("progress line %q: %v", l, err)
+		}
+		if m["total"] != 12.0 {
+			t.Fatalf("progress line %q, want total 12", l)
+		}
+	}
+}
+
+func TestCountListedCountsTopLevelTests(t *testing.T) {
+	// `go test -list '^Test'` prints each package's test names and then its
+	// ok line; a package without tests prints a ? line.
+	const listed = `TestA
+TestB
+ok  	example.com/m/p1	0.002s
+?   	example.com/m/p2	[no test files]
+TestC
+ok  	example.com/m/p3	0.001s
+`
+	if got := countListed(listed); got != 3 {
+		t.Fatalf("countListed = %d, want 3", got)
+	}
+}
+
 func TestRunEndsTheLogWithDoneWhenTheCommandSucceeds(t *testing.T) {
 	log := start(t)
 	const passing = `{"Time":"2026-09-15T10:00:00Z","Action":"run","Package":"example.com/m/p1","Test":"TestA"}
 {"Time":"2026-09-15T10:00:00.1Z","Action":"output","Package":"example.com/m/p1","Test":"TestA","Output":"ok\n"}
 {"Time":"2026-09-15T10:00:00.2Z","Action":"pass","Package":"example.com/m/p1","Test":"TestA"}
 `
-	if err := run(strings.NewReader(passing), func() error { return nil }, log, ""); err != nil {
+	if err := run(strings.NewReader(passing), func() error { return nil }, log, "", 0); err != nil {
 		t.Fatalf("run = %v", err)
 	}
 	if got, want := readLines(t, log), []string{"ok", "DONE"}; !reflect.DeepEqual(got, want) {
