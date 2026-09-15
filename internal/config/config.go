@@ -63,6 +63,12 @@ type SecretName struct {
 	InjectionTemplate *InjectionTemplate
 	// Upstreams are the Upstreams the Secret is pinned to, by name.
 	Upstreams map[string]Upstream
+	// Preset names the Preset that supplied InjectionTemplate, and Upstreams
+	// unless the Operator set them. Empty without one.
+	Preset string
+	// Env are the environment variables an Agent needs to use the Secret Name
+	// through Proxy Delivery. Nil exactly when Upstreams is empty.
+	Env []EnvVar
 }
 
 // InjectionTemplate is where Proxy Delivery puts a Secret in a request, and
@@ -101,7 +107,8 @@ type HeaderTemplate struct {
 	Suffix string
 }
 
-// SecretPlaceholder marks where the Secret goes in a header template.
+// SecretPlaceholder marks where the Secret goes in a header or basic auth
+// template.
 const SecretPlaceholder = "{secret}"
 
 // Upstream is one Upstream a Secret Name is pinned to.
@@ -176,6 +183,7 @@ type fileAgentAPI struct {
 type fileSecretName struct {
 	Backend           string                  `yaml:"backend"`
 	Location          string                  `yaml:"location"`
+	Preset            string                  `yaml:"preset"`
 	InjectionTemplate *fileInjectionTemplate  `yaml:"injection_template"`
 	Upstreams         map[string]fileUpstream `yaml:"upstreams"`
 }
@@ -357,11 +365,34 @@ func (s fileSecretName) validate(name, baseDir string, plugins map[string]Backen
 	}
 	out := SecretName{Name: name, Backend: s.Backend, Location: s.Location}
 
+	if s.Preset != "" {
+		presets, err := builtinPresets()
+		if err != nil {
+			return SecretName{}, err
+		}
+		p, ok := presets[s.Preset]
+		switch {
+		case !ok:
+			return SecretName{}, fmt.Errorf("Secret Name %q: unknown preset %q; use one of %s", name, s.Preset, strings.Join(slices.Sorted(maps.Keys(presets)), ", "))
+		case s.InjectionTemplate != nil:
+			return SecretName{}, fmt.Errorf("Secret Name %q: set preset or injection_template, not both", name)
+		}
+		out.Preset, out.InjectionTemplate, out.Upstreams, out.Env = s.Preset, &p.template, p.upstreams, p.env
+		// Upstreams set beside a Preset replace its own, as for a GitHub
+		// Enterprise Server.
+		if len(s.Upstreams) > 0 {
+			if out.Upstreams, err = validateUpstreams(s.Upstreams, baseDir); err != nil {
+				return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
+			}
+		}
+		return out, nil
+	}
+
 	switch {
 	case s.InjectionTemplate == nil && len(s.Upstreams) == 0:
 		return out, nil
 	case s.InjectionTemplate == nil:
-		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template is required with upstreams", name)
+		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template is required with upstreams, unless preset is set", name)
 	case len(s.Upstreams) == 0:
 		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template needs upstreams to deliver to", name)
 	}
@@ -370,13 +401,21 @@ func (s fileSecretName) validate(name, baseDir string, plugins map[string]Backen
 		return SecretName{}, fmt.Errorf("Secret Name %q: injection_template: %w", name, err)
 	}
 	out.InjectionTemplate = &tmpl
-	out.Upstreams = make(map[string]Upstream, len(s.Upstreams))
-	for _, upName := range slices.Sorted(maps.Keys(s.Upstreams)) {
-		up, err := s.Upstreams[upName].validate(upName, baseDir)
+	if out.Upstreams, err = validateUpstreams(s.Upstreams, baseDir); err != nil {
+		return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
+	}
+	out.Env = defaultEnv(name, tmpl)
+	return out, nil
+}
+
+func validateUpstreams(raw map[string]fileUpstream, baseDir string) (map[string]Upstream, error) {
+	out := make(map[string]Upstream, len(raw))
+	for _, name := range slices.Sorted(maps.Keys(raw)) {
+		up, err := raw[name].validate(name, baseDir)
 		if err != nil {
-			return SecretName{}, fmt.Errorf("Secret Name %q: %w", name, err)
+			return nil, err
 		}
-		out.Upstreams[upName] = up
+		out[name] = up
 	}
 	return out, nil
 }

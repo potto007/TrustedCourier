@@ -1,0 +1,43 @@
+# Built-in Presets. Each is an Injection Template and Upstream pin for a
+# well-known service, in the same form as a Secret Name's, plus the
+# environment variables tc env prints for an Agent's SDK. Adding a Preset is
+# adding an entry here.
+#
+# env maps a variable name to what it holds: base_url (the Proxy Delivery
+# route), agent_token, or for basic auth the literal username or password.
+
+anthropic:
+  injection_template:
+    header:
+      name: X-Api-Key
+      value: "{secret}"
+  upstreams:
+    api:
+      url: https://api.anthropic.com
+  env:
+    ANTHROPIC_BASE_URL: base_url
+    ANTHROPIC_API_KEY: agent_token
+
+github:
+  injection_template:
+    header:
+      name: Authorization
+      value: token {secret}
+  upstreams:
+    api:
+      url: https://api.github.com
+  env:
+    GITHUB_API_URL: base_url
+    GITHUB_TOKEN: agent_token
+
+openai:
+  injection_template:
+    header:
+      name: Authorization
+      value: Bearer {secret}
+  upstreams:
+    api:
+      url: https://api.openai.com/v1
+  env:
+    OPENAI_BASE_URL: base_url
+    OPENAI_API_KEY: agent_token
