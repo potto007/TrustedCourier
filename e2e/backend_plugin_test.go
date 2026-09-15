@@ -66,7 +66,7 @@ func running(p pluginStatus) bool { return p.State == "running" && p.PID > 0 }
 
 func TestStatusReportsBackendPluginHealthAndCapabilities(t *testing.T) {
 	tc := harness.New(t)
-	srv := tc.Start(harness.PluginConfig)
+	srv := tc.Start(harness.BaseConfig)
 
 	p := waitForPlugin(t, srv, "fake", running)
 	if !p.Healthy || !strings.Contains(p.Detail, "fake Backend") {
@@ -89,7 +89,7 @@ func TestStatusReportsBackendPluginHealthAndCapabilities(t *testing.T) {
 
 func TestStatusRequiresOperatorCredential(t *testing.T) {
 	tc := harness.New(t)
-	tc.Start(harness.PluginConfig)
+	tc.Start(harness.BaseConfig)
 
 	res := tc.TC(nil, "status")
 	if res.ExitCode == 0 || !strings.Contains(res.Stderr, "Operator Credential") {
@@ -109,7 +109,7 @@ func TestPluginSHA256PrintsConfigLine(t *testing.T) {
 	}
 
 	// The printed line is what the config takes.
-	srv := tc.Start(fmt.Sprintf(harness.BaseConfig+`
+	srv := tc.Start(fmt.Sprintf(harness.AdminConfig+`
 backend_plugins:
   fake:
     path: {{.Fake.Path}}
@@ -126,7 +126,7 @@ backend_plugins:
 
 func TestBackendPluginWithMismatchedHashIsRefused(t *testing.T) {
 	tc := harness.New(t)
-	config := strings.Replace(harness.PluginConfig, "{{.Fake.SHA256}}", "{{.Crashing.SHA256}}", 1)
+	config := strings.Replace(harness.BaseConfig, "{{.Fake.SHA256}}", "{{.Crashing.SHA256}}", 1)
 
 	code, stderr := tc.Refused(config)
 	if code == 0 {
@@ -146,7 +146,7 @@ func TestReplacedBackendPluginIsNotRelaunched(t *testing.T) {
 	tc := harness.New(t)
 	dir := t.TempDir()
 	path := tc.InstallPlugin(harness.FakePlugin, dir, 0o755)
-	srv := tc.Start(strings.Replace(harness.PluginConfig, "{{.Fake.Path}}", path, 1))
+	srv := tc.Start(strings.Replace(harness.BaseConfig, "{{.Fake.Path}}", path, 1))
 	first := waitForPlugin(t, srv, "fake", running)
 
 	tc.ReplacePlugin(path, harness.ReplacementPlugin)
@@ -167,7 +167,7 @@ func TestReplacedBackendPluginIsNotRelaunched(t *testing.T) {
 
 func TestCrashedBackendPluginIsRestarted(t *testing.T) {
 	tc := harness.New(t)
-	srv := tc.Start(harness.PluginConfig)
+	srv := tc.Start(harness.BaseConfig)
 	first := waitForPlugin(t, srv, "fake", running)
 
 	if err := syscall.Kill(first.PID, syscall.SIGKILL); err != nil {
@@ -187,7 +187,7 @@ func TestCrashedBackendPluginIsRestarted(t *testing.T) {
 
 func TestCrashingBackendPluginDoesNotAffectOthers(t *testing.T) {
 	tc := harness.New(t)
-	srv := tc.Start(harness.PluginConfig + `
+	srv := tc.Start(harness.BaseConfig + `
   crashing:
     path: {{.Crashing.Path}}
     sha256: {{.Crashing.SHA256}}
@@ -209,7 +209,7 @@ func TestCrashingBackendPluginDoesNotAffectOthers(t *testing.T) {
 
 func TestMalformedBackendPluginResponsesAreErrors(t *testing.T) {
 	tc := harness.New(t)
-	srv := tc.Start(harness.BaseConfig + `
+	srv := tc.Start(harness.AdminConfig + `
 backend_plugins:
   malformed:
     path: {{.Malformed.Path}}
@@ -245,7 +245,7 @@ backend_plugins:
 
 func TestUnhealthyBackendPluginKeepsItsDetail(t *testing.T) {
 	tc := harness.New(t)
-	srv := tc.Start(harness.BaseConfig + `
+	srv := tc.Start(harness.AdminConfig + `
 backend_plugins:
   unhealthy:
     path: {{.Unhealthy.Path}}
@@ -272,7 +272,7 @@ func waitFor(t *testing.T, ok func() bool) {
 
 func TestBackendPluginsStopWithServer(t *testing.T) {
 	tc := harness.New(t)
-	srv := tc.Start(harness.PluginConfig)
+	srv := tc.Start(harness.BaseConfig)
 	pid := waitForPlugin(t, srv, "fake", running).PID
 
 	srv.Stop()
@@ -302,29 +302,29 @@ backend_plugins:
 	}{
 		{
 			name:    "no user",
-			config:  harness.BaseConfig + plugin,
+			config:  harness.AdminConfig + plugin,
 			wantErr: `Backend Plugin "fake": user is required`,
 		},
 		{
 			name:    "server's own user",
-			config:  harness.BaseConfig + plugin + "    user: \"{{.UID}}\"\n",
+			config:  harness.AdminConfig + plugin + "    user: \"{{.UID}}\"\n",
 			wantErr: "insecure_share_core_user",
 		},
 		{
 			name:       "config readable by the plugin user",
-			config:     harness.BaseConfig + plugin + "    user: nobody\n",
+			config:     harness.AdminConfig + plugin + "    user: nobody\n",
 			configMode: 0o644,
 			wantErr:    "readable",
 		},
 		{
 			name:    "other user without root",
-			config:  harness.BaseConfig + plugin + "    user: nobody\n",
+			config:  harness.AdminConfig + plugin + "    user: nobody\n",
 			wantErr: "root",
 			skip:    os.Geteuid() == 0,
 		},
 		{
 			name:    "unknown user",
-			config:  harness.BaseConfig + plugin + "    user: tc-no-such-user\n",
+			config:  harness.AdminConfig + plugin + "    user: tc-no-such-user\n",
 			wantErr: "tc-no-such-user",
 		},
 	}
@@ -365,7 +365,7 @@ func TestBackendPluginRunsAsSeparateUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := tc.InstallPlugin(harness.FakePlugin, dir, 0o755)
-	srv := tc.Start(harness.BaseConfig + `
+	srv := tc.Start(harness.AdminConfig + `
 backend_plugins:
   fake:
     path: ` + path + `
@@ -401,7 +401,7 @@ func TestPluginConfigIsValidated(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			tc := harness.New(t)
-			code, stderr := tc.Refused(harness.BaseConfig + "backend_plugins:\n  fake:\n" + c.plugin)
+			code, stderr := tc.Refused(harness.AdminConfig + "backend_plugins:\n  fake:\n" + c.plugin)
 			if code == 0 {
 				t.Fatal("TrustedCourier started")
 			}
@@ -412,7 +412,7 @@ func TestPluginConfigIsValidated(t *testing.T) {
 	}
 	t.Run("invalid name", func(t *testing.T) {
 		tc := harness.New(t)
-		code, stderr := tc.Refused(harness.BaseConfig + `
+		code, stderr := tc.Refused(harness.AdminConfig + `
 backend_plugins:
   "bad name":
     path: {{.Fake.Path}}
@@ -428,7 +428,7 @@ backend_plugins:
 func TestUppercaseSHA256IsAccepted(t *testing.T) {
 	tc := harness.New(t)
 	sum := sha256.Sum256(mustRead(t, harness.FakePlugin.Path))
-	srv := tc.Start(strings.Replace(harness.PluginConfig, "{{.Fake.SHA256}}", fmt.Sprintf("%X", sum), 1))
+	srv := tc.Start(strings.Replace(harness.BaseConfig, "{{.Fake.SHA256}}", fmt.Sprintf("%X", sum), 1))
 	waitForPlugin(t, srv, "fake", running)
 }
 

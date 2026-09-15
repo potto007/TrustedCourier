@@ -57,18 +57,29 @@ An Agent can ask for a Secret by Secret Name over plain HTTP on loopback, and ge
 
 You need Go 1.26.5 or newer, on Linux or macOS. The admin socket reads the connecting user's credentials from the kernel, and on other platforms it refuses every connection.
 
-Build the CLI:
+Build the CLI, and the fake Backend Plugin the tests use. It stands in until the OpenBao Backend Plugin lands ([#18](https://github.com/potto007/TrustedCourier/issues/18)) and holds made-up Secrets at `kv/openai` and `kv/github`.
 
 ```sh
 go build -o tc ./cmd/tc
+go -C sdk/plugin build -o ../../fakebackend ./internal/fakebackend
+./tc plugin sha256 fakebackend
 ```
 
-Write a config file, say `trustedcourier.yaml`:
+Write a config file, say `trustedcourier.yaml`, with the hash `tc` printed:
 
 ```yaml
 data_dir: ./data
 admin:
   socket: /run/user/1000/trustedcourier/admin.sock
+backend_plugins:
+  fake:
+    path: ./fakebackend
+    sha256: <the hash tc printed>
+    insecure_share_core_user: true
+secrets:
+  openai:
+    backend: fake
+    location: kv/openai
 policies:
   openai-proxy:
     secrets:
@@ -233,7 +244,7 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `secrets.<name>.location` | yes | The Secret's location in that Backend, up to 1024 bytes without control characters. |
 | `agent_api.listen` | no | Loopback IP address and port for the Agent API, such as `127.0.0.1:8200` or `[::1]:8200`. Omit it to serve no Agent API. |
 
-Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, and can list each only once.
+Policy names, Backend Plugin names, and Secret Names are 1 to 64 characters of letters, digits, `.`, `_`, and `-`, starting with a letter or digit. A Policy must list at least one Secret Name, can list each only once, and may list only Secret Names defined under `secrets`. A typo there stops the server at startup instead of denying Agents at runtime.
 
 Two things trip people up with the admin socket. The default `/run/trustedcourier/` usually needs root to create, so for a non-root server pick a path you own, such as one under `$XDG_RUNTIME_DIR`. And unix socket paths are limited to about 104 to 108 bytes depending on the OS, so a deeply nested path fails with `bind: invalid argument`.
 

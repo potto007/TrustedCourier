@@ -12,22 +12,24 @@ import (
 	"github.com/potto007/TrustedCourier/e2e/harness"
 )
 
-// revealConfig serves the Agent API on loopback with Secret Names backed by
-// the fake Backend Plugin. github-reveal allows Reveal Delivery of github;
-// openai-proxy allows only Proxy Delivery of openai.
-const revealConfig = harness.PluginConfig + `
+// revealConfig serves the Agent API on loopback over BaseConfig, whose
+// github-reveal Policy allows Reveal Delivery of github and whose
+// openai-proxy Policy allows only Proxy Delivery of openai. It adds the Secret
+// Name unlisted, which no Policy lists.
+var revealConfig = strings.Replace(harness.BaseConfig, "\nsecrets:\n",
+	"\nsecrets:\n  unlisted:\n    backend: fake\n    location: kv/openai\n", 1) + `
 agent_api:
   listen: 127.0.0.1:0
-secrets:
-  openai:
-    backend: fake
-    location: kv/openai
-  github:
-    backend: fake
-    location: kv/github
-  unlisted:
-    backend: fake
-    location: kv/openai
+`
+
+// fakePluginConfig declares only the fake Backend Plugin, for configs built
+// on AdminConfig.
+const fakePluginConfig = `
+backend_plugins:
+  fake:
+    path: {{.Fake.Path}}
+    sha256: {{.Fake.SHA256}}
+    insecure_share_core_user: true
 `
 
 type agentResponse struct {
@@ -151,7 +153,7 @@ func TestSecretNameConfigIsValidated(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			tc := harness.New(t)
-			code, stderr := tc.Refused(harness.PluginConfig + c.config)
+			code, stderr := tc.Refused(harness.AdminConfig + fakePluginConfig + c.config)
 			if code == 0 {
 				t.Fatal("TrustedCourier started")
 			}

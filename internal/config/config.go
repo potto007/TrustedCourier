@@ -217,6 +217,15 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 		}
 		cfg.Secrets[name] = s
 	}
+	// A Policy entry naming an undefined Secret Name is a typo or a
+	// half-finished change; refuse it rather than deny Agents at runtime.
+	for _, name := range slices.Sorted(maps.Keys(cfg.Policies)) {
+		for _, a := range cfg.Policies[name].Secrets {
+			if _, ok := cfg.Secrets[a.SecretName]; !ok {
+				return nil, fmt.Errorf("Policy %q names Secret Name %q, which is not defined under secrets", name, a.SecretName)
+			}
+		}
+	}
 	if raw.AgentAPI.Listen != "" {
 		if err := checkLoopback(raw.AgentAPI.Listen); err != nil {
 			return nil, err

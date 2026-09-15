@@ -171,16 +171,6 @@ type ConfigVars struct {
 	Malformed PluginBinary
 }
 
-// PluginConfig is BaseConfig plus the well-behaved fake Backend Plugin,
-// named fake, sharing the server's OS user.
-const PluginConfig = BaseConfig + `
-backend_plugins:
-  fake:
-    path: {{.Fake.Path}}
-    sha256: {{.Fake.SHA256}}
-    insecure_share_core_user: true
-`
-
 // InstallPlugin copies bin into dir with the given mode and returns its path,
 // so a test can later replace it.
 func (in *Installation) InstallPlugin(bin PluginBinary, dir string, mode os.FileMode) string {
@@ -241,11 +231,19 @@ func (in *Installation) copyFile(from, to string, mode os.FileMode) {
 // Dir is the installation's private directory, holding the config file.
 func (in *Installation) Dir() string { return in.dir }
 
-// BaseConfig is a minimal valid config with two Policies.
-const BaseConfig = `
+// AdminConfig is the smallest valid config: a data directory and the admin
+// socket, with no Policies, Secret Names, or Backend Plugins.
+const AdminConfig = `
 data_dir: {{.DataDir}}
 admin:
   socket: {{.Socket}}
+`
+
+// BaseConfig is AdminConfig plus two Policies, the Secret Names they grant,
+// and the well-behaved fake Backend Plugin, named fake, sharing the server's
+// OS user. It ends inside backend_plugins, so a test can append more Backend
+// Plugins, or top-level keys.
+const BaseConfig = AdminConfig + `
 policies:
   openai-proxy:
     secrets:
@@ -255,6 +253,18 @@ policies:
     secrets:
       - name: github
         delivery: [proxy, reveal]
+secrets:
+  openai:
+    backend: fake
+    location: kv/openai
+  github:
+    backend: fake
+    location: kv/github
+backend_plugins:
+  fake:
+    path: {{.Fake.Path}}
+    sha256: {{.Fake.SHA256}}
+    insecure_share_core_user: true
 `
 
 func (in *Installation) writeConfig(tmpl string) string {

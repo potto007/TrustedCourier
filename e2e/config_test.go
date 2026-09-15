@@ -142,6 +142,17 @@ policies:
 `,
 			wantErr: `invalid Policy name "bad name"`,
 		},
+		{
+			name: "Policy names an undefined Secret Name",
+			config: header + `
+policies:
+  p:
+    secrets:
+      - name: openai
+        delivery: [reveal]
+`,
+			wantErr: `Policy "p" names Secret Name "openai", which is not defined under secrets`,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
