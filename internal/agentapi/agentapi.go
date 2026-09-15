@@ -82,7 +82,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
-	handler := noStore(mux)
+	handler := noStore(s.requireSigningKey(mux))
 	srv := &http.Server{
 		Protocols: protocols,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +111,19 @@ func noStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireSigningKey refuses every request until the audit signing key is
+// loaded, before any Agent Token is checked, so no Delivery goes unsigned.
+func (s *Server) requireSigningKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.audit.Ready() {
+			w.Header().Set("Retry-After", "5")
+			writeError(w, http.StatusServiceUnavailable, "TrustedCourier is not serving Deliveries yet: the audit signing key is not loaded")
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }

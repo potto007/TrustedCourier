@@ -30,9 +30,10 @@ func startTemplates(t *testing.T, secretNames, policies string) (*harness.Instal
 	tc := harness.New(t)
 	path := tc.InstallPlugin(harness.FakePlugin, t.TempDir(), 0o755)
 	tc.SetBackendSecrets(path, map[string]string{
-		"kv/openai": "test-value-1",
-		"kv/github": "test-value-2",
-		"kv/query":  querySecret,
+		"kv/openai":                     "test-value-1",
+		"kv/github":                     "test-value-2",
+		"kv/query":                      querySecret,
+		harness.AuditSigningKeyLocation: harness.AuditSigningKey,
 	})
 	config := strings.Replace(withSecretNames(proxyConfig, secretNames, policies), "{{.Fake.Path}}", path, 1)
 	srv := tc.Start(config)
@@ -144,7 +145,8 @@ func TestQueryInjectionTemplateKeepsTheSecretOutOfTheLog(t *testing.T) {
 	tc := harness.New(t)
 	secretNames := strings.Replace(querySecretNames, "ca_bundle: {{.Upstream.CABundle}}", "ca_bundle: "+foreignCA(t, t.TempDir()), 1)
 	path := tc.InstallPlugin(harness.FakePlugin, t.TempDir(), 0o755)
-	tc.SetBackendSecrets(path, map[string]string{"kv/openai": "test-value-1", "kv/github": "test-value-2", "kv/query": querySecret})
+	tc.SetBackendSecrets(path, map[string]string{"kv/openai": "test-value-1", "kv/github": "test-value-2", "kv/query": querySecret,
+		harness.AuditSigningKeyLocation: harness.AuditSigningKey})
 	srv := tc.Start(strings.Replace(withSecretNames(proxyConfig, secretNames, queryPolicies), "{{.Fake.Path}}", path, 1))
 	waitForPlugin(t, srv, "fake", running)
 	token := issueAgentToken(t, srv, "weather-proxy", "1h").Token

@@ -15,6 +15,7 @@ import (
 	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
 	"github.com/potto007/TrustedCourier/internal/resolver"
+	"github.com/potto007/TrustedCourier/internal/secret"
 	"github.com/potto007/TrustedCourier/internal/store"
 )
 
@@ -39,7 +40,10 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	defer func() { _ = db.Close() }()
 	// Audit Records stream to stdout, which carries nothing else once the
 	// Operator Credential has been shown.
-	auditLog, err := audit.Open(ctx, db, stdout)
+	auditLog, err := audit.Open(ctx, db, stdout, audit.Checkpoints{
+		Records:  cfg.Audit.CheckpointRecords,
+		Interval: cfg.Audit.CheckpointInterval,
+	}, log)
 	if err != nil {
 		return fmt.Errorf("audit: %w", err)
 	}
@@ -76,6 +80,19 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	}()
 	plugins.Start(pluginCtx)
 
+	// The Agent API refuses Deliveries until the audit signing key is loaded.
+	// Once both APIs have drained, the last records are signed before the
+	// database closes.
+	secrets := resolver.New(cfg, plugins)
+	if key := cfg.Audit.SigningKey; key != nil {
+		auditLog.Start(func(ctx context.Context) (*secret.Secret, error) { return secrets.CourierKey(ctx, *key) })
+	}
+	defer func() {
+		if err := auditLog.Close(); err != nil {
+			log.Error("final audit checkpoint failed", "error", err)
+		}
+	}()
+
 	// When either API stops, stop the other.
 	serveCtx, stopServing := context.WithCancel(ctx)
 	defer stopServing()
@@ -91,7 +108,7 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
 	if agentLn != nil {
 		serving++
-		agent := agentapi.NewServer(svc, resolver.New(cfg, plugins), auditLog, cfg, log)
+		agent := agentapi.NewServer(svc, secrets, auditLog, cfg, log)
 		go func() { errc <- agent.Serve(serveCtx, agentLn) }()
 		log.Info("Agent API listening", "address", agentLn.Addr().String())
 	}

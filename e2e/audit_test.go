@@ -183,9 +183,10 @@ func TestEveryDeliveryAttemptProducesOneAuditRecord(t *testing.T) {
 }
 
 type auditVerification struct {
-	Intact  bool `json:"intact"`
-	Records int  `json:"records"`
-	Break   *struct {
+	Intact      bool `json:"intact"`
+	Records     int  `json:"records"`
+	Checkpoints int  `json:"checkpoints"`
+	Break       *struct {
 		Seq     int    `json:"seq"`
 		Problem string `json:"problem"`
 	} `json:"break"`

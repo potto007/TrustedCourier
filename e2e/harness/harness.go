@@ -6,9 +6,12 @@ package harness
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -146,7 +149,27 @@ type Installation struct {
 // FakeSecretValues are the values the fake Backend Plugin holds at start,
 // mirroring sdk/plugin/internal/fakebackend. None may appear in
 // TrustedCourier's output.
-var FakeSecretValues = []string{"test-value-1", "test-value-2", "test-value-3"}
+var FakeSecretValues = []string{"test-value-1", "test-value-2", "test-value-3", AuditSigningKey}
+
+// AuditSigningKeyLocation is where the fake Backend Plugin holds
+// AuditSigningKey.
+const AuditSigningKeyLocation = "courier/audit-signing-key"
+
+// AuditSigningKey is the test-only Ed25519 audit signing key the fake Backend
+// Plugin holds, as PKCS #8 PEM, and AuditSigningPublicKey its public key.
+var AuditSigningKey, AuditSigningPublicKey = fakeAuditSigningKey()
+
+// fakeAuditSigningKey mirrors the derivation in
+// sdk/plugin/internal/fakebackend.
+func fakeAuditSigningKey() (string, ed25519.PublicKey) {
+	seed := sha256.Sum256([]byte("TrustedCourier fake audit signing key"))
+	private := ed25519.NewKeyFromSeed(seed[:])
+	der, err := x509.MarshalPKCS8PrivateKey(private)
+	if err != nil {
+		panic(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})), private.Public().(ed25519.PublicKey)
+}
 
 // New creates an empty installation cleaned up when the test ends.
 func New(t *testing.T) *Installation {
@@ -494,19 +517,35 @@ func (s *Server) checkOutput() {
 	})
 }
 
-var agentAPIAddress = regexp.MustCompile(`msg="Agent API listening" address=(\S+)`)
+var (
+	agentAPIAddress = regexp.MustCompile(`msg="Agent API listening" address=(\S+)`)
+	signingKeyReady = regexp.MustCompile(`msg="audit signing key loaded"`)
+)
 
-// AgentURL waits for the server to log the Agent API's address and returns
-// its base URL, such as http://127.0.0.1:41234.
+// AgentURL waits for the server to log the Agent API's address and to load
+// the audit signing key, so it serves Deliveries, and returns the Agent API's
+// base URL, such as http://127.0.0.1:41234.
 func (s *Server) AgentURL() string {
+	s.in.t.Helper()
+	return s.agentURL(true)
+}
+
+// ListeningAgentURL is AgentURL without waiting for the audit signing key.
+func (s *Server) ListeningAgentURL() string {
+	s.in.t.Helper()
+	return s.agentURL(false)
+}
+
+func (s *Server) agentURL(ready bool) string {
 	s.in.t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		if m := agentAPIAddress.FindStringSubmatch(s.Stderr()); m != nil {
+		stderr := s.Stderr()
+		if m := agentAPIAddress.FindStringSubmatch(stderr); m != nil && (!ready || signingKeyReady.MatchString(stderr)) {
 			return "http://" + m[1]
 		}
 		if time.Now().After(deadline) {
-			s.in.t.Fatalf("the Agent API never started listening; stderr:\n%s", s.Stderr())
+			s.in.t.Fatalf("the Agent API never started serving Deliveries; stderr:\n%s", stderr)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -602,6 +641,32 @@ func (in *Installation) TamperDatabase(statement string) {
 	defer func() { _ = db.Close() }()
 	if _, err := db.Exec(statement); err != nil {
 		in.t.Fatalf("tamper with the database: %v", err)
+	}
+}
+
+// QueryDatabase runs query against the installation's SQLite database
+// directly, as anyone with read access to the data directory could, and calls
+// scan for each row.
+func (in *Installation) QueryDatabase(query string, scan func(*sql.Rows) error) {
+	in.t.Helper()
+	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(in.DataDir, "trustedcourier.db"), RawQuery: "_pragma=busy_timeout(5000)"}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		in.t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.Query(query)
+	if err != nil {
+		in.t.Fatalf("query the database: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			in.t.Fatalf("read a database row: %v", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		in.t.Fatalf("query the database: %v", err)
 	}
 }
 

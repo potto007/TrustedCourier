@@ -31,3 +31,9 @@ func (r *Resolver) Resolve(ctx context.Context, secretName string) (*secret.Secr
 	}
 	return r.plugins.Get(ctx, s.Backend, s.Location)
 }
+
+// CourierKey fetches the Courier Key at key. The caller must Release it and
+// never deliver it to an Agent.
+func (r *Resolver) CourierKey(ctx context.Context, key config.CourierKey) (*secret.Secret, error) {
+	return r.plugins.Get(ctx, key.Backend, key.Location)
+}

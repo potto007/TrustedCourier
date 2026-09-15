@@ -58,7 +58,7 @@ secrets:
 ).Replace(harness.BaseConfig) + `
 agent_api:
   listen: 127.0.0.1:0
-`
+` + auditConfig
 
 // proxy sends method to path on the Agent API with header and body.
 func proxy(t *testing.T, srv *harness.Server, method, path string, header http.Header, body string) agentResponse {

@@ -230,6 +230,7 @@ func (s *Server) revokeAgentToken(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	out := Status{BackendPlugins: []BackendPluginStatus{}}
+	out.AuditSigningKey.Loaded, out.AuditSigningKey.Detail = s.audit.KeyStatus()
 	for _, p := range s.plugins.Status(r.Context()) {
 		out.BackendPlugins = append(out.BackendPlugins, BackendPluginStatus{
 			Name:         p.Name,
@@ -246,11 +247,15 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) verifyAudit(w http.ResponseWriter, r *http.Request) {
 	v, err := s.audit.Verify(r.Context())
-	if err != nil {
+	switch {
+	case errors.Is(err, audit.ErrNoSigningKey):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	case err != nil:
 		s.internalError(w, err)
 		return
 	}
-	out := AuditVerification{Intact: v.Break == nil, Records: v.Records}
+	out := AuditVerification{Intact: v.Break == nil, Records: v.Records, Checkpoints: v.Checkpoints}
 	if v.Break != nil {
 		out.Break = &AuditBreak{Seq: v.Break.Seq, Problem: v.Break.Problem}
 		s.log.Warn("audit chain broken", "seq", v.Break.Seq, "problem", v.Break.Problem)

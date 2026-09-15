@@ -40,7 +40,16 @@ type IssuedAgentToken struct {
 
 // Status is the server's operational state.
 type Status struct {
-	BackendPlugins []BackendPluginStatus `json:"backend_plugins"`
+	BackendPlugins  []BackendPluginStatus `json:"backend_plugins"`
+	AuditSigningKey AuditSigningKeyStatus `json:"audit_signing_key"`
+}
+
+// AuditSigningKeyStatus is whether the audit signing key is loaded. The Agent
+// API refuses Deliveries until it is.
+type AuditSigningKeyStatus struct {
+	Loaded bool `json:"loaded"`
+	// Detail is why the key is not loaded, or empty when it is.
+	Detail string `json:"detail"`
 }
 
 // BackendPluginStatus is one Backend Plugin's state.
@@ -61,8 +70,11 @@ type BackendPluginStatus struct {
 type AuditVerification struct {
 	Intact bool `json:"intact"`
 	// Records is how many Audit Records were found intact before the first
-	// break, or in all when there is none.
+	// break, or in all when there is none. After a break in the signed
+	// checkpoints, it counts only the records the last good checkpoint covers.
 	Records int64 `json:"records"`
+	// Checkpoints is how many signed checkpoints verified.
+	Checkpoints int64 `json:"checkpoints"`
 	// Break is the first break in the chain, or null when it is intact.
 	Break *AuditBreak `json:"break"`
 }
