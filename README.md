@@ -349,7 +349,7 @@ Issue an Agent Token with that Policy, and the Agent asks for the Secret by name
 curl -H "Authorization: Bearer tcat_..." http://127.0.0.1:8200/v1/reveal/github
 ```
 
-The body is the Secret, byte for byte, with `Cache-Control: no-store`. TrustedCourier fetches it from the Backend on every request. The Agent sees only the Secret Name, never the Backend or location.
+The body is the Secret, byte for byte, with `Cache-Control: no-store`. TrustedCourier fetches it from the Backend on every request, unless the Secret Name sets `cache_ttl`. The Agent sees only the Secret Name, never the Backend or location.
 
 | Status | When |
 | --- | --- |
@@ -464,6 +464,7 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `secrets` | no | Map of Secret Name to where its Secret lives. |
 | `secrets.<name>.backend` | yes | The `backend_plugins` entry that holds the Secret. |
 | `secrets.<name>.location` | yes | The Secret's location in that Backend, up to 1024 bytes without control characters. |
+| `secrets.<name>.cache_ttl` | no | Keep the Secret in locked memory and deliver it without calling the Backend for this long after each fetch, as a Go duration from `1s` to `1h`. Omit it to fetch on every Delivery. |
 | `secrets.<name>.preset` | no | A built-in Preset (`openai`, `anthropic`, `github`) supplying the Injection Template and Upstreams. Not with `injection_template`. `upstreams` beside it replace the Preset's. |
 | `secrets.<name>.injection_template` | with `upstreams`, unless `preset` | Exactly one of `header`, `query`, and `basic_auth`. |
 | `secrets.<name>.injection_template.query.name` | for `query` | The query parameter the Secret goes in: up to 64 letters, digits, `.`, `_`, `~`, and `-`. |
@@ -508,6 +509,7 @@ Policies, Secret Names, Upstreams, Injection Templates, and Presets take effect 
 - Every plugin response is checked against the protocol contract (size limits, valid UTF-8, no control characters) before the server uses it, and plugin error text and log output are sanitized.
 - A plugin that crashes is restarted with exponential backoff, from 250 ms to 30 s. It never takes the server down.
 - In the core, a Secret lives in `mlock`ed memory outside the Go heap, is wiped when the response is written, and prints as a placeholder if formatted or logged. A Delivery fails rather than hold a Secret in memory that could be swapped. The e2e harness fails any test whose server output, the audit stream included, contains a Secret value.
+- Caching is off unless a Secret Name sets `cache_ttl`, at most an hour. A cached Secret stays in locked memory, never on disk, and is wiped when its TTL ends, when a reload moves the Secret Name or turns its cache off, and at shutdown. Until then it is delivered even if rotated or revoked in its Backend ([ADR-0022](docs/decisions/0022-secret-cache-per-secret-name.md)).
 - Audit Records are hash-chained, so `tc audit verify` detects a record deleted or altered in SQLite ([ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md)).
 - The chain head is signed with an Ed25519 audit signing key held in locked memory and never on disk, so a chain rebuilt with fresh hashes fails verification. No Delivery is served until the key is loaded ([ADR-0019](docs/decisions/0019-signed-audit-checkpoints.md)), nor while Audit Records cannot be stored ([ADR-0020](docs/decisions/0020-deliveries-stop-while-audit-records-cannot-be-stored.md)).
 
