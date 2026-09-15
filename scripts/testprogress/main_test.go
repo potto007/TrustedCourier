@@ -66,7 +66,7 @@ func TestRunWritesTheLogProgressAndFailedSentinel(t *testing.T) {
 	log := start(t)
 	failure := errors.New("exit status 1")
 
-	if err := run(strings.NewReader(events), func() error { return failure }, log, "TrustedCourier e2e", 0); !errors.Is(err, failure) {
+	if err := run(strings.NewReader(events), func() error { return failure }, log, "TrustedCourier e2e", func() int { return 0 }); !errors.Is(err, failure) {
 		t.Fatalf("run = %v, want the command's error", err)
 	}
 
@@ -117,7 +117,17 @@ func TestRunWritesTheLogProgressAndFailedSentinel(t *testing.T) {
 
 func TestRunReportsTheTotalWhenKnown(t *testing.T) {
 	log := start(t)
-	if err := run(strings.NewReader(events), func() error { return nil }, log, "", 12); err != nil {
+	// Counting the tests takes seconds, and the band reads the log meanwhile,
+	// so the previous run's DONE must be gone before the count starts.
+	count := func() int {
+		for _, path := range []string{log, log + ".progress.jsonl"} {
+			if lines := readLines(t, path); len(lines) != 0 {
+				t.Errorf("%s still holds %q when the tests are counted", filepath.Base(path), lines)
+			}
+		}
+		return 12
+	}
+	if err := run(strings.NewReader(events), func() error { return nil }, log, "", count); err != nil {
 		t.Fatalf("run = %v", err)
 	}
 	for _, l := range readLines(t, log+".progress.jsonl") {
@@ -152,7 +162,7 @@ func TestRunEndsTheLogWithDoneWhenTheCommandSucceeds(t *testing.T) {
 {"Time":"2026-09-15T10:00:00.1Z","Action":"output","Package":"example.com/m/p1","Test":"TestA","Output":"ok\n"}
 {"Time":"2026-09-15T10:00:00.2Z","Action":"pass","Package":"example.com/m/p1","Test":"TestA"}
 `
-	if err := run(strings.NewReader(passing), func() error { return nil }, log, "", 0); err != nil {
+	if err := run(strings.NewReader(passing), func() error { return nil }, log, "", func() int { return 0 }); err != nil {
 		t.Fatalf("run = %v", err)
 	}
 	if got, want := readLines(t, log), []string{"ok", "DONE"}; !reflect.DeepEqual(got, want) {
