@@ -67,6 +67,14 @@ func (c *Client) VerifyAudit(ctx context.Context) (AuditVerification, error) {
 	return v, err
 }
 
+// ReloadConfig reloads the server's config file. On error the running config
+// stays in effect.
+func (c *Client) ReloadConfig(ctx context.Context) (ConfigReload, error) {
+	var reloaded ConfigReload
+	err := c.do(ctx, http.MethodPost, "/v1/config/reload", nil, &reloaded)
+	return reloaded, err
+}
+
 // SecretNameEnv returns the environment an Agent needs to use secretName
 // through Proxy Delivery to upstream, which may be empty when the Secret Name
 // has only one Upstream.

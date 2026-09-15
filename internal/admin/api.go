@@ -113,6 +113,14 @@ type EnvVar struct {
 	Value string `json:"value"`
 }
 
+// ConfigReload is the config a reload put in effect.
+type ConfigReload struct {
+	// Path is the config file the server reloaded.
+	Path        string `json:"path"`
+	Policies    int    `json:"policies"`
+	SecretNames int    `json:"secret_names"`
+}
+
 type errorResponse struct {
 	Error string `json:"error"`
 }

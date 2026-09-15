@@ -54,8 +54,12 @@ type Server struct {
 	secrets *resolver.Resolver
 	audit   *audit.Log
 	log     *slog.Logger
-	routes  map[routeKey]*route
-	slots   slots
+	cfg     *config.Running
+
+	// snapshotMu serializes rebuilding snapshot after a reload.
+	snapshotMu sync.Mutex
+	// snapshot is what the running config snapshot serves, built from it.
+	snapshot atomic.Pointer[snapshot]
 
 	// inflight is read-locked by every request, so Serve can wait for the
 	// ones shutdown cut off to write their Audit Records.
@@ -66,9 +70,43 @@ type Server struct {
 
 // NewServer returns an Agent API server that authenticates Agents with svc,
 // fetches Secrets through secrets, records every Delivery attempt in
-// auditLog, and proxies to the Upstreams in cfg.
-func NewServer(svc *access.Service, secrets *resolver.Resolver, auditLog *audit.Log, cfg *config.Config, log *slog.Logger) *Server {
-	return &Server{access: svc, secrets: secrets, audit: auditLog, log: log, routes: newRoutes(cfg), slots: newSlots(cfg)}
+// auditLog, and authorizes and proxies as the running config says.
+func NewServer(svc *access.Service, secrets *resolver.Resolver, auditLog *audit.Log, cfg *config.Running, log *slog.Logger) *Server {
+	s := &Server{access: svc, secrets: secrets, audit: auditLog, log: log, cfg: cfg}
+	snap := cfg.Snapshot()
+	s.snapshot.Store(&snapshot{cfg: snap, routes: newRoutes(snap, nil), slots: newSlots(snap)})
+	return s
+}
+
+// snapshot is one config snapshot and the routes and credential slots built
+// from it. A request takes one and uses only it, so a reload never mixes two
+// configs in one Delivery.
+type snapshot struct {
+	cfg    *config.Config
+	routes map[routeKey]*route
+	slots  slots
+}
+
+// currentSnapshot returns the snapshot for the running config, building it
+// the first time a request sees a reloaded config.
+func (s *Server) currentSnapshot() *snapshot {
+	cfg := s.cfg.Snapshot()
+	if snap := s.snapshot.Load(); snap.cfg == cfg {
+		return snap
+	}
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	// Read the running config again: a slower request must not replace a
+	// newer snapshot with its older one.
+	cfg = s.cfg.Snapshot()
+	old := s.snapshot.Load()
+	if old.cfg == cfg {
+		return old
+	}
+	snap := &snapshot{cfg: cfg, routes: newRoutes(cfg, old.routes), slots: newSlots(cfg)}
+	s.snapshot.Store(snap)
+	closeUnused(old.routes, snap.routes)
+	return snap
 }
 
 // Serve serves the Agent API on ln until ctx is done.
@@ -141,12 +179,13 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	snap := s.currentSnapshot()
 	name := r.PathValue("secret_name")
 	log := s.log.With("delivery", config.DeliveryReveal, "agent_token_id", tok.ID, "secret_name", name)
 	rec := &audit.Record{AgentTokenID: tok.ID, SecretName: name, Delivery: config.DeliveryReveal}
 	defer s.record(r, log, rec)
 
-	if reason, allowed := s.access.Authorize(tok, name, config.DeliveryReveal); !allowed {
+	if reason, allowed := access.Authorize(snap.cfg, tok, name, config.DeliveryReveal); !allowed {
 		log.Info("Delivery denied", "reason", reason)
 		rec.Decision, rec.Reason = audit.Denied, string(reason)
 		writeError(w, http.StatusForbidden, deniedMessage)
@@ -154,7 +193,7 @@ func (s *Server) reveal(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.Decision = audit.Allowed
 
-	value, ok := s.resolve(w, r, log, rec, name)
+	value, ok := s.resolve(w, r, log, rec, snap.cfg, name)
 	if !ok {
 		return
 	}
@@ -179,10 +218,11 @@ func (s *Server) record(r *http.Request, log *slog.Logger, rec *audit.Record) {
 	}
 }
 
-// resolve fetches the Secret for name. Otherwise it writes the error, notes
-// the failure in rec, and reports false. The caller must Release the Secret.
-func (s *Server) resolve(w http.ResponseWriter, r *http.Request, log *slog.Logger, rec *audit.Record, name string) (*secret.Secret, bool) {
-	value, err := s.secrets.Resolve(r.Context(), name)
+// resolve fetches the Secret for name as the config snapshot cfg maps it.
+// Otherwise it writes the error, notes the failure in rec, and reports false.
+// The caller must Release the Secret.
+func (s *Server) resolve(w http.ResponseWriter, r *http.Request, log *slog.Logger, rec *audit.Record, cfg *config.Config, name string) (*secret.Secret, bool) {
+	value, err := s.secrets.Resolve(r.Context(), cfg, name)
 	switch {
 	case errors.Is(err, secret.ErrLockedMemory):
 		log.Error("Delivery failed: no locked memory to hold the Secret; raise RLIMIT_MEMLOCK", "error", err)

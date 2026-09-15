@@ -36,22 +36,31 @@ func pluginCredential(cfg *config.Config, pc config.BackendPlugin) (*credential,
 	if int(cred.Uid) == os.Geteuid() {
 		return nil, fmt.Errorf("user %q is the server's own user; a Backend Plugin must run as a separate OS user (insecure_share_core_user: true allows this for development only)", pc.User)
 	}
-	readable, err := readableBy(cfg.Path, cred)
-	if err != nil {
+	if err := checkSeparation(cfg, cred, pc.User); err != nil {
 		return nil, err
-	}
-	if readable {
-		return nil, fmt.Errorf("the config file %s is readable by user %q; restrict it, for example with chmod 600", cfg.Path, pc.User)
-	}
-	if owned, err := ownedBy(cfg.DataDir, cred.Uid); err != nil {
-		return nil, err
-	} else if owned {
-		return nil, fmt.Errorf("the data directory %s is owned by user %q", cfg.DataDir, pc.User)
 	}
 	if os.Geteuid() != 0 {
 		return nil, fmt.Errorf("running it as user %q requires TrustedCourier to run as root", pc.User)
 	}
 	return cred, nil
+}
+
+// checkSeparation checks that cred, the OS user named userName, can neither
+// read cfg's config file nor owns its data directory.
+func checkSeparation(cfg *config.Config, cred *credential, userName string) error {
+	readable, err := readableBy(cfg.Path, cred)
+	if err != nil {
+		return err
+	}
+	if readable {
+		return fmt.Errorf("the config file %s is readable by user %q; restrict it, for example with chmod 600", cfg.Path, userName)
+	}
+	if owned, err := ownedBy(cfg.DataDir, cred.Uid); err != nil {
+		return err
+	} else if owned {
+		return fmt.Errorf("the data directory %s is owned by user %q", cfg.DataDir, userName)
+	}
+	return nil
 }
 
 func lookupUser(name string) (*user.User, error) {

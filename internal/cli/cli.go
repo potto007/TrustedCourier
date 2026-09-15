@@ -30,6 +30,7 @@ const usage = `Usage:
   tc token list [--json]
   tc token revoke <id>
   tc env <secret-name> [--upstream <name>] [--json]
+  tc reload [--json]
   tc status [--json]
   tc audit verify [--json]
   tc plugin sha256 <path>
@@ -69,6 +70,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	if len(args) >= 1 && args[0] == "env" {
 		return env(args[1:], stdout)
+	}
+	if len(args) >= 1 && args[0] == "reload" {
+		return reload(args[1:], stdout)
 	}
 	if len(args) < 2 {
 		return fmt.Errorf("%w: missing command", errUsage)
@@ -340,6 +344,32 @@ func status(args []string, stdout io.Writer) error {
 	}
 	_, err = fmt.Fprintf(stdout, "Audit Records: %d waiting to be stored; Deliveries are refused (%s)\n",
 		st.AuditRecords.Pending, st.AuditRecords.Detail)
+	return err
+}
+
+// reload has the server reload its config file.
+func reload(args []string, stdout io.Writer) error {
+	fs := newFlagSet("reload")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%w: reload: unexpected argument %q", errUsage, fs.Arg(0))
+	}
+	client, err := adminClient()
+	if err != nil {
+		return err
+	}
+	reloaded, err := client.ReloadConfig(context.Background())
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(stdout, reloaded)
+	}
+	_, err = fmt.Fprintf(stdout, "Config reloaded from %s (Policies: %d, Secret Names: %d)\n",
+		reloaded.Path, reloaded.Policies, reloaded.SecretNames)
 	return err
 }
 

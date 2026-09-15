@@ -1,6 +1,6 @@
 // Package resolver is the Secret Resolver: it resolves a Secret Name through
-// the config to a Backend location and fetches the Secret through the Plugin
-// Host on every Delivery.
+// a config snapshot to a Backend location and fetches the Secret through the
+// Plugin Host on every Delivery.
 package resolver
 
 import (
@@ -14,18 +14,18 @@ import (
 
 // Resolver is the Secret Resolver.
 type Resolver struct {
-	cfg     *config.Config
 	plugins *pluginhost.Host
 }
 
-// New returns a Resolver over cfg's Secret Names that fetches through plugins.
-func New(cfg *config.Config, plugins *pluginhost.Host) *Resolver {
-	return &Resolver{cfg: cfg, plugins: plugins}
+// New returns a Resolver that fetches through plugins.
+func New(plugins *pluginhost.Host) *Resolver {
+	return &Resolver{plugins: plugins}
 }
 
-// Resolve fetches the Secret for secretName. The caller must Release it.
-func (r *Resolver) Resolve(ctx context.Context, secretName string) (*secret.Secret, error) {
-	s, ok := r.cfg.Secrets[secretName]
+// Resolve fetches the Secret for secretName as the config snapshot cfg maps
+// it. The caller must Release it.
+func (r *Resolver) Resolve(ctx context.Context, cfg *config.Config, secretName string) (*secret.Secret, error) {
+	s, ok := cfg.Secrets[secretName]
 	if !ok {
 		return nil, fmt.Errorf("unknown Secret Name %q", secretName)
 	}

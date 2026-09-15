@@ -104,6 +104,21 @@ func New(cfg *config.Config, stderr io.Writer, log *slog.Logger) (*Host, error) 
 	return h, nil
 }
 
+// CheckConfig checks, as New does, that no Backend Plugin's OS user can read
+// cfg's config file or owns its data directory, for a config reloaded while
+// the plugins run.
+func (h *Host) CheckConfig(cfg *config.Config) error {
+	for _, p := range h.plugins {
+		if p.cred == nil {
+			continue
+		}
+		if err := checkSeparation(cfg, p.cred, p.cfg.User); err != nil {
+			return fmt.Errorf("Backend Plugin %q: %w", p.cfg.Name, err)
+		}
+	}
+	return nil
+}
+
 // Start launches every Backend Plugin in the background. When ctx is done
 // the plugins are stopped; Wait returns once they have exited.
 func (h *Host) Start(ctx context.Context) {
