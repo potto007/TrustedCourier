@@ -80,6 +80,10 @@ type AgentAPI struct {
 	Listen string
 }
 
+// MaxCacheTTL is the longest a Secret Name may cache its Secret: the cache
+// trades plaintext lifetime for fewer Backend calls, so the trade stays short.
+const MaxCacheTTL = time.Hour
+
 // SecretName maps a Secret Name to where its Secret lives. Agents never see
 // the mapping.
 type SecretName struct {
@@ -88,6 +92,10 @@ type SecretName struct {
 	Backend string
 	// Location is the Secret's location in that Backend.
 	Location string
+	// CacheTTL is how long the Secret may be kept in memory and delivered
+	// without calling the Backend. Zero, the default, fetches on every
+	// Delivery.
+	CacheTTL time.Duration
 	// InjectionTemplate says where Proxy Delivery puts the Secret. Nil
 	// exactly when Upstreams is empty.
 	InjectionTemplate *InjectionTemplate
@@ -243,6 +251,7 @@ type fileAgentAPI struct {
 type fileSecretName struct {
 	Backend           string                  `yaml:"backend"`
 	Location          string                  `yaml:"location"`
+	CacheTTL          string                  `yaml:"cache_ttl"`
 	Preset            string                  `yaml:"preset"`
 	InjectionTemplate *fileInjectionTemplate  `yaml:"injection_template"`
 	Upstreams         map[string]fileUpstream `yaml:"upstreams"`
@@ -490,6 +499,16 @@ func (s fileSecretName) validate(name, baseDir string, plugins map[string]Backen
 		return SecretName{}, fmt.Errorf("Secret Name %q: unknown backend %q; name one of backend_plugins", name, s.Backend)
 	}
 	out := SecretName{Name: name, Backend: s.Backend, Location: s.Location}
+	if s.CacheTTL != "" {
+		d, err := time.ParseDuration(s.CacheTTL)
+		switch {
+		case err != nil:
+			return SecretName{}, fmt.Errorf("Secret Name %q: cache_ttl %q is not a duration such as 30s", name, s.CacheTTL)
+		case d < time.Second || d > MaxCacheTTL:
+			return SecretName{}, fmt.Errorf("Secret Name %q: cache_ttl %q must be from 1s to 1h; omit it to fetch the Secret on every Delivery", name, s.CacheTTL)
+		}
+		out.CacheTTL = d
+	}
 
 	if s.Preset != "" {
 		presets, err := builtinPresets()

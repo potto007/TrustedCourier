@@ -45,6 +45,25 @@ type locked struct {
 // hold the value in memory that could be swapped out.
 func New(value []byte) (*Secret, error) {
 	defer clear(value)
+	return newLocked(value)
+}
+
+// Clone copies the value into new locked memory, so releasing either Secret
+// leaves the other intact.
+func (s Secret) Clone() (*Secret, error) {
+	if s.p == nil {
+		return nil, ErrReleased
+	}
+	s.p.mu.Lock()
+	defer s.p.mu.Unlock()
+	if s.p.buf == nil {
+		return nil, ErrReleased
+	}
+	return newLocked(s.p.buf[:s.p.n])
+}
+
+// newLocked copies value into a new Secret's locked memory.
+func newLocked(value []byte) (*Secret, error) {
 	buf, err := allocate(max(len(value), 1))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrLockedMemory, err)

@@ -25,3 +25,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0019](0019-signed-audit-checkpoints.md) | Audit checkpoints sign the chain head in a linked binary message, and Deliveries wait for the key | accepted |
 | [0020](0020-deliveries-stop-while-audit-records-cannot-be-stored.md) | Deliveries stop while Audit Records cannot be stored (supersedes part of 0016) | accepted |
 | [0021](0021-config-reload-swaps-snapshots.md) | Config reload swaps whole snapshots and changes only access | accepted |
+| [0022](0022-secret-cache-per-secret-name.md) | The Secret cache is keyed by Secret Name, bounded to an hour, and hands out copies | accepted |
