@@ -30,7 +30,6 @@ func main() {
 		os.Exit(2)
 	}
 
-	total := countTests(flag.Args())
 	cmd := exec.Command(flag.Arg(0), flag.Args()[1:]...)
 	pr, pw := io.Pipe()
 	cmd.Stdout, cmd.Stderr = pw, pw
@@ -45,7 +44,8 @@ func main() {
 		done <- err
 	}()
 
-	err := run(pr, func() error { return <-done }, *logPath, *label, total)
+	args := flag.Args()
+	err := run(pr, func() error { return <-done }, *logPath, *label, func() int { return countTests(args) })
 	var exit *exec.ExitError
 	switch {
 	case errors.As(err, &exit) && exit.ExitCode() > 0:
@@ -123,10 +123,11 @@ const appendInterval = time.Second
 // FAILED by what wait returns. Only top-level tests are counted. A package
 // that fails to build, or fails without a failing test (e.g. TestMain exit,
 // panic, timeout), counts as one failure. Lines that are not events, such as
-// go's own stderr, go to the log as they are. total, when not 0, is how many
-// top-level tests the run holds. It returns wait's error joined with any
-// write error.
-func run(events io.Reader, wait func() error, logPath, label string, total int) error {
+// go's own stderr, go to the log as they are. count, called once the log and
+// sidecar are truncated, so the band never reads the previous run's sentinel
+// as this run's, reports how many top-level tests the run holds, or 0 when
+// that is not known. It returns wait's error joined with any write error.
+func run(events io.Reader, wait func() error, logPath, label string, count func() int) error {
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return err
@@ -137,6 +138,7 @@ func run(events io.Reader, wait func() error, logPath, label string, total int) 
 		return err
 	}
 	defer func() { _ = sidecar.Close() }()
+	total := count()
 
 	var (
 		writeErr   error
