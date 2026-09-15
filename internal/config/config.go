@@ -66,10 +66,18 @@ type SecretName struct {
 }
 
 // InjectionTemplate is where Proxy Delivery puts a Secret in a request, and
-// so where it finds the Agent Token.
+// so where it finds the Agent Token. Exactly one field is set.
 type InjectionTemplate struct {
-	// Header is the header the Secret goes in.
-	Header HeaderTemplate
+	// Header puts the Secret in a header.
+	Header *HeaderTemplate
+	// Query puts the Secret in a query parameter.
+	Query *QueryTemplate
+}
+
+// QueryTemplate puts the Secret in a query parameter, as its whole value.
+type QueryTemplate struct {
+	// Name is the query parameter's name, which never needs escaping.
+	Name string
 }
 
 // HeaderTemplate puts the Secret in a header as Prefix, the Secret, Suffix.
@@ -161,6 +169,11 @@ type fileSecretName struct {
 
 type fileInjectionTemplate struct {
 	Header *fileHeaderTemplate `yaml:"header"`
+	Query  *fileQueryTemplate  `yaml:"query"`
+}
+
+type fileQueryTemplate struct {
+	Name string `yaml:"name"`
 }
 
 type fileHeaderTemplate struct {
@@ -361,26 +374,61 @@ var reservedHeaders = []string{
 	"Transfer-Encoding", "Upgrade", "X-Tc-Agent-Token",
 }
 
+// templateKinds names the kinds of Injection Template, as the config spells
+// them.
+const templateKinds = "header, query"
+
 func (t fileInjectionTemplate) validate() (InjectionTemplate, error) {
-	if t.Header == nil {
-		return InjectionTemplate{}, errors.New("set header")
+	set := 0
+	for _, kind := range []bool{t.Header != nil, t.Query != nil} {
+		if kind {
+			set++
+		}
 	}
-	h := t.Header
+	switch {
+	case set == 0:
+		return InjectionTemplate{}, errors.New("set one of " + templateKinds)
+	case set > 1:
+		return InjectionTemplate{}, errors.New("set only one of " + templateKinds)
+	case t.Query != nil:
+		q, err := t.Query.validate()
+		return InjectionTemplate{Query: q}, err
+	}
+	h, err := t.Header.validate()
+	return InjectionTemplate{Header: h}, err
+}
+
+func (h fileHeaderTemplate) validate() (*HeaderTemplate, error) {
 	if !headerNamePattern.MatchString(h.Name) {
-		return InjectionTemplate{}, fmt.Errorf("invalid header name %q", h.Name)
+		return nil, fmt.Errorf("invalid header name %q", h.Name)
 	}
 	name := http.CanonicalHeaderKey(h.Name)
 	if slices.Contains(reservedHeaders, name) {
-		return InjectionTemplate{}, fmt.Errorf("header %q is reserved and cannot carry a Secret", h.Name)
+		return nil, fmt.Errorf("header %q is reserved and cannot carry a Secret", h.Name)
 	}
 	if strings.Count(h.Value, SecretPlaceholder) != 1 {
-		return InjectionTemplate{}, fmt.Errorf("header value must contain %s exactly once", SecretPlaceholder)
+		return nil, fmt.Errorf("header value must contain %s exactly once", SecretPlaceholder)
 	}
-	if strings.ContainsFunc(h.Value, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
-		return InjectionTemplate{}, errors.New("header value contains a control character")
+	if hasControl(h.Value) {
+		return nil, errors.New("header value contains a control character")
 	}
 	prefix, suffix, _ := strings.Cut(h.Value, SecretPlaceholder)
-	return InjectionTemplate{Header: HeaderTemplate{Name: name, Prefix: prefix, Suffix: suffix}}, nil
+	return &HeaderTemplate{Name: name, Prefix: prefix, Suffix: suffix}, nil
+}
+
+// queryNamePattern is a query parameter name made only of bytes a query never
+// escapes, so the name matches as the Agent sends it.
+var queryNamePattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,64}$`)
+
+func (q fileQueryTemplate) validate() (*QueryTemplate, error) {
+	if !queryNamePattern.MatchString(q.Name) {
+		return nil, fmt.Errorf("invalid query parameter name %q: use up to 64 letters, digits, '.', '_', '~' or '-'", q.Name)
+	}
+	return &QueryTemplate{Name: q.Name}, nil
+}
+
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
 }
 
 func (u fileUpstream) validate(name, baseDir string) (Upstream, error) {

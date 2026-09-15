@@ -29,7 +29,7 @@ import (
 // route is one Upstream of one Secret Name, served at
 // /proxy/{secret_name}/{upstream}/.
 type route struct {
-	template  config.HeaderTemplate
+	template  config.InjectionTemplate
 	upstream  config.Upstream
 	transport http.RoundTripper
 }
@@ -43,7 +43,7 @@ func newRoutes(cfg *config.Config) map[routeKey]*route {
 	for name, s := range cfg.Secrets {
 		for upName, up := range s.Upstreams {
 			routes[routeKey{name, upName}] = &route{
-				template:  s.InjectionTemplate.Header,
+				template:  *s.InjectionTemplate,
 				upstream:  up,
 				transport: newTransport(up),
 			}
@@ -69,20 +69,35 @@ func newTransport(up config.Upstream) *http.Transport {
 	}
 }
 
-// newSlots collects the credential slots every header Injection Template
-// defines, by canonical header name.
-func newSlots(cfg *config.Config) map[string][]config.HeaderTemplate {
-	slots := make(map[string][]config.HeaderTemplate)
+// slots are the credential slots every Injection Template defines.
+type slots struct {
+	// headers are the header templates, by canonical header name.
+	headers map[string][]config.HeaderTemplate
+	// queries are the query parameter names, sorted.
+	queries []string
+}
+
+// slot is where an Agent Token was presented: a header or a query parameter.
+type slot struct{ header, query string }
+
+func newSlots(cfg *config.Config) slots {
+	out := slots{headers: make(map[string][]config.HeaderTemplate)}
 	for _, name := range slices.Sorted(maps.Keys(cfg.Secrets)) {
-		if t := cfg.Secrets[name].InjectionTemplate; t != nil && !slices.Contains(slots[t.Header.Name], t.Header) {
-			slots[t.Header.Name] = append(slots[t.Header.Name], t.Header)
+		t := cfg.Secrets[name].InjectionTemplate
+		switch {
+		case t == nil:
+		case t.Header != nil && !slices.Contains(out.headers[t.Header.Name], *t.Header):
+			out.headers[t.Header.Name] = append(out.headers[t.Header.Name], *t.Header)
+		case t.Query != nil && !slices.Contains(out.queries, t.Query.Name):
+			out.queries = append(out.queries, t.Query.Name)
 		}
 	}
-	return slots
+	slices.Sort(out.queries)
+	return out
 }
 
 func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
-	tok, tokenHeader, ok := s.authenticateProxy(w, r)
+	tok, from, ok := s.authenticateProxy(w, r)
 	if !ok {
 		return
 	}
@@ -134,7 +149,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	header, err := headerValue(rt.template, value)
+	cred, err := render(rt.template, value)
 	value.Release()
 	if err != nil {
 		log.Error("Delivery failed: the Secret cannot go in the Injection Template's header", "error", err)
@@ -170,8 +185,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	// since on HTTP/2 an armed deadline resets the stream when it passes,
 	// even while no write is pending.
 	_ = rc.SetWriteDeadline(time.Time{})
-	// The Secret is the part of the header between the template's text.
-	rw := newRedactingWriter(w, header[len(rt.template.Prefix):len(header)-len(rt.template.Suffix)])
+	rw := newRedactingWriter(w, cred.needles)
 	pw := &progressWriter{ResponseWriter: rw, rc: rc, timer: timer}
 	defer func() {
 		// Once the response has started, ReverseProxy ends a Delivery it
@@ -212,8 +226,22 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 				pr.Out.Body = &progressReader{ReadCloser: pr.Out.Body, timer: timer}
 			}
 			pr.Out.Header.Del(AgentTokenHeader)
-			pr.Out.Header.Del(tokenHeader)
-			pr.Out.Header.Set(rt.template.Name, header)
+			if from.header != "" {
+				pr.Out.Header.Del(from.header)
+			}
+			if from.query != "" {
+				out.RawQuery = withoutParam(out.RawQuery, from.query)
+			}
+			if cred.header != "" {
+				pr.Out.Header.Set(cred.header, cred.headerValue)
+			}
+			if cred.query != "" {
+				q := withoutParam(out.RawQuery, cred.query)
+				if q != "" {
+					q += "&"
+				}
+				out.RawQuery = q + cred.query + "=" + cred.queryValue
+			}
 			// Redaction must see the whole response as plain bytes: the
 			// proxy asks for gzip and decodes it, and a range could carry
 			// the Secret in pieces.
@@ -358,13 +386,23 @@ func (p *progressWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter 
 // the trailers.
 type redactingWriter struct {
 	http.ResponseWriter
-	secret      string
+	// needles are every form of the Secret the request carried.
+	needles     []string
 	body        *redact.Writer
 	wroteHeader bool
 }
 
-func newRedactingWriter(w http.ResponseWriter, secret string) *redactingWriter {
-	return &redactingWriter{ResponseWriter: w, secret: secret, body: redact.NewWriter(w, secret)}
+func newRedactingWriter(w http.ResponseWriter, needles []string) *redactingWriter {
+	return &redactingWriter{ResponseWriter: w, needles: needles, body: redact.NewWriter(w, needles...)}
+}
+
+// namesSecret reports whether a header name contains any form of the Secret,
+// in any case.
+func (w *redactingWriter) namesSecret(name string) bool {
+	name = strings.ToLower(name)
+	return slices.ContainsFunc(w.needles, func(n string) bool {
+		return n != "" && strings.Contains(name, strings.ToLower(n))
+	})
 }
 
 // redactHeader masks the Secret in every header value and drops any header
@@ -372,25 +410,21 @@ func newRedactingWriter(w http.ResponseWriter, secret string) *redactingWriter {
 // matched in any case: Go canonicalizes them, and HTTP/2 lowercases them on
 // the wire. So are the names Trailer announces.
 func (w *redactingWriter) redactHeader() {
-	if w.secret == "" {
-		return
-	}
 	h := w.Header()
-	secret := strings.ToLower(w.secret)
 	for name, values := range h {
-		if strings.Contains(strings.ToLower(name), secret) {
+		if w.namesSecret(name) {
 			delete(h, name)
 			continue
 		}
 		for i, v := range values {
-			values[i] = redact.String(v, w.secret)
+			values[i] = redact.String(v, w.needles...)
 		}
 	}
 	if announced := h.Values("Trailer"); len(announced) > 0 {
 		var kept []string
 		for _, v := range announced {
 			for name := range strings.SplitSeq(v, ",") {
-				if name = strings.TrimSpace(name); name != "" && !strings.Contains(strings.ToLower(name), secret) {
+				if name = strings.TrimSpace(name); name != "" && !w.namesSecret(name) {
 					kept = append(kept, name)
 				}
 			}
@@ -508,18 +542,58 @@ func forwardedPath(escaped string) (string, bool) {
 	return "/" + rest, true
 }
 
-// headerValue renders the header Injection Template around value. net/http
-// takes header values only as strings, so this is where Proxy Delivery copies
-// the Secret out of locked memory (ADR-0013).
-func headerValue(t config.HeaderTemplate, value *secret.Secret) (string, error) {
+// credential is a Secret rendered by an Injection Template for one request.
+type credential struct {
+	// header and headerValue are set for a header template.
+	header, headerValue string
+	// query and queryValue, escaped, are set for a query template.
+	query, queryValue string
+	// needles are every form of the Secret the request carries, for
+	// Redaction. Each reads the rendered strings in place where it can.
+	needles []string
+}
+
+// render renders the Injection Template around value. net/http takes header
+// values and URLs only as strings, so this is where Proxy Delivery copies the
+// Secret out of locked memory (ADR-0013).
+func render(t config.InjectionTemplate, value *secret.Secret) (credential, error) {
 	var b strings.Builder
-	b.Grow(len(t.Prefix) + value.Len() + len(t.Suffix))
-	b.WriteString(t.Prefix)
-	if _, err := value.WriteTo(headerValueWriter{&b}); err != nil {
-		return "", err
+	if t.Query != nil {
+		b.Grow(value.Len())
+		if _, err := value.WriteTo(&b); err != nil {
+			return credential{}, err
+		}
+		raw := b.String()
+		// QueryEscape returns raw itself when nothing needs escaping.
+		escaped := url.QueryEscape(raw)
+		return credential{query: t.Query.Name, queryValue: escaped, needles: []string{raw, escaped}}, nil
 	}
-	b.WriteString(t.Suffix)
-	return b.String(), nil
+	h := t.Header
+	b.Grow(len(h.Prefix) + value.Len() + len(h.Suffix))
+	b.WriteString(h.Prefix)
+	if _, err := value.WriteTo(headerValueWriter{&b}); err != nil {
+		return credential{}, err
+	}
+	b.WriteString(h.Suffix)
+	v := b.String()
+	// The Secret is the part of the header between the template's text.
+	return credential{header: h.Name, headerValue: v, needles: []string{v[len(h.Prefix) : len(v)-len(h.Suffix)]}}, nil
+}
+
+// withoutParam returns the query rawQuery without its name parameters. The
+// other parameters keep their bytes and order.
+func withoutParam(rawQuery, name string) string {
+	var kept []string
+	for pair := range strings.SplitSeq(rawQuery, "&") {
+		key, _, _ := strings.Cut(pair, "=")
+		if k, err := url.QueryUnescape(key); err == nil {
+			key = k
+		}
+		if key != name {
+			kept = append(kept, pair)
+		}
+	}
+	return strings.Join(kept, "&")
 }
 
 var errHeaderControl = errors.New("the Secret contains a control character, which a header cannot carry")
@@ -543,26 +617,37 @@ func (w headerValueWriter) Write(p []byte) (int, error) {
 // which Secret Names exist from which slots were read. A slot counts only when
 // it holds something shaped like an Agent Token, so an SDK's placeholder API
 // key next to AgentTokenHeader is not a second token.
-func (s *Server) authenticateProxy(w http.ResponseWriter, r *http.Request) (access.AgentToken, string, bool) {
-	var presented, headers []string
-	for _, name := range slices.Sorted(maps.Keys(s.slots)) {
+func (s *Server) authenticateProxy(w http.ResponseWriter, r *http.Request) (access.AgentToken, slot, bool) {
+	var presented []string
+	var from []slot
+	for _, name := range slices.Sorted(maps.Keys(s.slots.headers)) {
 		for _, v := range r.Header.Values(name) {
-			for _, t := range s.slots[name] {
+			for _, t := range s.slots.headers[name] {
 				if tok, ok := extract(v, t); ok && strings.HasPrefix(tok, access.AgentTokenPrefix) {
-					presented, headers = append(presented, tok), append(headers, name)
+					presented, from = append(presented, tok), append(from, slot{header: name})
 					break
 				}
 			}
 		}
 	}
+	if len(s.slots.queries) > 0 {
+		query := r.URL.Query()
+		for _, name := range s.slots.queries {
+			for _, v := range query[name] {
+				if strings.HasPrefix(v, access.AgentTokenPrefix) {
+					presented, from = append(presented, v), append(from, slot{query: name})
+				}
+			}
+		}
+	}
 	for _, v := range r.Header.Values(AgentTokenHeader) {
-		presented, headers = append(presented, v), append(headers, AgentTokenHeader)
+		presented, from = append(presented, v), append(from, slot{header: AgentTokenHeader})
 	}
 	tok, ok := s.verifyAgentToken(w, r, presented)
 	if !ok {
-		return access.AgentToken{}, "", false
+		return access.AgentToken{}, slot{}, false
 	}
-	return tok, headers[0], true
+	return tok, from[0], true
 }
 
 // extract returns what sits where the Secret would in value under t. The
