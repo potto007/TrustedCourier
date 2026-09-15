@@ -34,7 +34,9 @@ info:
     identifier: Apache-2.0
 servers:
   - url: http://127.0.0.1:8200
-    description: The address in agent_api.listen.
+    description: A loopback address in agent_api.listen, serving plain HTTP.
+  - url: https://courier.example:8443
+    description: Any other address in agent_api.listen, serving TLS with the certificate in agent_api.tls.
 
 paths:
   /v1/reveal/{secret_name}:
