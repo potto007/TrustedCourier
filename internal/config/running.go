@@ -15,6 +15,16 @@ import (
 type Running struct {
 	mu      sync.Mutex // serializes Reload
 	current atomic.Pointer[Config]
+	// reloaded are called with each snapshot a reload puts in effect.
+	reloaded []func(*Config)
+}
+
+// OnReload calls f with every snapshot a later reload puts in effect, once it
+// is in effect. Reloads wait for f, so it must not reload.
+func (r *Running) OnReload(f func(*Config)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reloaded = append(r.reloaded, f)
 }
 
 // NewRunning returns a Running holding cfg.
@@ -49,6 +59,9 @@ func (r *Running) Reload(check func(*Config) error) (*Config, error) {
 		return nil, err
 	}
 	r.current.Store(cfg)
+	for _, f := range r.reloaded {
+		f(cfg)
+	}
 	return cfg, nil
 }
 

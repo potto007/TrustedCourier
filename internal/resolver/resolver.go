@@ -18,10 +18,13 @@ type Resolver struct {
 	cache   *cache
 }
 
-// New returns a Resolver that fetches through plugins. Close it to wipe the
-// Secrets it caches.
-func New(plugins *pluginhost.Host) *Resolver {
-	return &Resolver{plugins: plugins, cache: newCache()}
+// New returns a Resolver that fetches through plugins and caches as the
+// running config allows, wiping what a reload stops caching. Close it to wipe
+// the Secrets it caches.
+func New(plugins *pluginhost.Host, running *config.Running) *Resolver {
+	c := newCache(running.Snapshot)
+	running.OnReload(c.prune)
+	return &Resolver{plugins: plugins, cache: c}
 }
 
 // Resolve returns the Secret for secretName as the config snapshot cfg maps
@@ -34,7 +37,6 @@ func (r *Resolver) Resolve(ctx context.Context, cfg *config.Config, secretName s
 	}
 	fetch := func() (*secret.Secret, error) { return r.plugins.Get(ctx, s.Backend, s.Location) }
 	if s.CacheTTL == 0 {
-		r.cache.forget(secretName)
 		return fetch()
 	}
 	return r.cache.get(secretName, s.Backend, s.Location, s.CacheTTL, fetch)

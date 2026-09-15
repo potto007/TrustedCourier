@@ -4,14 +4,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/secret"
 )
 
 // cache holds Secrets for the Secret Names that set a cache TTL (ADR-0001).
-// Every cached Secret stays in locked memory, is wiped when its TTL ends, and
-// is wiped by close. Callers get their own copy, so releasing it after a
-// Delivery leaves the cached one intact.
+// Every cached Secret stays in locked memory and is wiped when its TTL ends,
+// when a reload deletes or moves its Secret Name or turns its cache off, and
+// by close. Callers get their own copy, so releasing it after a Delivery
+// leaves the cached one intact.
 type cache struct {
+	// running returns the config snapshot in effect.
+	running func() *config.Config
+
 	mu      sync.Mutex
 	entries map[string]*entry
 	closed  bool
@@ -21,21 +26,21 @@ type cache struct {
 type entry struct {
 	backend, location string
 	fetched           time.Time
+	ttl               time.Duration
 	value             *secret.Secret
 	timer             *time.Timer
 }
 
-func newCache() *cache {
-	return &cache{entries: make(map[string]*entry)}
+func newCache(running func() *config.Config) *cache {
+	return &cache{running: running, entries: make(map[string]*entry)}
 }
 
 // get returns a copy of the Secret cached for name when it was fetched from
 // backend and location less than ttl ago. Otherwise it fetches the Secret
-// with fetch and caches it for ttl. The caller must Release the copy.
+// with fetch and caches it, if the running config still maps name that way.
+// The caller must Release the copy.
 func (c *cache) get(name, backend, location string, ttl time.Duration, fetch func() (*secret.Secret, error)) (*secret.Secret, error) {
 	c.mu.Lock()
-	// A reload may have moved the Secret Name or shortened its TTL since the
-	// entry was fetched.
 	if e := c.entries[name]; e != nil && e.backend == backend && e.location == location && time.Since(e.fetched) < ttl {
 		defer c.mu.Unlock()
 		return e.value.Clone()
@@ -55,27 +60,41 @@ func (c *cache) get(name, backend, location string, ttl time.Duration, fetch fun
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	// A request that started before a reload must not cache what the reload
+	// removed. Checking under mu is enough: prune runs after the new snapshot
+	// is in effect and takes mu, so it wipes anything cached before the check
+	// could see that snapshot.
+	current, ok := c.running().Secrets[name]
+	if c.closed || !ok || current.Backend != backend || current.Location != location || current.CacheTTL == 0 {
 		value.Release()
 		return delivered, nil
 	}
 	if old := c.entries[name]; old != nil {
 		old.wipe()
 	}
-	e := &entry{backend: backend, location: location, fetched: fetched, value: value}
-	e.timer = time.AfterFunc(ttl-time.Since(fetched), func() { c.expire(name, e) })
+	e := &entry{backend: backend, location: location, fetched: fetched, ttl: min(ttl, current.CacheTTL), value: value}
+	e.timer = time.AfterFunc(e.ttl-time.Since(fetched), func() { c.expire(name, e) })
 	c.entries[name] = e
 	return delivered, nil
 }
 
-// forget wipes the Secret cached for name, if any, as when a reload turned
-// its cache off.
-func (c *cache) forget(name string) {
+// prune applies a reloaded config snapshot to the cache: it wipes every
+// Secret whose Secret Name cfg deletes, moves, or no longer caches, and ends
+// the rest by cfg's TTL where that is shorter.
+func (c *cache) prune(cfg *config.Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if e := c.entries[name]; e != nil {
-		e.wipe()
-		delete(c.entries, name)
+	for name, e := range c.entries {
+		s, ok := cfg.Secrets[name]
+		left := s.CacheTTL - time.Since(e.fetched)
+		switch {
+		case !ok || s.Backend != e.backend || s.Location != e.location || s.CacheTTL == 0 || left <= 0:
+			e.wipe()
+			delete(c.entries, name)
+		case s.CacheTTL < e.ttl:
+			e.ttl = s.CacheTTL
+			e.timer.Reset(left)
+		}
 	}
 }
 
