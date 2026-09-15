@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"github.com/potto007/TrustedCourier/internal/admin"
 	"github.com/potto007/TrustedCourier/internal/agentapi"
 	"github.com/potto007/TrustedCourier/internal/audit"
+	"github.com/potto007/TrustedCourier/internal/certmanager"
 	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
 	"github.com/potto007/TrustedCourier/internal/resolver"
@@ -56,8 +58,14 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	}
 	defer func() { _ = ln.Close() }()
 	var agentLn net.Listener
-	if cfg.AgentAPI.Listen != "" {
-		if agentLn, err = agentapi.Listen(cfg.AgentAPI.Listen); err != nil {
+	var certs *certmanager.Manager
+	if cfg.AgentAPI.Served() {
+		var tlsConfig *tls.Config
+		if cfg.AgentAPI.TLS != nil {
+			certs = certmanager.New(log)
+			tlsConfig = certs.TLSConfig()
+		}
+		if agentLn, err = agentapi.Listen(cfg.AgentAPI, tlsConfig); err != nil {
 			return err
 		}
 		defer func() { _ = agentLn.Close() }()
@@ -95,25 +103,54 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 			log.Error("closing the audit log failed", "error", err)
 		}
 	}()
+	// The TLS listener completes no handshake until the certificate is
+	// loaded from its Backend (ADR-0001).
+	if certs != nil {
+		agentTLS := *cfg.AgentAPI.TLS
+		certs.Start(func(ctx context.Context) (*secret.Secret, *secret.Secret, error) {
+			certificate, err := secrets.CourierKey(ctx, agentTLS.Certificate)
+			if err != nil {
+				return nil, nil, fmt.Errorf("fetch the TLS certificate: %w", err)
+			}
+			key, err := secrets.CourierKey(ctx, agentTLS.Key)
+			if err != nil {
+				certificate.Release()
+				return nil, nil, fmt.Errorf("fetch the TLS key: %w", err)
+			}
+			return certificate, key, nil
+		})
+		defer certs.Close()
+	}
 
 	// When either API stops, stop the other.
 	serveCtx, stopServing := context.WithCancel(ctx)
 	defer stopServing()
 	errc := make(chan error, 2)
 	serving := 1
-	var agentURL string
-	if agentLn != nil {
-		agentURL = "http://" + agentLn.Addr().String()
+	agent := admin.AgentAPI{Socket: cfg.AgentAPI.Socket}
+	if certs != nil {
+		agent.Certificate = certs
+	}
+	if agentLn != nil && cfg.AgentAPI.Socket == "" {
+		scheme := "http://"
+		if cfg.AgentAPI.TLS != nil {
+			scheme = "https://"
+		}
+		agent.URL = scheme + boundAddress(cfg.AgentAPI.Listen, agentLn.Addr())
 	}
 	go func() {
-		errc <- admin.NewServer(svc, plugins, auditLog, running, agentURL, log).Serve(serveCtx, ln)
+		errc <- admin.NewServer(svc, plugins, auditLog, running, agent, log).Serve(serveCtx, ln)
 	}()
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
 	if agentLn != nil {
 		serving++
-		agent := agentapi.NewServer(svc, secrets, auditLog, running, log)
-		go func() { errc <- agent.Serve(serveCtx, agentLn) }()
-		log.Info("Agent API listening", "address", agentLn.Addr().String())
+		agentSrv := agentapi.NewServer(svc, secrets, auditLog, running, log)
+		go func() { errc <- agentSrv.Serve(serveCtx, agentLn, cfg.AgentAPI.TLS != nil) }()
+		if agent.Socket != "" {
+			log.Info("Agent API listening", "socket", agent.Socket)
+		} else {
+			log.Info("Agent API listening", "url", agent.URL)
+		}
 	}
 	var firstErr error
 	for range serving {
@@ -123,4 +160,19 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		stopServing()
 	}
 	return firstErr
+}
+
+// boundAddress is the configured listen address with the port actually
+// bound, so a port of 0 is reported as the port chosen, and 0.0.0.0 stays
+// 0.0.0.0 rather than the dual-stack [::] the kernel reports.
+func boundAddress(configured string, bound net.Addr) string {
+	host, _, err := net.SplitHostPort(configured)
+	if err != nil {
+		return bound.String()
+	}
+	_, port, err := net.SplitHostPort(bound.String())
+	if err != nil {
+		return bound.String()
+	}
+	return net.JoinHostPort(host, port)
 }

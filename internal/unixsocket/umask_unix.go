@@ -1,6 +1,6 @@
 //go:build unix
 
-package admin
+package unixsocket
 
 import "syscall"
 

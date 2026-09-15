@@ -5,16 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"maps"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
@@ -22,6 +19,7 @@ import (
 	"github.com/potto007/TrustedCourier/internal/config"
 	"github.com/potto007/TrustedCourier/internal/httpserve"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
+	"github.com/potto007/TrustedCourier/internal/unixsocket"
 )
 
 // Listen binds the admin unix socket. A stale socket file left by a crashed
@@ -37,57 +35,7 @@ func Listen(socket string, allowedUIDs []int) (net.Listener, error) {
 		dirMode, sockMode = 0o711, 0o666
 	}
 
-	if err := os.MkdirAll(filepath.Dir(socket), dirMode); err != nil {
-		return nil, fmt.Errorf("create admin socket directory: %w", err)
-	}
-	if err := removeStaleSocket(socket); err != nil {
-		return nil, err
-	}
-	var ln net.Listener
-	// Bind owner-only so the socket is never more open than intended, then
-	// widen it if other users are allowed.
-	err := withUmask(0o177, func() error {
-		var err error
-		ln, err = net.Listen("unix", socket)
-		return err
-	})
-	if err != nil {
-		return nil, fmt.Errorf("listen on admin socket: %w", err)
-	}
-	if err := os.Chmod(socket, sockMode); err != nil {
-		_ = ln.Close()
-		return nil, fmt.Errorf("set admin socket mode: %w", err)
-	}
-	return ln, nil
-}
-
-// removeStaleSocket removes socket only when it is a socket nothing listens
-// on. Any other dial failure (a full backlog, a permission error) may mean a
-// live server, so it is reported rather than unlinked.
-func removeStaleSocket(socket string) error {
-	info, err := os.Lstat(socket)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect admin socket: %w", err)
-	}
-	if info.Mode().Type() != os.ModeSocket {
-		return fmt.Errorf("admin socket path %s exists and is not a socket", socket)
-	}
-	conn, err := net.Dial("unix", socket)
-	switch {
-	case err == nil:
-		_ = conn.Close()
-		return fmt.Errorf("another process is serving the admin socket %s", socket)
-	case errors.Is(err, syscall.ECONNREFUSED):
-		if err := os.Remove(socket); err != nil {
-			return fmt.Errorf("remove stale admin socket: %w", err)
-		}
-		return nil
-	default:
-		return fmt.Errorf("admin socket %s may be in use: %w", socket, err)
-	}
+	return unixsocket.Listen(socket, dirMode, sockMode, "admin socket")
 }
 
 // Server serves the admin API.
@@ -96,17 +44,29 @@ type Server struct {
 	plugins *pluginhost.Host
 	audit   *audit.Log
 	cfg     *config.Running
-	// agentURL is the Agent API's base URL, or empty when it is not served.
-	agentURL string
-	log      *slog.Logger
+	agent   AgentAPI
+	log     *slog.Logger
+}
+
+// AgentAPI is how the Agent API is served, as the admin API reports it.
+type AgentAPI struct {
+	// URL is the Agent API's base URL, such as http://127.0.0.1:8200 or
+	// https://0.0.0.0:8443. Empty when it is not served, or served on a unix
+	// socket.
+	URL string
+	// Socket is the unix socket path the Agent API is served on, or empty.
+	Socket string
+	// Certificate reports the TLS certificate's state. Nil when the Agent
+	// API does not serve TLS.
+	Certificate interface {
+		Status() (loaded bool, detail string)
+	}
 }
 
 // NewServer returns an admin API server for the running config that admits
 // connections from its allowed UIDs presenting the Operator Credential.
-// agentURL is the Agent API's base URL, such as http://127.0.0.1:8200, or
-// empty when it is not served.
-func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, cfg *config.Running, agentURL string, log *slog.Logger) *Server {
-	return &Server{access: svc, plugins: plugins, audit: auditLog, cfg: cfg, agentURL: agentURL, log: log}
+func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, cfg *config.Running, agent AgentAPI, log *slog.Logger) *Server {
+	return &Server{access: svc, plugins: plugins, audit: auditLog, cfg: cfg, agent: agent, log: log}
 }
 
 // Serve serves the admin API on ln until ctx is done.
@@ -233,6 +193,10 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	out := Status{BackendPlugins: []BackendPluginStatus{}}
 	out.AuditSigningKey.Loaded, out.AuditSigningKey.Detail = s.audit.KeyStatus()
 	out.AuditRecords.Pending, out.AuditRecords.Detail = s.audit.Backlog()
+	if s.agent.Certificate != nil {
+		out.TLSCertificate = &TLSCertificateStatus{}
+		out.TLSCertificate.Loaded, out.TLSCertificate.Detail = s.agent.Certificate.Status()
+	}
 	for _, p := range s.plugins.Status(r.Context()) {
 		out.BackendPlugins = append(out.BackendPlugins, BackendPluginStatus{
 			Name:         p.Name,
@@ -275,7 +239,10 @@ func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 	case len(sn.Upstreams) == 0:
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("Secret Name %q has no upstreams, so no Agent can use it through Proxy Delivery", name))
 		return
-	case s.agentURL == "":
+	case s.agent.Socket != "":
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("the Agent API is served on the unix socket %s, which no base URL can name; tc env needs agent_api.listen", s.agent.Socket))
+		return
+	case s.agent.URL == "":
 		writeError(w, http.StatusBadRequest, "the Agent API is not served; set agent_api.listen")
 		return
 	}
@@ -296,7 +263,7 @@ func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 		var value string
 		switch v.Source {
 		case config.EnvBaseURL:
-			value = s.agentURL + "/proxy/" + name + "/" + upstream
+			value = s.agent.URL + "/proxy/" + name + "/" + upstream
 		case config.EnvAgentToken:
 			value = AgentTokenPlaceholder
 		case config.EnvUsername:

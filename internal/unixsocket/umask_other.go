@@ -1,5 +1,5 @@
 //go:build !unix
 
-package admin
+package unixsocket
 
 func withUmask(_ int, f func() error) error { return f() }

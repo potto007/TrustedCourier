@@ -525,19 +525,23 @@ func (s *Server) checkOutput() {
 }
 
 var (
-	agentAPIAddress = regexp.MustCompile(`msg="Agent API listening" address=(\S+)`)
-	signingKeyReady = regexp.MustCompile(`msg="audit signing key loaded"`)
+	agentAPIURL       = regexp.MustCompile(`msg="Agent API listening" url=(\S+)`)
+	agentAPISocket    = regexp.MustCompile(`msg="Agent API listening" socket=(\S+)`)
+	signingKeyReady   = regexp.MustCompile(`msg="audit signing key loaded"`)
+	certificateLoaded = regexp.MustCompile(`msg="TLS certificate loaded"`)
 )
 
-// AgentURL waits for the server to log the Agent API's address and to load
-// the audit signing key, so it serves Deliveries, and returns the Agent API's
-// base URL, such as http://127.0.0.1:41234.
+// AgentURL waits for the server to log the Agent API's URL and to load the
+// audit signing key and, when the URL is https, the TLS certificate, so it
+// serves Deliveries, and returns the Agent API's base URL, such as
+// http://127.0.0.1:41234.
 func (s *Server) AgentURL() string {
 	s.in.t.Helper()
 	return s.agentURL(true)
 }
 
-// ListeningAgentURL is AgentURL without waiting for the audit signing key.
+// ListeningAgentURL is AgentURL without waiting for the audit signing key or
+// the TLS certificate.
 func (s *Server) ListeningAgentURL() string {
 	s.in.t.Helper()
 	return s.agentURL(false)
@@ -548,11 +552,32 @@ func (s *Server) agentURL(ready bool) string {
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		stderr := s.Stderr()
-		if m := agentAPIAddress.FindStringSubmatch(stderr); m != nil && (!ready || signingKeyReady.MatchString(stderr)) {
-			return "http://" + m[1]
+		if m := agentAPIURL.FindStringSubmatch(stderr); m != nil {
+			url := m[1]
+			if !ready || (signingKeyReady.MatchString(stderr) &&
+				(!strings.HasPrefix(url, "https://") || certificateLoaded.MatchString(stderr))) {
+				return url
+			}
 		}
 		if time.Now().After(deadline) {
 			s.in.t.Fatalf("the Agent API never started serving Deliveries; stderr:\n%s", stderr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// AgentSocket waits for the server to log the Agent API's unix socket and to
+// load the audit signing key, and returns the socket path.
+func (s *Server) AgentSocket() string {
+	s.in.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		stderr := s.Stderr()
+		if m := agentAPISocket.FindStringSubmatch(stderr); m != nil && signingKeyReady.MatchString(stderr) {
+			return m[1]
+		}
+		if time.Now().After(deadline) {
+			s.in.t.Fatalf("the Agent API never started serving Deliveries on a unix socket; stderr:\n%s", stderr)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

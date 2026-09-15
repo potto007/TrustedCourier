@@ -77,7 +77,7 @@ func restartKeys(old, cfg *Config) []string {
 		!slices.Equal(slices.Sorted(slices.Values(old.Admin.AllowedUIDs)), slices.Sorted(slices.Values(cfg.Admin.AllowedUIDs))) {
 		keys = append(keys, "admin")
 	}
-	if old.AgentAPI != cfg.AgentAPI {
+	if !old.AgentAPI.Equal(cfg.AgentAPI) {
 		keys = append(keys, "agent_api")
 	}
 	if !maps.Equal(old.BackendPlugins, cfg.BackendPlugins) {
