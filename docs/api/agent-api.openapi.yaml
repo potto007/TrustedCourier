@@ -1,0 +1,255 @@
+openapi: 3.1.0
+info:
+  title: TrustedCourier Agent API
+  version: 0.1.0
+  summary: The HTTP API Agents call with an Agent Token.
+  description: |
+    Agents use Secrets through two Deliveries:
+
+    - **Proxy Delivery** (the default): the Agent points its SDK's base URL at
+      `/proxy/{secret_name}/{upstream}` and puts its Agent Token where the SDK
+      expects its API key. TrustedCourier swaps the Agent Token for the Secret
+      and forwards the request to the pinned Upstream. The Agent never sees the
+      Secret.
+    - **Reveal Delivery**: `GET /v1/reveal/{secret_name}` returns the Secret
+      itself, where a Policy explicitly allows it.
+
+    Until TLS lands on the Agent listener, the API serves plain HTTP on a
+    loopback address only, over HTTP/1.1 or HTTP/2 with prior knowledge.
+
+    Every response carries `Cache-Control: no-store` and
+    `X-Content-Type-Options: nosniff`.
+
+    ## Errors
+
+    TrustedCourier's own errors are JSON objects with an `error` message.
+    After authentication, every denial gets the identical 403 body, whether
+    the Secret Name does not exist, no attached Policy lists it, the Policy
+    does not allow the Delivery mode, or (for Proxy Delivery) the Upstream is
+    not pinned to the Secret Name. Agents cannot discover Secret Names or
+    Upstreams from the Agent API.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://127.0.0.1:8200
+    description: The address in agent_api.listen.
+
+paths:
+  /v1/reveal/{secret_name}:
+    parameters:
+      - $ref: "#/components/parameters/SecretName"
+    get:
+      operationId: reveal
+      summary: Reveal Delivery
+      description: |
+        Returns the Secret for the Secret Name, byte for byte. TrustedCourier
+        fetches it from its Backend on every request. Only `GET` reveals;
+        every other method, including `HEAD`, gets 405 before any Secret is
+        fetched.
+      security:
+        - bearer: []
+        - agentTokenHeader: []
+      responses:
+        "200":
+          description: The Secret.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Denied"
+        "405":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/BackendFailed"
+        "503":
+          $ref: "#/components/responses/NoLockedMemory"
+
+  /proxy/{secret_name}/{upstream}/{path}:
+    summary: Proxy Delivery
+    description: |
+      Forwards the request to the Upstream with the Secret in place of the
+      Agent Token. Any method is forwarded. Upstream TLS is always verified.
+    parameters:
+      - $ref: "#/components/parameters/SecretName"
+      - $ref: "#/components/parameters/Upstream"
+      - $ref: "#/components/parameters/ForwardedPath"
+    get: &proxyOperation
+      summary: Proxy Delivery
+      security:
+        - credentialSlot: []
+        - agentTokenHeader: []
+      responses:
+        "400":
+          $ref: "#/components/responses/ProxyBadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Denied"
+        "502":
+          $ref: "#/components/responses/ProxyFailed"
+        "503":
+          $ref: "#/components/responses/NoLockedMemory"
+        default:
+          $ref: "#/components/responses/Upstream"
+    head: *proxyOperation
+    post: *proxyOperation
+    put: *proxyOperation
+    patch: *proxyOperation
+    delete: *proxyOperation
+    options: *proxyOperation
+
+  /proxy/{secret_name}/{upstream}:
+    summary: Proxy Delivery to the Upstream's base URL
+    description: The same as the route above with an empty path.
+    parameters:
+      - $ref: "#/components/parameters/SecretName"
+      - $ref: "#/components/parameters/Upstream"
+    get: *proxyOperation
+    head: *proxyOperation
+    post: *proxyOperation
+    put: *proxyOperation
+    patch: *proxyOperation
+    delete: *proxyOperation
+    options: *proxyOperation
+
+components:
+  parameters:
+    SecretName:
+      name: secret_name
+      in: path
+      required: true
+      description: The Operator-defined Secret Name.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    Upstream:
+      name: upstream
+      in: path
+      required: true
+      description: The name of one Upstream the Secret Name is pinned to.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    ForwardedPath:
+      name: path
+      in: path
+      required: true
+      description: |
+        The rest of the path, which may contain slashes. It is forwarded
+        under the Upstream's base URL as sent, and the query string is
+        forwarded unchanged. Dot segments, including percent-encoded ones,
+        get 400.
+      schema:
+        type: string
+
+  headers:
+    CacheControl:
+      description: Always `no-store`.
+      schema:
+        type: string
+        const: no-store
+
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: |
+        The Agent Token as a bearer token. For Proxy Delivery this is one
+        example of a credential slot; see `credentialSlot`.
+    agentTokenHeader:
+      type: apiKey
+      in: header
+      name: X-TC-Agent-Token
+      description: |
+        The fallback header, for clients that cannot put the Agent Token in
+        the credential slot. TrustedCourier removes it before forwarding.
+    credentialSlot:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        Proxy Delivery only. The Agent Token goes where the Secret Name's
+        Injection Template puts the Secret, so an SDK's own API-key setting
+        works unchanged. With the template `Authorization: Bearer {secret}`,
+        the Agent sends `Authorization: Bearer <Agent Token>`; with
+        `X-Api-Key: {secret}`, it sends `X-Api-Key: <Agent Token>`. The
+        template's literal text matches case-insensitively. The Agent Token
+        is never read from the URL. Present it exactly once.
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+  responses:
+    Error:
+      description: A TrustedCourier error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: |
+        The Agent Token is missing, presented more than once, unknown,
+        expired, or revoked. The message says which.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Denied:
+      description: Every denial, with an identical body.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BackendFailed:
+      description: The Backend could not return the Secret. Details go to the server log only.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NoLockedMemory:
+      description: The server has no locked memory left to hold the Secret.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Upstream:
+      description: |
+        The Upstream's response, status, headers, and body as the Upstream
+        sent them, except that `Cache-Control` is `no-store`. Redirects are
+        never followed: a 3xx and its `Location` reach the Agent unchanged.
+        Server-sent event streams pass through as they arrive.
+    ProxyBadRequest:
+      description: |
+        The path contains a dot segment, or the request asks for a protocol
+        upgrade such as a WebSocket, which Proxy Delivery does not support.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ProxyFailed:
+      description: |
+        The Backend could not return the Secret, the Secret cannot go in the
+        Injection Template's header, or the Upstream could not be reached,
+        including when its TLS certificate does not verify. Details go to the
+        server log only.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
