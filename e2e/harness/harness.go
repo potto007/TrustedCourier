@@ -130,6 +130,9 @@ type Installation struct {
 	ConfigMode os.FileMode
 	dir        string
 
+	// Upstream is the fake Upstream BaseConfig pins its Secret Names to.
+	Upstream *Upstream
+
 	mu sync.Mutex
 	// secretValues are the Secret values tests gave the fake Backend Plugin.
 	secretValues []string
@@ -149,18 +152,21 @@ func New(t *testing.T) *Installation {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return &Installation{
+	in := &Installation{
 		t:          t,
 		dir:        dir,
 		DataDir:    filepath.Join(dir, "data"),
 		Socket:     filepath.Join(dir, "admin.sock"),
 		ConfigMode: 0o600,
 	}
+	in.Upstream = in.StartUpstream(true)
+	return in
 }
 
 // ConfigVars are available to config templates as {{.DataDir}}, {{.Socket}},
-// {{.UID}}, and the fake Backend Plugins as {{.Fake.Path}},
-// {{.Fake.SHA256}} and so on. The config file lives in the parent of DataDir.
+// {{.UID}}, the fake Backend Plugins as {{.Fake.Path}}, {{.Fake.SHA256}} and
+// so on, and the installation's fake Upstream as {{.Upstream.URL}} and
+// {{.Upstream.CABundle}}. The config file lives in the parent of DataDir.
 type ConfigVars struct {
 	DataDir   string
 	Socket    string
@@ -169,6 +175,7 @@ type ConfigVars struct {
 	Unhealthy PluginBinary
 	Crashing  PluginBinary
 	Malformed PluginBinary
+	Upstream  *Upstream
 }
 
 // InstallPlugin copies bin into dir with the given mode and returns its path,
@@ -241,8 +248,11 @@ admin:
 
 // BaseConfig is AdminConfig plus two Policies, the Secret Names they grant,
 // and the well-behaved fake Backend Plugin, named fake, sharing the server's
-// OS user. It ends inside backend_plugins, so a test can append more Backend
-// Plugins, or top-level keys.
+// OS user. Both Secret Names are pinned to the installation's fake Upstream
+// as the Upstream named api: openai with an "Authorization: Bearer" header
+// Injection Template, github with "Authorization: token". It ends inside
+// backend_plugins, so a test can append more Backend Plugins, or top-level
+// keys.
 const BaseConfig = AdminConfig + `
 policies:
   openai-proxy:
@@ -257,9 +267,25 @@ secrets:
   openai:
     backend: fake
     location: kv/openai
+    injection_template:
+      header:
+        name: Authorization
+        value: Bearer {secret}
+    upstreams:
+      api:
+        url: {{.Upstream.URL}}
+        ca_bundle: {{.Upstream.CABundle}}
   github:
     backend: fake
     location: kv/github
+    injection_template:
+      header:
+        name: Authorization
+        value: token {secret}
+    upstreams:
+      api:
+        url: {{.Upstream.URL}}
+        ca_bundle: {{.Upstream.CABundle}}
 backend_plugins:
   fake:
     path: {{.Fake.Path}}
@@ -282,6 +308,7 @@ func (in *Installation) writeConfig(tmpl string) string {
 		Unhealthy: UnhealthyPlugin,
 		Crashing:  CrashingPlugin,
 		Malformed: MalformedPlugin,
+		Upstream:  in.Upstream,
 	}
 	if err := parsed.Execute(&buf, vars); err != nil {
 		in.t.Fatalf("render config template: %v", err)
