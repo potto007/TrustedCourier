@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction, work today. A real Backend, TLS, and audit do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction and hash-chained Audit Records, work today. A real Backend, TLS, and signed audit checkpoints do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -49,7 +49,8 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Redaction | done |
 | OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
 | Method and path limits, query and basic auth Injection Templates, Presets | [#7](https://github.com/potto007/TrustedCourier/issues/7), [#8](https://github.com/potto007/TrustedCourier/issues/8) |
-| Audit Records and checkpoints | [#9](https://github.com/potto007/TrustedCourier/issues/9), [#10](https://github.com/potto007/TrustedCourier/issues/10) |
+| Hash-chained Audit Records, `tc audit verify` | done |
+| Signed audit checkpoints | [#10](https://github.com/potto007/TrustedCourier/issues/10) |
 | TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
@@ -109,7 +110,7 @@ Operator Credential (shown once; store it now, it cannot be shown again):
 tcoc_...
 ```
 
-TrustedCourier stores only a hash of it, and `tc` has no command to reset it, so save it before you close the terminal. Logs go to stderr, so `2>server.log` keeps them apart.
+TrustedCourier stores only a hash of it, and `tc` has no command to reset it, so save it before you close the terminal. Logs go to stderr, so `2>server.log` keeps them apart. After that, stdout carries only [Audit Records](#audit).
 
 In another shell, point `tc` at the socket and issue an Agent Token:
 
@@ -269,6 +270,35 @@ The body is the Secret, byte for byte, with `Cache-Control: no-store`. TrustedCo
 
 The Agent Token may go in `X-TC-Agent-Token` instead of `Authorization`. The Agent API serves plain HTTP, so until TLS lands ([#13](https://github.com/potto007/TrustedCourier/issues/13)) it listens only on a loopback IP address ([ADR-0012](docs/decisions/0012-reveal-delivery-api-and-secret-memory.md)).
 
+### Audit
+
+Every Delivery attempt made with a valid Agent Token, allowed or denied, produces one Audit Record. That includes Deliveries that failed or were cut off, and 400s for a dot segment or a protocol upgrade. A 401 produces none. The server stores each record in SQLite and writes it to stdout as one JSON line, ready for Loki or a SIEM:
+
+```json
+{"seq":2,"time":"2026-09-15T06:12:03.418Z","agent_token_id":"emqckmg73t6p2xaj","secret_name":"openai","delivery":"proxy","upstream":"api","upstream_host":"api.openai.com","decision":"allowed","reason":"","upstream_status":200,"failure":"","prev_hash":"a7dc...","hash":"a227..."}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `seq` | Position in the chain, from 1, with no gaps. |
+| `delivery` | `proxy` or `reveal`. |
+| `upstream`, `upstream_host` | The Upstream name the Agent asked for, and the host it is pinned to. Empty for Reveal Delivery or an unknown Upstream. |
+| `decision`, `reason` | `allowed`, or `denied` with the reason the Agent never sees, such as `no Policy allows it` or `unknown Upstream`. |
+| `upstream_status` | The Upstream's status code, or `null` when it never answered. |
+| `failure` | Why an allowed Delivery did not complete, such as `the Secret could not be fetched` or `the Upstream's response broke off`. |
+| `prev_hash`, `hash` | The previous record's hash, and this record's: the SHA-256 of this JSON object without `hash`. The first `prev_hash` is 64 zeros. |
+
+Records never contain a Secret's value, request or response bodies, paths, or error text from a Backend or Upstream.
+
+`tc audit verify` walks the chain in SQLite and reports the first break. A deleted record, an altered one, or one that no longer chains all count:
+
+```
+Audit chain broken at record 2: record 2 does not match its hash
+1 Audit Record before it intact
+```
+
+It exits 0 when the chain is intact and 1 when it is broken, and takes `--json`. Removing records from the end of the chain is caught while the server that wrote them runs. Removal while it was stopped needs the signed checkpoints of [#10](https://github.com/potto007/TrustedCourier/issues/10). The stream, the chain's format, and which requests count are recorded in [ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md).
+
 ## CLI
 
 ```
@@ -277,13 +307,14 @@ tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | -
 tc token list [--json]
 tc token revoke <id>
 tc status [--json]
+tc audit verify [--json]
 tc plugin sha256 <path>
 ```
 
 | Variable | Meaning |
 | --- | --- |
 | `TC_ADMIN_SOCKET` | Admin socket path. Defaults to `/run/trustedcourier/admin.sock`. |
-| `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command and `status` require it. |
+| `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command, `status`, and `audit verify` require it. |
 
 Exit codes are 0 for success, 1 for a failed operation, and 2 for a malformed command line.
 
@@ -331,7 +362,8 @@ Two things trip people up with the admin socket. The default `/run/trustedcourie
 - Backend Plugins run as a separate OS user that cannot read the config file or own the data directory, with an empty environment apart from `GODEBUG`. Core and plugin talk over go-plugin's automatic mutual TLS.
 - Every plugin response is checked against the protocol contract (size limits, valid UTF-8, no control characters) before the server uses it, and plugin error text and log output are sanitized.
 - A plugin that crashes is restarted with exponential backoff, from 250 ms to 30 s. It never takes the server down.
-- In the core, a Secret lives in `mlock`ed memory outside the Go heap, is wiped when the response is written, and prints as a placeholder if formatted or logged. A Delivery fails rather than hold a Secret in memory that could be swapped. The e2e harness fails any test whose server output contains a Secret value.
+- In the core, a Secret lives in `mlock`ed memory outside the Go heap, is wiped when the response is written, and prints as a placeholder if formatted or logged. A Delivery fails rather than hold a Secret in memory that could be swapped. The e2e harness fails any test whose server output, the audit stream included, contains a Secret value.
+- Audit Records are hash-chained, so `tc audit verify` detects a record deleted or altered in SQLite ([ADR-0016](docs/decisions/0016-audit-record-stream-chain-and-verify.md)).
 
 ## Repository layout
 
@@ -343,6 +375,7 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `internal/access` | Operator Credential and Agent Token issue, verify, revoke; Policy evaluation. |
 | `internal/admin` | Admin API server and client over the unix socket. |
 | `internal/agentapi` | Agent API server: Proxy Delivery and Reveal Delivery. |
+| `internal/audit` | Audit Records: appended to SQLite, hash-chained, streamed as JSON lines, and verified. |
 | `internal/cli` | Command-line parsing and output. |
 | `internal/config` | Config loading and validation. |
 | `internal/pluginhost` | Plugin Host: verifies, launches, supervises, and reports Backend Plugins, and fetches Secrets through them. |
