@@ -33,7 +33,8 @@ jobs:
       - name: go test (race detector)
         env:
           GODEBUG: fips140=${{ matrix.fips140 }}
-        run: go test -race ./...
+        # The e2e package alone runs close to go test's default 10m limit.
+        run: go test -race -timeout 30m ./...
       # Running a Backend Plugin as a separate OS user needs a root server.
       - name: go test as root (Backend Plugin user separation)
         if: matrix.module == '.'
