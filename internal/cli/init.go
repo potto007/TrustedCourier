@@ -127,8 +127,10 @@ func (in *initializer) run(ctx context.Context) error {
 	})
 	cancel()
 	if err != nil {
+		// The key file stays: an OpenBao that is starting slowly may have
+		// read it already, and the next tc init reuses it.
 		if sealKeyCreated {
-			_ = os.Remove(in.o.sealKeyFile)
+			return fmt.Errorf("%w; the seal key written to %s is kept for the next run", err, in.o.sealKeyFile)
 		}
 		return err
 	}
