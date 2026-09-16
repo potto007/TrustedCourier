@@ -1,0 +1,49 @@
+name: Bug report
+description: Report unexpected behavior with a reproducible example.
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Use made-up Secrets and remove credentials
+        from configs and logs before posting them.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Which release tag or commit are you running?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include your OS, installation method, Backend Plugin, and whether FIPS mode is enabled.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest config and commands that reproduce the problem, using fake credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include the error message or exit code.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove Secret values, Agent Tokens, Operator Credentials, Courier Keys, and Backend credentials.
+      render: text

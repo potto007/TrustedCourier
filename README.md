@@ -785,6 +785,13 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `deploy` | The docker compose stack with the bundled OpenBao, its Dockerfile, and the configs it ships with. |
 | `scripts/build-release.sh` | Static release build of `tc` and the OpenBao plugin. |
 
+## Contributing
+
+Bug reports, fixes, tests, documentation, and Backend Plugins are welcome. See the
+[contribution guide](.github/CONTRIBUTING.md) for setup, checks, and the fork-and-PR
+workflow. Use [GitHub Issues](https://github.com/potto007/TrustedCourier/issues/new/choose)
+to report a bug or propose a feature.
+
 ## Development
 
 Run the checks CI runs, in each module (`.`, `sdk/plugin`, `plugins/openbao`):

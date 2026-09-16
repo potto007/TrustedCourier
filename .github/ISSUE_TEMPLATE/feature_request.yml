@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a change and explain the problem it would solve.
+labels: [enhancement, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1)
+        before opening a request. Link related work below.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and what prevents it today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the result you want and how you would use it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include any current workaround and its limitations.
+  - type: textarea
+    id: related
+    attributes:
+      label: Related issues or spec requirements
+      description: Link any existing discussion, spec story, or architecture decision.

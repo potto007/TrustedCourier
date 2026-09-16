@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Contribution guide
+    url: https://github.com/potto007/TrustedCourier/blob/main/.github/CONTRIBUTING.md
+    about: Development setup, tests, and the pull request workflow.
+  - name: Backend Plugin guide
+    url: https://github.com/potto007/TrustedCourier/blob/main/docs/backend-plugins.md
+    about: The SDK, plugin contract, and conformance kit for Plugin Authors.
