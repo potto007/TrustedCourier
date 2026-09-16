@@ -18,6 +18,11 @@
 // the JSON object of locations to values in it instead of the built-in
 // Secrets, and WriteCourierKey stores into that file, so a test can see what
 // TrustedCourier stored and a restarted server finds it again.
+//
+// FIPS 140-3 mode defaults to off, as tc's does; the core and the
+// conformance kit set GODEBUG explicitly.
+//
+//go:debug fips140=off
 package main
 
 import (

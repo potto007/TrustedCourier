@@ -29,6 +29,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/potto007/TrustedCourier/sdk/plugin/client"
 	_ "modernc.org/sqlite" // registers the "sqlite" driver for TamperDatabase
 )
 
@@ -122,13 +123,13 @@ func buildPlugin(sdkDir, out, ldflags string) (PluginBinary, error) {
 
 // childEnv is the environment every tc process gets: a clean base plus the
 // runtime settings the test run was invoked with, so a GODEBUG=fips140=on
-// test run exercises tc in FIPS mode.
+// test run exercises tc in FIPS mode. The FIPS 140-3 mode is always spelled
+// out, since tc defaults it off while a test binary built with GOFIPS140
+// defaults it on.
 func childEnv(extra ...string) []string {
-	env := []string{"PATH=" + os.Getenv("PATH")}
-	for _, name := range []string{"GODEBUG", "GORACE"} {
-		if v, ok := os.LookupEnv(name); ok {
-			env = append(env, name+"="+v)
-		}
+	env := []string{"PATH=" + os.Getenv("PATH"), "GODEBUG=" + client.GODEBUG()}
+	if v, ok := os.LookupEnv("GORACE"); ok {
+		env = append(env, "GORACE="+v)
 	}
 	return append(env, extra...)
 }

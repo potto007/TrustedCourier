@@ -22,7 +22,7 @@ jobs:
         working-directory: ${{ matrix.module }}
     env:
       # Build against Go's validated FIPS 140-3 module, as release builds
-      # do. It defaults fips140 to on; the matrix sets the mode explicitly.
+      # do. tc pins the mode off by default; the matrix sets it explicitly.
       GOFIPS140: certified
     steps:
       - uses: actions/checkout@v5
