@@ -8,11 +8,16 @@
 package main
 
 import (
+	"io"
+	"log"
 	"os"
 
 	"github.com/potto007/TrustedCourier/internal/cli"
 )
 
 func main() {
+	// net/http's default logger can print raw Upstream bytes, including
+	// Secrets, after a response. Operational logs use explicit loggers.
+	log.SetOutput(io.Discard)
 	os.Exit(cli.Main(os.Args[1:], os.Stdout, os.Stderr))
 }

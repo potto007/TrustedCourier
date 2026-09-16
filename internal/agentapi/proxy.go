@@ -6,9 +6,8 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
-	"log/slog"
+	stdlog "log"
 	"maps"
 	"net"
 	"net/http"
@@ -234,7 +233,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 					log.Info("Delivery abandoned by the Agent")
 					rec.Failure = "abandoned by the Agent"
 				case pw.writeErr() != nil:
-					log.Error("Delivery cut off: the response could not be written to the Agent", "error", pw.writeErr())
+					log.Error("Delivery cut off: the response could not be written to the Agent")
 					rec.Failure = "the response could not be written to the Agent"
 				default:
 					log.Error("Delivery cut off: the Upstream's response broke off")
@@ -292,8 +291,10 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// Upstream errors can include arbitrary response bytes, including
+			// the injected Secret. Log only our own failure categories.
 			if errors.Is(err, errUnreadableEncoding) {
-				log.Error("Delivery failed: Redaction cannot read the Upstream's response", "error", err)
+				log.Error("Delivery failed: Redaction cannot read the Upstream's response")
 				rec.Failure = "Redaction cannot read the Upstream's response"
 				writeError(w, http.StatusBadGateway, "the Upstream's response could not be delivered")
 				return
@@ -305,20 +306,27 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if r.Context().Err() != nil && s.stopping.Load() {
-				log.Warn("Delivery cut off by server shutdown", "error", err)
+				log.Warn("Delivery cut off by server shutdown")
 				rec.Failure = "cut off by server shutdown"
 				return
 			}
 			if r.Context().Err() != nil {
-				log.Info("Delivery abandoned by the Agent", "error", err)
+				log.Info("Delivery abandoned by the Agent")
 				rec.Failure = "abandoned by the Agent"
 				return
 			}
-			log.Error("Delivery failed: Upstream not reached", "error", err)
+			var certificateErr *tls.CertificateVerificationError
+			if errors.As(err, &certificateErr) {
+				log.Error("Delivery failed: Upstream TLS certificate verification failed")
+			} else {
+				log.Error("Delivery failed: Upstream not reached")
+			}
 			rec.Failure = "the Upstream could not be reached"
 			writeError(w, http.StatusBadGateway, "the Upstream could not be reached")
 		},
-		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		// ReverseProxy logs untrusted body-read errors before aborting the
+		// response. The recovery handler above records a safe failure instead.
+		ErrorLog: stdlog.New(io.Discard, "", 0),
 	}).ServeHTTP(pw, r.WithContext(ctx))
 	// The held-back bytes, the trailers, and the end of the response go out
 	// after the last guarded write, so bound them too. The deadline stays
@@ -524,7 +532,7 @@ func decodeBody(res *http.Response) error {
 		res.Body = &gzipBody{body: res.Body}
 		return nil
 	default:
-		return fmt.Errorf("%w: %s", errUnreadableEncoding, strings.Join(encodings, ", "))
+		return errUnreadableEncoding
 	}
 }
 
