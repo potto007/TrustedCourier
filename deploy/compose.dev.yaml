@@ -1,0 +1,37 @@
+# A demo on one machine, with no domain and nothing persistent in OpenBao:
+# OpenBao in in-memory dev mode, and the Agent API on loopback without TLS.
+# Everything in OpenBao is lost when it stops.
+#
+#   chmod 600 trustedcourier.dev.yaml
+#   echo "BAO_DEV_ROOT_TOKEN_ID=$(head -c 16 /dev/urandom | base64)" > .env
+#   docker compose -f compose.yaml -f compose.dev.yaml build
+#   docker compose -f compose.yaml -f compose.dev.yaml run --rm trustedcourier tc plugin sha256 /usr/local/lib/trustedcourier/plugins/openbao
+#   # paste the hash into trustedcourier.dev.yaml
+#   docker compose -f compose.yaml -f compose.dev.yaml run --rm trustedcourier tc init --config /etc/trustedcourier/trustedcourier.yaml --dev
+#   docker compose -f compose.yaml -f compose.dev.yaml up -d
+#
+# Agents on this machine use http://127.0.0.1:8200; OpenBao answers on
+# http://127.0.0.1:8300 with the root token from .env.
+
+services:
+  openbao:
+    command: ["server", "-dev"]
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: ${BAO_DEV_ROOT_TOKEN_ID:?set BAO_DEV_ROOT_TOKEN_ID in .env}
+      BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "127.0.0.1:8300:8200"
+    volumes: !reset []
+
+  trustedcourier:
+    # Loopback is the host's, so Agents on this machine reach the Agent API
+    # without TLS, and the plugin reaches OpenBao on its published port.
+    network_mode: host
+    ports: !reset []
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: ${BAO_DEV_ROOT_TOKEN_ID:?set BAO_DEV_ROOT_TOKEN_ID in .env}
+    volumes: !override
+      - ./trustedcourier.dev.yaml:/etc/trustedcourier/trustedcourier.yaml:ro
+      - trustedcourier-data:/var/lib/trustedcourier/data
+      - trustedcourier-plugin:/var/lib/trustedcourier/openbao
+      - trustedcourier-run:/run/trustedcourier

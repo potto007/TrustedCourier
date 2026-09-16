@@ -47,8 +47,9 @@ jobs:
         if: matrix.module == '.'
         env:
           GODEBUG: fips140=${{ matrix.fips140 }}
+          TC_REQUIRE_OPENBAO: "1"
         run: >-
-          sudo --preserve-env=GODEBUG,GOFIPS140 env
+          sudo --preserve-env=GODEBUG,GOFIPS140,TC_REQUIRE_OPENBAO env
           "PATH=$PATH" "GOCACHE=$RUNNER_TEMP/root-gocache" "GOMODCACHE=$(go env GOMODCACHE)"
           GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-buildvcs=false
-          go test -race -count=1 -run '^TestBackendPlugin(RunsAs|MustRunAs)SeparateUser$' ./e2e
+          go test -race -count=1 -run '^(TestBackendPlugin(RunsAs|MustRunAs)SeparateUser|TestInitGivesTokenFileToPluginUser)$' ./e2e

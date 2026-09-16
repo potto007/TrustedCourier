@@ -32,3 +32,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0026](0026-remote-admin-listener-mutual-tls.md) | The remote admin listener requires a client certificate in the handshake and the Operator Credential on every request | accepted |
 | [0027](0027-fips-mode-plugin-parity-and-process-hardening.md) | FIPS mode is reported in the plugin's Capabilities response, enforced by the Plugin Host, and the binaries link the validated module | accepted |
 | [0028](0028-openbao-plugin-locations-env-and-kit-contract.md) | The OpenBao plugin addresses KV fields, is configured by environment, and the conformance kit makes malformed Secrets the plugin's error | accepted |
+| [0029](0029-tc-init-seal-key-hand-off-and-bootstrap-order.md) | tc init writes the seal key OpenBao waits for, then finishes the bootstrap through the Backend Plugin | accepted |

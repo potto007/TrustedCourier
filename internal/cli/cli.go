@@ -28,6 +28,7 @@ import (
 )
 
 const usage = `Usage:
+  tc init --config <path> (--seal-key-file <path> | --dev) [--backend <name>] [--recovery-shares <n>] [--recovery-threshold <n>] [--plugin-token-ttl <duration>] [--wait <duration>]
   tc server run --config <path>
   tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | --expires-at <RFC 3339>) [--json]
   tc token list [--json]
@@ -45,6 +46,8 @@ Environment:
   TC_ADMIN_CLIENT_CERT    client certificate PEM file for TC_ADMIN_URL
   TC_ADMIN_CLIENT_KEY     its private key PEM file
   TC_ADMIN_CA_BUNDLE      CA PEM file that verifies TC_ADMIN_URL (default: system roots)
+  BAO_DEV_ROOT_TOKEN_ID   OpenBao's dev-mode root token, for tc init --dev
+  BAO_TOKEN               a root token, for tc init against an OpenBao already initialized
 `
 
 // errUsage reports a command line the user must fix.
@@ -88,6 +91,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	if len(args) >= 1 && args[0] == "reload" {
 		return reload(args[1:], stdout)
+	}
+	if len(args) >= 1 && args[0] == "init" {
+		return initCommand(args[1:], stdout, stderr)
 	}
 	if len(args) < 2 {
 		return fmt.Errorf("%w: missing command", errUsage)

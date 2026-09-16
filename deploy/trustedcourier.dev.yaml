@@ -1,0 +1,38 @@
+# TrustedCourier for the one-machine demo in deploy/compose.dev.yaml: the
+# Agent API on loopback without TLS, OpenBao in dev mode on its published
+# port. Fill in the plugin's hash. Keep this file mode 600.
+data_dir: /var/lib/trustedcourier/data
+
+admin:
+  socket: /run/trustedcourier/admin.sock
+
+agent_api:
+  listen: 127.0.0.1:8200
+
+audit:
+  signing_key:
+    backend: openbao
+    location: secret/data/trustedcourier#audit-signing-key
+
+backend_plugins:
+  openbao:
+    path: /usr/local/lib/trustedcourier/plugins/openbao
+    sha256: CHANGE-ME                    # docker compose -f compose.yaml -f compose.dev.yaml run --rm trustedcourier tc plugin sha256 /usr/local/lib/trustedcourier/plugins/openbao
+    user: trustedcourier-plugin
+    env:
+      BAO_ADDR: http://127.0.0.1:8300
+      BAO_TOKEN_FILE: /var/lib/trustedcourier/openbao/token
+
+# Store the value with the root token from .env:
+#   docker compose -f compose.yaml -f compose.dev.yaml exec openbao bao kv put -mount=secret openai key=sk-...
+secrets:
+  openai:
+    backend: openbao
+    location: secret/data/openai#key
+    preset: openai
+
+policies:
+  openai-proxy:
+    secrets:
+      - name: openai
+        delivery: [proxy]

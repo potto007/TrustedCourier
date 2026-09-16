@@ -1,0 +1,7 @@
+# The image build (deploy/Dockerfile) copies the source tree; keep build
+# products and local state out of it.
+.git
+.claude
+.playwright-mcp
+dist
+**/*.log

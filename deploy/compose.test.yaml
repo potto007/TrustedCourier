@@ -1,0 +1,11 @@
+# Used by e2e TestComposeStackBootstraps: the shipped stack with a test
+# config in place of trustedcourier.yaml and no published port.
+services:
+  trustedcourier:
+    ports: !reset []
+    volumes: !override
+      - ${TC_TEST_CONFIG:?}:/etc/trustedcourier/trustedcourier.yaml:ro
+      - trustedcourier-data:/var/lib/trustedcourier/data
+      - trustedcourier-plugin:/var/lib/trustedcourier/openbao
+      - trustedcourier-run:/run/trustedcourier
+      - openbao-seal:/openbao/seal

@@ -1,0 +1,66 @@
+# TrustedCourier with the bundled OpenBao (ADR-0008). From this directory:
+#
+#   chmod 600 trustedcourier.yaml               # the plugin user must not read it
+#   # edit trustedcourier.yaml: your domain, ACME contact, Secret Names
+#   docker compose build
+#   docker compose run --rm trustedcourier tc plugin sha256 /usr/local/lib/trustedcourier/plugins/openbao
+#   # paste the hash into trustedcourier.yaml
+#   docker compose run --rm trustedcourier tc init --config /etc/trustedcourier/trustedcourier.yaml --seal-key-file /openbao/seal/unseal.key
+#   docker compose up -d
+#
+# tc init shows the seal key, the recovery keys, OpenBao's root token, and
+# the Operator Credential once; nothing keeps them but you. For a demo
+# without persistent OpenBao, add compose.dev.yaml (see that file).
+#
+# Volumes: openbao-data is OpenBao's storage and openbao-seal its seal key;
+# together they hold every Secret. trustedcourier-data is the database
+# (Agent Token hashes, Audit Records); trustedcourier-plugin holds the
+# Backend Plugin's OpenBao token.
+
+services:
+  openbao:
+    image: openbao/openbao:2.4.4
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    environment:
+      SKIP_CHOWN: "1"
+      # For `docker compose exec openbao bao ...`.
+      BAO_ADDR: http://127.0.0.1:8200
+    volumes:
+      - ./openbao:/openbao/config:ro
+      - openbao-data:/openbao/file
+      - openbao-seal:/openbao/seal:ro
+    # Waits for tc init to write the seal key, then hands it to OpenBao in
+    # its environment, so the file stays owner-only on the volume. Must
+    # match e2e/harness OpenBaoWaitForSealKey.
+    command:
+      - sh
+      - -c
+      - while [ ! -s /openbao/seal/unseal.key ]; do sleep 1; done; BAO_SEAL_KEY=$$(base64 -w0 /openbao/seal/unseal.key) exec docker-entrypoint.sh server
+
+  trustedcourier:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: trustedcourier
+    restart: unless-stopped
+    depends_on:
+      - openbao
+    ports:
+      # The Agent API, over TLS with a certificate from ACME (TLS-ALPN-01
+      # arrives on 443).
+      - "443:8200"
+    volumes:
+      - ./trustedcourier.yaml:/etc/trustedcourier/trustedcourier.yaml:ro
+      - trustedcourier-data:/var/lib/trustedcourier/data
+      - trustedcourier-plugin:/var/lib/trustedcourier/openbao
+      - trustedcourier-run:/run/trustedcourier
+      - openbao-seal:/openbao/seal
+
+volumes:
+  openbao-data:
+  openbao-seal:
+  trustedcourier-data:
+  trustedcourier-plugin:
+  trustedcourier-run:

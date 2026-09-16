@@ -1,0 +1,52 @@
+# TrustedCourier with the bundled OpenBao, for deploy/compose.yaml. Fill in
+# the three CHANGE-ME values, then follow the steps in compose.yaml. Keep
+# this file mode 600: the Backend Plugin's user must not be able to read it.
+data_dir: /var/lib/trustedcourier/data
+
+admin:
+  socket: /run/trustedcourier/admin.sock
+
+agent_api:
+  listen: 0.0.0.0:8200
+  tls:
+    certificate:
+      backend: openbao
+      location: secret/data/trustedcourier/tls#certificate
+    key:
+      backend: openbao
+      location: secret/data/trustedcourier/tls#key
+    acme:
+      domains: [tc.example.com]          # CHANGE-ME: the Agent API's public name
+      contact: mailto:ops@example.com     # CHANGE-ME: where the CA reaches you
+      account_key:
+        backend: openbao
+        location: secret/data/trustedcourier/acme#account-key
+
+audit:
+  signing_key:
+    backend: openbao
+    location: secret/data/trustedcourier#audit-signing-key
+
+backend_plugins:
+  openbao:
+    path: /usr/local/lib/trustedcourier/plugins/openbao
+    sha256: CHANGE-ME                    # docker compose run --rm trustedcourier tc plugin sha256 /usr/local/lib/trustedcourier/plugins/openbao
+    user: trustedcourier-plugin
+    env:
+      BAO_ADDR: http://openbao:8200
+      BAO_TOKEN_FILE: /var/lib/trustedcourier/openbao/token
+
+# Secret Names map to fields of KV records in OpenBao; store the values
+# with the root token tc init showed:
+#   docker compose exec -e BAO_TOKEN=<root token> openbao bao kv put -mount=secret openai key=sk-...
+secrets:
+  openai:
+    backend: openbao
+    location: secret/data/openai#key
+    preset: openai
+
+policies:
+  openai-proxy:
+    secrets:
+      - name: openai
+        delivery: [proxy]
