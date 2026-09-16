@@ -48,13 +48,18 @@ func startOpenBao(t *testing.T) *openBao {
 		t.Skip("no docker on PATH and no TC_OPENBAO_ADDR; set one to run the OpenBao conformance test")
 	}
 	token := "root-" + hex.EncodeToString(randomBytes(t, 8))
-	out, err := exec.Command(docker, "run", "--detach", "--rm", "--cap-add=IPC_LOCK",
+	// Only stdout holds the container ID; a pull, when the image is not
+	// present, reports on stderr.
+	var stderr strings.Builder
+	run := exec.Command(docker, "run", "--detach", "--rm", "--cap-add=IPC_LOCK",
 		"--publish", "127.0.0.1::8200",
 		"--env", "BAO_DEV_ROOT_TOKEN_ID="+token,
 		"--env", "BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200",
-		Image, "server", "-dev").CombinedOutput()
+		Image, "server", "-dev")
+	run.Stderr = &stderr
+	out, err := run.Output()
 	if err != nil {
-		t.Fatalf("docker run %s: %v\n%s", Image, err, out)
+		t.Fatalf("docker run %s: %v\n%s", Image, err, stderr.String())
 	}
 	id := strings.TrimSpace(string(out))
 	t.Cleanup(func() {
