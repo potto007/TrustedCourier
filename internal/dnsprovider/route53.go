@@ -37,14 +37,25 @@ type route53 struct {
 	zones       zoneCache
 }
 
-func newRoute53(cfg config.DNS, creds Credentials, client *http.Client) *route53 {
+// minSecretAccessKeyBytes is the shortest secret access key SigV4 can sign
+// with in FIPS 140-only mode, where an HMAC key under 112 bits panics: the
+// first key is "AWS4" plus the secret. AWS keys are 40 characters.
+const minSecretAccessKeyBytes = 10
+
+func newRoute53(cfg config.DNS, creds Credentials, client *http.Client) (*route53, error) {
+	secret := bytes.TrimSpace(slices.Clone(creds["secret_access_key"]))
+	if len(secret) < minSecretAccessKeyBytes {
+		clear(secret)
+		return nil, fmt.Errorf("the %s DNS credential secret_access_key is shorter than %d bytes; it is not an AWS secret access key",
+			cfg.Provider, minSecretAccessKeyBytes)
+	}
 	a := newAPI(cfg, client)
 	return &route53{
 		api:         a,
 		base:        a.endpoint(DefaultRoute53Endpoint),
 		accessKeyID: strings.TrimSpace(string(creds["access_key_id"])),
-		secret:      bytes.TrimSpace(slices.Clone(creds["secret_access_key"])),
-	}
+		secret:      secret,
+	}, nil
 }
 
 func (r *route53) Close() { clear(r.secret) }
