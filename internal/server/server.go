@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"crypto/fips140"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -30,6 +31,9 @@ import (
 // stderr.
 func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error {
 	log := slog.New(slog.NewTextHandler(stderr, nil))
+	// The Operator turns FIPS 140-3 mode on with GODEBUG=fips140=on (or
+	// only) on the standard binary (ADR-0003); say which mode this is.
+	log.Info("FIPS 140-3 mode", "fips140", onOff(fips140.Enabled()), "module", fips140.Version())
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -260,6 +264,13 @@ func (c certificateStatus) Status() admin.TLSCertificateStatus {
 // boundAddress is the configured listen address with the port actually
 // bound, so a port of 0 is reported as the port chosen, and 0.0.0.0 stays
 // 0.0.0.0 rather than the dual-stack [::] the kernel reports.
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
 func boundAddress(configured string, bound net.Addr) string {
 	host, _, err := net.SplitHostPort(configured)
 	if err != nil {

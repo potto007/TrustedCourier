@@ -40,6 +40,8 @@ type IssuedAgentToken struct {
 
 // Status is the server's operational state.
 type Status struct {
+	// FIPS140 is the server process's FIPS 140-3 state.
+	FIPS140         FIPS140Status         `json:"fips140"`
 	BackendPlugins  []BackendPluginStatus `json:"backend_plugins"`
 	AuditSigningKey AuditSigningKeyStatus `json:"audit_signing_key"`
 	AuditRecords    AuditRecordsStatus    `json:"audit_records"`
@@ -50,6 +52,16 @@ type Status struct {
 	// state, or nil when the listener is off. The same state as
 	// TLSCertificate when the listener shares the Agent API's certificate.
 	RemoteAdminTLSCertificate *TLSCertificateStatus `json:"remote_admin_tls_certificate,omitempty"`
+}
+
+// FIPS140Status is a process's FIPS 140-3 state (ADR-0003).
+type FIPS140Status struct {
+	// Enabled reports whether the process runs in FIPS 140-3 mode
+	// (GODEBUG=fips140=on or only).
+	Enabled bool `json:"enabled"`
+	// Module is the Go FIPS 140-3 module the binary was built with, such as
+	// "v1.0.0", or "latest" for an unvalidated in-tree module.
+	Module string `json:"module"`
 }
 
 // TLSCertificateStatus is whether the Agent API's TLS certificate is loaded.
@@ -97,7 +109,10 @@ type BackendPluginStatus struct {
 	// Detail is the plugin's health detail, or why it is not healthy.
 	Detail       string   `json:"detail"`
 	Capabilities []string `json:"capabilities"`
-	Restarts     int      `json:"restarts"`
+	// FIPS140 reports whether the running plugin is in FIPS 140-3 mode. A
+	// server in FIPS mode runs no plugin that is not.
+	FIPS140  bool `json:"fips140"`
+	Restarts int  `json:"restarts"`
 }
 
 // AuditVerification is the result of checking the audit chain.

@@ -7,6 +7,7 @@ package pluginhost
 import (
 	"bytes"
 	"context"
+	"crypto/fips140"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -65,6 +66,8 @@ type Status struct {
 	// it is not healthy.
 	Detail       string
 	Capabilities []string
+	// FIPS140 reports whether the running plugin is in FIPS 140-3 mode.
+	FIPS140 bool
 	// Restarts counts relaunches after the first launch.
 	Restarts int
 }
@@ -282,7 +285,8 @@ func (p *supervised) run(ctx context.Context) {
 			p.mu.Lock()
 			p.client, p.state, p.lastErr = c, StateRunning, ""
 			p.mu.Unlock()
-			p.log.Info("Backend Plugin running", "pid", c.PID(), "capabilities", c.Capabilities().Names())
+			p.log.Info("Backend Plugin running", "pid", c.PID(), "capabilities", c.Capabilities().Names(),
+				"fips140", c.FIPS140().Enabled, "fips140_module", c.FIPS140().Version)
 
 			exited := waitExit(ctx, c)
 			c.Kill()
@@ -338,8 +342,24 @@ func (p *supervised) launch() (*client.Client, error) {
 	if err := setCredential(cmd, p.cred); err != nil {
 		return nil, err
 	}
-	return client.Start(cmd, p.hlog)
+	c, err := client.Start(cmd, p.hlog)
+	if err != nil {
+		return nil, err
+	}
+	// A core in FIPS 140-3 mode serves Secrets only through processes in
+	// FIPS mode (ADR-0004). The plugin inherits GODEBUG above, so one built
+	// on the SDK follows the core; one that does not report FIPS mode is
+	// outside the boundary.
+	if fips140.Enabled() && !c.FIPS140().Enabled {
+		c.Kill()
+		return nil, ErrNotFIPS
+	}
+	return c, nil
 }
+
+// ErrNotFIPS reports a Backend Plugin refused because the server runs in
+// FIPS 140-3 mode and the plugin does not.
+var ErrNotFIPS = errors.New("Backend Plugin is not in FIPS 140-3 mode; the server is, and refuses to serve Secrets through it")
 
 func (p *supervised) setState(state, lastErr string) {
 	p.mu.Lock()
@@ -363,6 +383,7 @@ func (p *supervised) status(ctx context.Context) Status {
 	}
 	s.PID = c.PID()
 	s.Capabilities = c.Capabilities().Names()
+	s.FIPS140 = c.FIPS140().Enabled
 	hctx, cancel := context.WithTimeout(ctx, healthTimeout)
 	defer cancel()
 	detail, err := c.Health(hctx)
