@@ -146,16 +146,28 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	// When either API stops, stop the other.
 	serveCtx, stopServing := context.WithCancel(ctx)
 	defer stopServing()
-	errc := make(chan error, 3)
+	errc := make(chan error, 2)
 	serving := 1
 	agent := admin.AgentAPI{Socket: cfg.AgentAPI.Socket}
 	if certs != nil {
 		agent.Certificate = certificateStatus{certs}
 	}
+	// The HTTP-01 listener matters for seconds per renewal, so its failure
+	// is logged and never stops the APIs.
 	if http01Ln != nil {
-		serving++
-		http01Srv := &http.Server{Handler: certs.HTTP01Handler(), ReadHeaderTimeout: 10 * time.Second}
-		go func() { errc <- httpserve.Serve(serveCtx, http01Srv, http01Ln) }()
+		http01Srv := &http.Server{
+			Handler:           certs.HTTP01Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       time.Minute,
+			MaxHeaderBytes:    64 << 10,
+			ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelDebug),
+		}
+		go func() {
+			if err := httpserve.Serve(serveCtx, http01Srv, http01Ln); err != nil {
+				log.Error("ACME HTTP-01 challenge listener stopped; HTTP-01 validations fail until a restart", "error", err)
+			}
+		}()
 		log.Info("ACME HTTP-01 challenge listener listening", "address", boundAddress(agentACME(cfg).HTTPListen, http01Ln.Addr()))
 	}
 	if agentLn != nil && cfg.AgentAPI.Socket == "" {

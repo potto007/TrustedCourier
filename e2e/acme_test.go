@@ -285,6 +285,8 @@ func TestACMEConfigIsValidated(t *testing.T) {
 		{"unknown challenge", "      domains: [example.com]\n      challenge: dns-01\n" + accountKey, "challenge"},
 		{"http_listen without http-01", "      domains: [example.com]\n      http_listen: 0.0.0.0:80\n" + accountKey, "http_listen"},
 		{"EAB without key", "      domains: [example.com]\n      external_account_binding:\n        key_id: kid\n" + accountKey, "external_account_binding.hmac_key"},
+		{"account key at the certificate location", "      domains: [example.com]\n      account_key:\n        backend: fake\n        location: courier/tls-certificate\n", "name the same location"},
+		{"http_listen on the Agent API port", "      domains: [example.com]\n      challenge: http-01\n      http_listen: \"[::]:8443\"\n" + accountKey, "http_listen"},
 		{"missing ca_bundle", "      domains: [example.com]\n      ca_bundle: /nonexistent/ca.pem\n" + accountKey, "ca_bundle"},
 		{"Secret Name maps to the account key", "      domains: [example.com]\n" + accountKey + "secrets:\n  leak:\n    backend: fake\n    location: courier/acme-account-key\n", "Courier Key is never delivered to Agents"},
 	}

@@ -217,10 +217,11 @@ func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if c := m.cert.Load(); c != nil {
+		s := Status{Loaded: true, NotAfter: c.Leaf.NotAfter, RenewAt: m.renewAt, RenewalError: m.renewalErr}
 		if err := expired(c.Leaf, time.Now()); err != nil {
-			return Status{Detail: err.Error(), NotAfter: c.Leaf.NotAfter}
+			s.Loaded, s.Detail = false, err.Error()
 		}
-		return Status{Loaded: true, NotAfter: c.Leaf.NotAfter, RenewAt: m.renewAt, RenewalError: m.renewalErr}
+		return s
 	}
 	return Status{Detail: m.detail}
 }
@@ -237,10 +238,11 @@ func (m *Manager) setDetail(detail string) {
 	m.detail = detail
 }
 
-// serve puts cert into service.
+// serve puts cert into service. The certificate and its renewal state are
+// published together, so Status never pairs one with the other's past.
 func (m *Manager) serve(cert *tls.Certificate, renewAt time.Time) {
-	m.cert.Store(cert)
 	m.mu.Lock()
+	m.cert.Store(cert)
 	m.detail, m.renewalErr, m.renewAt = "", "", renewAt
 	m.mu.Unlock()
 	attrs := []any{"subject", cert.Leaf.Subject.String(), "not_after", cert.Leaf.NotAfter.UTC().Format(time.RFC3339)}
@@ -298,10 +300,22 @@ func (m *Manager) runACME(ctx context.Context, a ACME) {
 	}
 
 	backoff := acmeMinRetry
+	// earliest is the soonest the next order may be placed after an
+	// issuance: a third of the lifetime, so a backdated or clock-skewed
+	// certificate whose renewal time is already past never puts orders back
+	// to back against the CA's rate limits.
+	var earliest time.Time
+	// pending is an issued pair the Backend has not stored yet; it is
+	// stored on the next attempt rather than ordered again.
+	var pending *acmecert.Issued
 	for ctx.Err() == nil {
 		current := m.cert.Load()
-		if current != nil {
-			if due := renewAt(current.Leaf); time.Now().Before(due) {
+		if current != nil && pending == nil {
+			due := renewAt(current.Leaf)
+			if due.Before(earliest) {
+				due = earliest
+			}
+			if time.Now().Before(due) {
 				timer := time.NewTimer(time.Until(due))
 				select {
 				case <-ctx.Done():
@@ -312,7 +326,14 @@ func (m *Manager) runACME(ctx context.Context, a ACME) {
 				continue
 			}
 		}
-		cert, err := m.obtain(ctx, a)
+		var err error
+		if pending == nil {
+			pending, err = m.obtain(ctx, a)
+		}
+		var cert *tls.Certificate
+		if err == nil {
+			cert, err = m.store(ctx, a, pending)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -334,7 +355,10 @@ func (m *Manager) runACME(ctx context.Context, a ACME) {
 			backoff = min(backoff*2, acmeMaxRetry)
 			continue
 		}
+		clear(pending.Key)
+		pending = nil
 		backoff = acmeMinRetry
+		earliest = time.Now().Add(lifetime(cert.Leaf) / 3)
 		m.serve(cert, renewAt(cert.Leaf))
 	}
 }
@@ -377,10 +401,10 @@ func (m *Manager) loadStored(ctx context.Context, a ACME) (*tls.Certificate, err
 	return cert, nil
 }
 
-// obtain obtains a certificate from the ACME directory, stores the pair in
-// the Backend, and returns it parsed. Nothing is ordered while the Backend
-// cannot store the result.
-func (m *Manager) obtain(ctx context.Context, a ACME) (*tls.Certificate, error) {
+// obtain obtains a certificate from the ACME directory and checks it is one
+// the manager can serve. Nothing is ordered while the Backend cannot store
+// the result. The caller wipes the returned key.
+func (m *Manager) obtain(ctx context.Context, a ACME) (*acmecert.Issued, error) {
 	if err := a.Issuer.CheckWritable(a.Certificate, a.Key); err != nil {
 		return nil, fmt.Errorf("%w; ACME needs a Backend that stores Courier Keys, or supply agent_api.tls.certificate and key yourself", err)
 	}
@@ -388,9 +412,19 @@ func (m *Manager) obtain(ctx context.Context, a ACME) (*tls.Certificate, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer clear(issued.Key)
-	// The key goes first: a certificate without its key is re-obtained on
-	// the next start, a key without its certificate is simply unused.
+	if _, err := parsePEM(issued.Chain, issued.Key); err != nil {
+		clear(issued.Key)
+		return nil, fmt.Errorf("the obtained certificate is unusable: %w", err)
+	}
+	m.log.Info("TLS certificate obtained", "subject", issued.Leaf.Subject.String(), "not_after", issued.Leaf.NotAfter.UTC().Format(time.RFC3339))
+	return issued, nil
+}
+
+// store writes the issued pair to the Backend and returns it parsed. The
+// key goes first: a certificate without its key is re-obtained on the next
+// start, while a key without its certificate is simply unused. A pair whose
+// second write fails is retried by the caller, not ordered again.
+func (m *Manager) store(ctx context.Context, a ACME, issued *acmecert.Issued) (*tls.Certificate, error) {
 	if err := a.Keys.WriteCourierKey(ctx, a.Key, issued.Key); err != nil {
 		return nil, fmt.Errorf("store the TLS key: %w", err)
 	}
@@ -401,14 +435,20 @@ func (m *Manager) obtain(ctx context.Context, a ACME) (*tls.Certificate, error) 
 	if err != nil {
 		return nil, fmt.Errorf("the obtained certificate is unusable: %w", err)
 	}
-	m.log.Info("TLS certificate obtained", "subject", cert.Leaf.Subject.String(), "not_after", cert.Leaf.NotAfter.UTC().Format(time.RFC3339), "backend", a.Certificate.Backend)
+	m.log.Info("TLS certificate stored", "backend", a.Certificate.Backend)
 	return cert, nil
+}
+
+// lifetime is how long leaf is valid, at least a second, so fractions of it
+// never overflow or reach zero.
+func lifetime(leaf *x509.Certificate) time.Duration {
+	const longest = 100 * 365 * 24 * time.Hour
+	return min(max(leaf.NotAfter.Sub(leaf.NotBefore), time.Second), longest)
 }
 
 // renewAt is when leaf is renewed: at two thirds of its lifetime.
 func renewAt(leaf *x509.Certificate) time.Time {
-	lifetime := leaf.NotAfter.Sub(leaf.NotBefore)
-	return leaf.NotBefore.Add(lifetime * 2 / 3)
+	return leaf.NotBefore.Add(lifetime(leaf) / 3 * 2)
 }
 
 func fetchAndParse(ctx context.Context, fetch Fetch) (*tls.Certificate, error) {

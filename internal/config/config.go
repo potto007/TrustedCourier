@@ -167,7 +167,7 @@ type ExternalAccountBinding struct {
 func (a ACME) Equal(b ACME) bool {
 	return a.Directory == b.Directory && slices.Equal(a.Domains, b.Domains) &&
 		a.Contact == b.Contact && a.Challenge == b.Challenge && a.HTTPListen == b.HTTPListen &&
-		a.CABundle == b.CABundle && a.AccountKey == b.AccountKey &&
+		a.CABundle == b.CABundle && a.RootCAs.Equal(b.RootCAs) && a.AccountKey == b.AccountKey &&
 		(a.EAB == nil) == (b.EAB == nil) && (a.EAB == nil || *a.EAB == *b.EAB)
 }
 
@@ -559,15 +559,46 @@ func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 			return err
 		}
 		cfg.AgentAPI.TLS = &AgentTLS{Certificate: cert, Key: key}
+		keys := []namedCourierKey{{"agent_api.tls.certificate", cert}, {"agent_api.tls.key", key}}
 		if a.TLS.ACME != nil {
 			acme, err := a.TLS.ACME.validate(cfg, baseDir, a.Listen)
 			if err != nil {
 				return err
 			}
 			cfg.AgentAPI.TLS.ACME = &acme
+			keys = append(keys, namedCourierKey{"agent_api.tls.acme.account_key", acme.AccountKey})
+			if acme.EAB != nil {
+				keys = append(keys, namedCourierKey{"agent_api.tls.acme.external_account_binding.hmac_key", acme.EAB.HMACKey})
+			}
+		}
+		// ACME writes the certificate and key locations, so each Courier
+		// Key needs its own.
+		for i, k := range keys {
+			for _, other := range keys[:i] {
+				if k.key == other.key {
+					return fmt.Errorf("%s and %s name the same location; each Courier Key needs its own", other.name, k.name)
+				}
+			}
 		}
 	}
 	return nil
+}
+
+type namedCourierKey struct {
+	name string
+	key  CourierKey
+}
+
+// sameBind reports whether two IP address and port strings would bind the
+// same socket: the same port, on the same address or a wildcard.
+func sameBind(a, b string) bool {
+	x, errX := netip.ParseAddrPort(a)
+	y, errY := netip.ParseAddrPort(b)
+	if errX != nil || errY != nil {
+		return a == b
+	}
+	return x.Port() == y.Port() &&
+		(x.Addr().IsUnspecified() || y.Addr().IsUnspecified() || x.Addr().Unmap() == y.Addr().Unmap())
 }
 
 // domainPattern is a DNS name ACME can issue for: lowercase labels of
@@ -625,7 +656,7 @@ func (a fileACME) validate(cfg *Config, baseDir, listen string) (ACME, error) {
 			}
 			out.HTTPListen = a.HTTPListen
 		}
-		if out.HTTPListen == listen {
+		if sameBind(out.HTTPListen, listen) {
 			return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen %q is the Agent API's own address; HTTP-01 is validated over plain HTTP on a different port", out.HTTPListen)
 		}
 	case a.HTTPListen != "":
