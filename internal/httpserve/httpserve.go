@@ -4,10 +4,35 @@ package httpserve
 import (
 	"context"
 	"errors"
+	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
+
+// ErrorLog returns net/http's error log for a TLS listener. A failed TLS
+// handshake is logged at Debug, not Warn: on a network listener any remote
+// can fail one per connection before a credential is looked at, and the
+// reason (no certificate loaded yet, a client that does not trust the CA or
+// presents no client certificate) is already reported elsewhere. Everything
+// else net/http reports stays at Warn.
+func ErrorLog(logger *slog.Logger) *log.Logger {
+	return log.New(handshakeErrorsToDebug{logger}, "", 0)
+}
+
+type handshakeErrorsToDebug struct{ log *slog.Logger }
+
+func (h handshakeErrorsToDebug) Write(p []byte) (int, error) {
+	msg := strings.TrimSuffix(string(p), "\n")
+	level := slog.LevelWarn
+	if strings.HasPrefix(msg, "http: TLS handshake error") {
+		level = slog.LevelDebug
+	}
+	h.log.Log(context.Background(), level, msg)
+	return len(p), nil
+}
 
 // shutdownTimeout bounds how long in-flight requests may take to finish.
 const shutdownTimeout = 5 * time.Second

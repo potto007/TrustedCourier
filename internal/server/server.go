@@ -66,7 +66,7 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	if cfg.AgentAPI.Served() {
 		var tlsConfig *tls.Config
 		if cfg.AgentAPI.TLS != nil {
-			certs = certmanager.New(log)
+			certs = certmanager.New(log, "the Agent API")
 			tlsConfig = certs.TLSConfig()
 		}
 		if agentLn, err = agentapi.Listen(cfg.AgentAPI, tlsConfig); err != nil {
@@ -81,7 +81,7 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	adminCerts := certs
 	if cfg.Admin.Listen != "" {
 		if !cfg.SharesAgentCertificate() {
-			adminCerts = certmanager.New(log)
+			adminCerts = certmanager.New(log, "the remote admin listener")
 		}
 		if remoteLn, err = admin.ListenTLS(cfg.Admin.Listen, adminCerts, cfg.Admin.TLS.ClientCAs); err != nil {
 			return err
@@ -185,7 +185,11 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		}
 		agent.URL = scheme + boundAddress(cfg.AgentAPI.Listen, agentLn.Addr())
 	}
-	adminSrv := admin.NewServer(svc, plugins, auditLog, running, agent, log)
+	var remoteCertificate admin.CertificateStatus
+	if remoteLn != nil {
+		remoteCertificate = certificateStatus{adminCerts}
+	}
+	adminSrv := admin.NewServer(svc, plugins, auditLog, running, agent, remoteCertificate, log)
 	go func() { errc <- adminSrv.Serve(serveCtx, ln) }()
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
 	if remoteLn != nil {

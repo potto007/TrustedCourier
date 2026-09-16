@@ -96,11 +96,12 @@ func startRemoteAdmin(t *testing.T, tc *harness.Installation, shared bool) remot
 	config := strings.Replace(harness.BaseConfig, "{{.Fake.Path}}", path, 1)
 	config = strings.Replace(config, "admin:\n  socket: {{.Socket}}\n", adminListener("127.0.0.1:0", certificate, key, caFile), 1)
 	srv := tc.Start(config + tlsAgentAPI("127.0.0.1:0") + auditConfig)
+	url := srv.AdminURL(shared)
 	return remoteAdmin{
-		srv: srv, url: srv.AdminURL(), server: server, client: client,
+		srv: srv, url: url, server: server, client: client,
 		caFile: caFile, certFile: certFile, keyFile: keyFile,
 		env: []string{
-			"TC_ADMIN_URL=" + srv.AdminURL(),
+			"TC_ADMIN_URL=" + url,
 			"TC_ADMIN_CA_BUNDLE=" + serverCAFile,
 			"TC_ADMIN_CLIENT_CERT=" + certFile,
 			"TC_ADMIN_CLIENT_KEY=" + keyFile,
@@ -194,7 +195,7 @@ func TestRemoteAdminRequiresClientCertificateAndOperatorCredential(t *testing.T)
 	if res := tc.TC(env, "token", "list"); res.ExitCode != 0 {
 		t.Errorf("tc token list over the remote admin listener: exit %d\n%s", res.ExitCode, res.Stderr)
 	}
-	if res := tc.TC(env, "status"); res.ExitCode != 0 || !strings.Contains(res.Stdout, "TLS certificate: loaded") {
+	if res := tc.TC(env, "status"); res.ExitCode != 0 || !strings.Contains(res.Stdout, "Remote admin TLS certificate: loaded") {
 		t.Errorf("tc status over the remote admin listener: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
 	}
 	issued := tc.TC(env, "token", "issue", "--policy", "openai-proxy", "--expires-in", "1h")
@@ -266,6 +267,8 @@ func TestRemoteAdminListenerConfigIsValidated(t *testing.T) {
 		{"empty client_ca file", "admin:\n  socket: {{.Socket}}\n  listen: 127.0.0.1:8300\n" + tlsBlock(empty), "holds no certificates"},
 		{"certificate and key share a location", "admin:\n  socket: {{.Socket}}\n  listen: 127.0.0.1:8300\n  tls:\n    certificate:\n      backend: fake\n      location: courier/same\n    key:\n      backend: fake\n      location: courier/same\n    client_ca: " + caFile + "\n", "same location"},
 		{"same port as the Agent API", "admin:\n  socket: {{.Socket}}\n  listen: 127.0.0.1:8300\n" + tlsBlock(caFile) + "agent_api:\n  listen: 127.0.0.1:8300\n", "admin.listen"},
+		{"shares only the Agent API certificate", "admin:\n  socket: {{.Socket}}\n  listen: 127.0.0.1:8300\n  tls:\n    certificate:\n      backend: fake\n      location: " + tlsCertificateLocation + "\n    key:\n      backend: fake\n      location: " + adminKeyLocation + "\n    client_ca: " + caFile + "\n" + tlsAgentAPI("127.0.0.1:8200"), "name both to share"},
+		{"admin key is the Agent API certificate", "admin:\n  socket: {{.Socket}}\n  listen: 127.0.0.1:8300\n  tls:\n    certificate:\n      backend: fake\n      location: " + adminCertificateLocation + "\n    key:\n      backend: fake\n      location: " + tlsCertificateLocation + "\n    client_ca: " + caFile + "\n" + tlsAgentAPI("127.0.0.1:8200"), "agent_api.tls.certificate and admin.tls.key name the same location"},
 		{"Secret Name maps to the admin key", "admin:\n  socket: {{.Socket}}\n  listen: 127.0.0.1:8300\n" + tlsBlock(caFile) + "secrets:\n  leak:\n    backend: fake\n    location: " + adminKeyLocation + "\n", "Courier Key is never delivered to Agents"},
 	}
 	for _, c := range cases {

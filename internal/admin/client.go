@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -46,12 +45,12 @@ func NewClient(socket, credential string) *Client {
 // authenticates with credential.
 func NewRemoteClient(baseURL string, client tls.Certificate, rootCAs *x509.CertPool, credential string) (*Client, error) {
 	u, err := url.Parse(baseURL)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("remote admin URL %q must be https://host:port", baseURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, fmt.Errorf("remote admin URL %q must be https://host:port, with no path", baseURL)
 	}
-	u.Path = strings.TrimSuffix(u.Path, "/")
 	return &Client{
-		base:       u.String(),
+		base:       "https://" + u.Host,
 		credential: credential,
 		http: &http.Client{
 			Timeout: 30 * time.Second,

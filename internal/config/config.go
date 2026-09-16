@@ -696,7 +696,7 @@ func (a fileAdmin) validateListener(cfg *Config, baseDir string) error {
 		return errors.New("admin.tls.client_ca is required: the PEM file of CA certificates that Operator client certificates must chain to")
 	}
 	clientCA := resolve(baseDir, a.TLS.ClientCA)
-	pool, err := loadCABundle(clientCA)
+	pool, err := LoadCABundle(clientCA)
 	if err != nil {
 		return fmt.Errorf("admin.tls.client_ca: %w", err)
 	}
@@ -761,6 +761,15 @@ func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 					keys = append(keys, namedCourierKey{"agent_api.tls.acme.dns.credentials." + field, acme.DNS.Credentials[field]})
 				}
 			}
+		}
+		// The remote admin listener shares the pair whole, or names its own
+		// locations; ACME writes the Agent API's, so a partial overlap would
+		// pair a certificate with the wrong key or overwrite the admin pair.
+		if admin := cfg.Admin.TLS; admin != nil && !cfg.SharesAgentCertificate() {
+			if admin.Certificate == cert || admin.Key == key {
+				return errors.New("admin.tls shares only one of agent_api.tls.certificate and agent_api.tls.key; name both to share the Agent API's certificate, or neither")
+			}
+			keys = append(keys, namedCourierKey{"admin.tls.certificate", admin.Certificate}, namedCourierKey{"admin.tls.key", admin.Key})
 		}
 		// ACME writes the certificate and key locations, so each Courier
 		// Key needs its own.
@@ -873,7 +882,7 @@ func (a fileACME) validate(cfg *Config, baseDir, listen string) (ACME, error) {
 	}
 	if a.CABundle != "" {
 		out.CABundle = resolve(baseDir, a.CABundle)
-		pool, err := loadCABundle(out.CABundle)
+		pool, err := LoadCABundle(out.CABundle)
 		if err != nil {
 			return ACME{}, fmt.Errorf("agent_api.tls.acme.ca_bundle: %w", err)
 		}
@@ -954,7 +963,7 @@ func (d fileDNS) validate(cfg *Config, baseDir string, domains []string) (DNS, e
 	out.Authority = strings.TrimSuffix(d.Authority, "/")
 	if d.CABundle != "" {
 		out.CABundle = resolve(baseDir, d.CABundle)
-		pool, err := loadCABundle(out.CABundle)
+		pool, err := LoadCABundle(out.CABundle)
 		if err != nil {
 			return DNS{}, fmt.Errorf("%s.ca_bundle: %w", prefix, err)
 		}
@@ -1000,8 +1009,8 @@ func (d fileDNS) validate(cfg *Config, baseDir string, domains []string) (DNS, e
 	return out, nil
 }
 
-// loadCABundle reads the CA certificates in the PEM file at path.
-func loadCABundle(path string) (*x509.CertPool, error) {
+// LoadCABundle reads the CA certificates in the PEM file at path.
+func LoadCABundle(path string) (*x509.CertPool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -1281,7 +1290,7 @@ func (u fileUpstream) validate(name, baseDir string) (Upstream, error) {
 		BasePath: strings.TrimRight(parsed.EscapedPath(), "/"),
 	}
 	if u.CABundle != "" {
-		pool, err := loadCABundle(resolve(baseDir, u.CABundle))
+		pool, err := LoadCABundle(resolve(baseDir, u.CABundle))
 		if err != nil {
 			return Upstream{}, fmt.Errorf("Upstream %q: ca_bundle: %w", name, err)
 		}

@@ -168,13 +168,8 @@ func remoteAdminClient(remote, credential string) (*admin.Client, error) {
 	}
 	var rootCAs *x509.CertPool
 	if bundle := os.Getenv("TC_ADMIN_CA_BUNDLE"); bundle != "" {
-		data, err := os.ReadFile(bundle)
-		if err != nil {
+		if rootCAs, err = config.LoadCABundle(bundle); err != nil {
 			return nil, fmt.Errorf("TC_ADMIN_CA_BUNDLE: %w", err)
-		}
-		rootCAs = x509.NewCertPool()
-		if !rootCAs.AppendCertsFromPEM(data) {
-			return nil, fmt.Errorf("TC_ADMIN_CA_BUNDLE: %s holds no certificates", bundle)
 		}
 	}
 	return admin.NewRemoteClient(remote, client, rootCAs, credential)
@@ -397,6 +392,20 @@ func status(args []string, stdout io.Writer) error {
 			_, err = fmt.Fprintln(stdout, line)
 		} else {
 			_, err = fmt.Fprintf(stdout, "TLS certificate: not loaded (%s); the Agent API completes no TLS handshake until it is\n", cert.Detail)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if cert := st.RemoteAdminTLSCertificate; cert != nil {
+		if cert.Loaded {
+			line := "Remote admin TLS certificate: loaded"
+			if cert.NotAfter != "" {
+				line += " (expires " + cert.NotAfter + ")"
+			}
+			_, err = fmt.Fprintln(stdout, line)
+		} else {
+			_, err = fmt.Fprintf(stdout, "Remote admin TLS certificate: not loaded (%s); the remote admin listener completes no TLS handshake until it is\n", cert.Detail)
 		}
 		if err != nil {
 			return err

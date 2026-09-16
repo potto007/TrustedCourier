@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"maps"
 	"net"
@@ -75,7 +76,16 @@ type Server struct {
 	audit   *audit.Log
 	cfg     *config.Running
 	agent   AgentAPI
-	log     *slog.Logger
+	// remoteCertificate reports the remote admin listener's certificate,
+	// or is nil when the listener is off.
+	remoteCertificate CertificateStatus
+	log               *slog.Logger
+}
+
+// CertificateStatus reports a TLS listener's certificate state. The
+// certificate manager, wrapped by the server package, is one.
+type CertificateStatus interface {
+	Status() TLSCertificateStatus
 }
 
 // AgentAPI is how the Agent API is served, as the admin API reports it.
@@ -88,27 +98,23 @@ type AgentAPI struct {
 	Socket string
 	// Certificate reports the TLS certificate's state. Nil when the Agent
 	// API does not serve TLS.
-	Certificate interface {
-		Status() TLSCertificateStatus
-	}
+	Certificate CertificateStatus
 }
 
 // NewServer returns an admin API server for the running config that admits
 // connections from its allowed UIDs presenting the Operator Credential.
-func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, cfg *config.Running, agent AgentAPI, log *slog.Logger) *Server {
-	return &Server{access: svc, plugins: plugins, audit: auditLog, cfg: cfg, agent: agent, log: log}
+// remoteCertificate reports the remote admin listener's certificate, or is
+// nil when the listener is off.
+func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Log, cfg *config.Running, agent AgentAPI, remoteCertificate CertificateStatus, log *slog.Logger) *Server {
+	return &Server{access: svc, plugins: plugins, audit: auditLog, cfg: cfg, agent: agent, remoteCertificate: remoteCertificate, log: log}
 }
 
 // Serve serves the admin API on the unix socket listener ln until ctx is
 // done. Each connection's local user is checked before the Operator
 // Credential.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	srv := &http.Server{
-		Handler:           s.requirePeer(s.requireOperator(s.mux())),
-		ReadHeaderTimeout: 10 * time.Second,
-		ConnContext:       withPeer,
-		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
-	}
+	srv := s.httpServer(s.requirePeer(s.requireOperator(s.mux())), slog.NewLogLogger(s.log.Handler(), slog.LevelWarn))
+	srv.ConnContext = withPeer
 	return httpserve.Serve(ctx, srv, ln)
 }
 
@@ -118,14 +124,21 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 // for the Operator Credential. Failed handshakes are logged at Debug: any
 // remote can fail one per connection.
 func (s *Server) ServeTLS(ctx context.Context, ln net.Listener) error {
-	srv := &http.Server{
-		Handler:           s.requireClientCertificate(s.requireOperator(s.mux())),
+	srv := s.httpServer(s.requireClientCertificate(s.requireOperator(s.mux())), httpserve.ErrorLog(s.log))
+	return httpserve.Serve(ctx, srv, ln)
+}
+
+// httpServer is the admin API's HTTP server with the limits both listeners
+// share. A client that stops reading must not hold a connection open.
+func (s *Server) httpServer(handler http.Handler, errorLog *log.Logger) *http.Server {
+	return &http.Server{
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       time.Minute,
 		MaxHeaderBytes:    64 << 10,
-		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelDebug),
+		ErrorLog:          errorLog,
 	}
-	return httpserve.Serve(ctx, srv, ln)
 }
 
 func (s *Server) mux() *http.ServeMux {
@@ -261,6 +274,10 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	if s.agent.Certificate != nil {
 		status := s.agent.Certificate.Status()
 		out.TLSCertificate = &status
+	}
+	if s.remoteCertificate != nil {
+		status := s.remoteCertificate.Status()
+		out.RemoteAdminTLSCertificate = &status
 	}
 	for _, p := range s.plugins.Status(r.Context()) {
 		out.BackendPlugins = append(out.BackendPlugins, BackendPluginStatus{
