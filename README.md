@@ -217,7 +217,7 @@ path "secret/data/*"     { capabilities = ["read", "create", "update"] }
 path "secret/metadata/*" { capabilities = ["list", "read"] }
 ```
 
-`create` and `update` are needed only where TrustedCourier stores Courier Keys. `list` on `metadata` serves the plugin's `List`, which the conformance kit exercises and the server does not call today.
+`create` and `update` are needed only where TrustedCourier stores Courier Keys. `list` on `metadata` serves the plugin's `List`, which the conformance kit exercises and the server does not call today. Keep OpenBao's built-in `default` policy on the token, which `bao token create` attaches unless told otherwise: the plugin reads `auth/token/lookup-self` to check the token and `sys/internal/ui/mounts` to learn each mount's KV version, and both come from it.
 
 `tc status` shows the server's [FIPS 140-3 mode](#fips-140-3-mode), each plugin's state, health, and capabilities, whether the [audit signing key](#audit) is loaded, and, when the Agent API serves TLS, whether its [certificate](#tls-on-the-agent-api) is:
 
@@ -631,7 +631,7 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `backend_plugins.<name>.sha256` | yes | The binary's SHA-256 as `tc plugin sha256` prints it. |
 | `backend_plugins.<name>.user` | one of these two | OS user name or ID the plugin runs as. |
 | `backend_plugins.<name>.insecure_share_core_user` | one of these two | `true` runs the plugin as the server's own user. Development only. |
-| `backend_plugins.<name>.env` | no | Map of environment variable name to value the plugin gets, such as its Backend's address. Values are up to 4096 bytes without control characters. `GODEBUG` is reserved for the server's [FIPS 140-3 mode](#fips-140-3-mode). Put credentials in a file the plugin user can read, not in the config. |
+| `backend_plugins.<name>.env` | no | Map of environment variable name to value the plugin gets, such as its Backend's address. Names are letters, digits, and `_`; values up to 4096 bytes without control characters. Go runtime settings (`GODEBUG`, which carries the server's [FIPS 140-3 mode](#fips-140-3-mode), `GOTRACEBACK`, and the rest) and loader settings (`LD_*`, `DYLD_*`) are refused. Put credentials in a file the plugin user can read, not in the config. |
 | `secrets` | no | Map of Secret Name to where its Secret lives. |
 | `secrets.<name>.backend` | yes | The `backend_plugins` entry that holds the Secret. |
 | `secrets.<name>.location` | yes | The Secret's location in that Backend, up to 1024 bytes without control characters. |

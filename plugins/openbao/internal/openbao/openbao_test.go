@@ -14,19 +14,22 @@ import (
 )
 
 // fakeBao is the least of OpenBao's API the plugin needs, with knobs for
-// the states a dev-mode container cannot easily show.
+// the states a dev-mode container cannot easily show. It mounts secret/
+// as KV v2 and kv1/ as KV v1; the record x on each holds key=value.
 type fakeBao struct {
 	sealed       bool
 	tokenValid   bool
 	forbidden    bool
+	deleted      bool
+	version      string
 	casConflicts atomic.Int32
-	version      atomic.Int64
+	recordVer    atomic.Int64
 	written      chan map[string]any
 }
 
 func newFakeBao() *fakeBao {
-	f := &fakeBao{tokenValid: true, written: make(chan map[string]any, 8)}
-	f.version.Store(1)
+	f := &fakeBao{tokenValid: true, version: "2.4.4", written: make(chan map[string]any, 8)}
+	f.recordVer.Store(1)
 	return f
 }
 
@@ -35,49 +38,84 @@ func (f *fakeBao) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(body)
 	}
-	errors := func(status int, msg string) { write(status, map[string]any{"errors": []string{msg}}) }
+	fail := func(status int, msgs ...string) { write(status, map[string]any{"errors": msgs}) }
+	path := strings.TrimPrefix(r.URL.Path, "/v1/")
 	switch {
-	case r.URL.Path == "/v1/sys/health":
+	case path == "sys/health":
 		if f.sealed {
-			write(http.StatusServiceUnavailable, map[string]any{"initialized": true, "sealed": true, "version": "2.4.4"})
+			write(http.StatusServiceUnavailable, map[string]any{"initialized": true, "sealed": true, "version": f.version})
 			return
 		}
-		write(http.StatusOK, map[string]any{"initialized": true, "sealed": false, "version": "2.4.4"})
+		write(http.StatusOK, map[string]any{"initialized": true, "sealed": false, "version": f.version})
 	case r.Header.Get("X-Vault-Token") != "good" || !f.tokenValid:
-		errors(http.StatusForbidden, "permission denied")
-	case r.URL.Path == "/v1/auth/token/lookup-self":
+		fail(http.StatusForbidden, "permission denied")
+	case path == "auth/token/lookup-self":
 		write(http.StatusOK, map[string]any{"data": map[string]any{"ttl": 0}})
-	case r.URL.Path == "/v1/elsewhere/data/x":
+	case strings.HasPrefix(path, "sys/internal/ui/mounts/"):
+		mnt, _, _ := strings.Cut(strings.TrimPrefix(path, "sys/internal/ui/mounts/"), "/")
+		switch mnt {
+		case "secret":
+			write(http.StatusOK, map[string]any{"data": map[string]any{"type": "kv", "path": "secret/", "options": map[string]any{"version": "2"}}})
+		case "kv1", "elsewhere":
+			write(http.StatusOK, map[string]any{"data": map[string]any{"type": "kv", "path": mnt + "/", "options": map[string]any{"version": "1"}}})
+		case "pki":
+			write(http.StatusOK, map[string]any{"data": map[string]any{"type": "pki", "path": "pki/"}})
+		default:
+			fail(http.StatusForbidden, "preflight capability check returned 403")
+		}
+	case path == "elsewhere/x":
 		// A record somewhere the token must never be sent.
 		w.Header().Set("Location", "http://127.0.0.1:1/v1/secret/data/x")
 		w.WriteHeader(http.StatusTemporaryRedirect)
 	case f.forbidden:
-		errors(http.StatusForbidden, "permission denied")
-	case r.URL.Path == "/v1/sys/internal/ui/mounts/secret/data/x":
-		write(http.StatusOK, map[string]any{"data": map[string]any{"type": "kv", "path": "secret/", "options": map[string]any{"version": "2"}}})
-	case r.URL.Path == "/v1/secret/data/x" && r.Method == http.MethodGet:
+		fail(http.StatusForbidden, "permission denied")
+	case path == "secret/x":
+		fail(http.StatusNotFound, "Invalid path for a versioned K/V secrets engine. See the API docs for the appropriate API endpoints to use.")
+	case path == "kv1/x" && r.Method == http.MethodGet:
+		// A KV v1 record whose fields happen to be named like a KV v2
+		// envelope.
+		write(http.StatusOK, map[string]any{"data": map[string]any{
+			"key": "value", "data": map[string]any{"inner": "x"}, "metadata": "meta",
+		}})
+	case path == "kv1/x" && r.Method == http.MethodPost:
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.written <- body
+		w.WriteHeader(http.StatusNoContent)
+	case path == "secret/data/big" && r.Method == http.MethodGet:
+		write(http.StatusOK, map[string]any{"data": map[string]any{
+			"data":     map[string]any{"key": strings.Repeat("x", maxValueBytes+1)},
+			"metadata": map[string]any{"version": 1},
+		}})
+	case path == "secret/data/x" && r.Method == http.MethodGet:
+		if f.deleted {
+			write(http.StatusNotFound, map[string]any{"errors": []string{}, "data": map[string]any{
+				"data": nil, "metadata": map[string]any{"version": f.recordVer.Load(), "deletion_time": "2026-09-16T00:00:00Z"},
+			}})
+			return
+		}
 		write(http.StatusOK, map[string]any{"data": map[string]any{
 			"data":     map[string]any{"key": "value"},
-			"metadata": map[string]any{"version": f.version.Load()},
+			"metadata": map[string]any{"version": f.recordVer.Load()},
 		}})
-	case r.URL.Path == "/v1/secret/data/x" && r.Method == http.MethodPost:
+	case path == "secret/data/x" && r.Method == http.MethodPost:
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		cas, _ := body["options"].(map[string]any)["cas"].(float64)
 		if f.casConflicts.Load() > 0 {
 			f.casConflicts.Add(-1)
-			f.version.Add(1)
-			errors(http.StatusBadRequest, "check-and-set parameter did not match the current version")
+			f.recordVer.Add(1)
+			fail(http.StatusBadRequest, "check-and-set parameter did not match the current version")
 			return
 		}
-		if int64(cas) != f.version.Load() {
-			errors(http.StatusBadRequest, "check-and-set parameter did not match the current version")
+		if int64(cas) != f.recordVer.Load() {
+			fail(http.StatusBadRequest, "check-and-set parameter did not match the current version")
 			return
 		}
 		f.written <- body
-		write(http.StatusOK, map[string]any{"data": map[string]any{"version": f.version.Load() + 1}})
+		write(http.StatusOK, map[string]any{"data": map[string]any{"version": f.recordVer.Load() + 1}})
 	default:
-		errors(http.StatusNotFound, "")
+		fail(http.StatusNotFound)
 	}
 }
 
@@ -113,6 +151,18 @@ func TestHealthReportsInvalidToken(t *testing.T) {
 	}
 }
 
+func TestHealthDetailIsPrintableAndBounded(t *testing.T) {
+	f := newFakeBao()
+	f.version = "2.4.4\x1b[2J" + strings.Repeat("v", 200)
+	detail, err := newBackend(t, f).Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if strings.ContainsRune(detail, '\x1b') || len(detail) > 100 {
+		t.Errorf("detail = %q; want the version sanitized and cut", detail)
+	}
+}
+
 func TestGetReportsPermissionDenied(t *testing.T) {
 	f := newFakeBao()
 	f.forbidden = true
@@ -123,7 +173,7 @@ func TestGetReportsPermissionDenied(t *testing.T) {
 }
 
 func TestGetDoesNotFollowRedirects(t *testing.T) {
-	_, err := newBackend(t, newFakeBao()).Get(context.Background(), "elsewhere/data/x#key")
+	_, err := newBackend(t, newFakeBao()).Get(context.Background(), "elsewhere/x#key")
 	if err == nil || !strings.Contains(err.Error(), "status 307") {
 		t.Errorf("Get = %v; want the redirect status reported, not followed", err)
 	}
@@ -131,10 +181,43 @@ func TestGetDoesNotFollowRedirects(t *testing.T) {
 
 func TestGetRejectsBadLocations(t *testing.T) {
 	b := newBackend(t, newFakeBao())
-	for _, loc := range []string{"secret/data/x", "#key", "secret/data/x#", "/secret/data/x#key", "secret/data/x/#key", "secret//x#key", "secret/data/x?a=b#key"} {
-		if _, err := b.Get(context.Background(), loc); err == nil || errors.Is(err, plugin.ErrNotFound) {
+	for _, loc := range []string{"secret/data/x", "#key", "secret/data/x#", "/secret/data/x#key", "secret/data/x/#key", "secret//x#key", "secret/data/x?a=b#key", "secret/data/50%off#key", "secret/data/a b#key"} {
+		_, err := b.Get(context.Background(), loc)
+		if err == nil || errors.Is(err, plugin.ErrNotFound) || !strings.Contains(err.Error(), "location") {
 			t.Errorf("Get(%q) = %v; want a location error", loc, err)
 		}
+	}
+}
+
+func TestGetNamesAMissingDataSegment(t *testing.T) {
+	_, err := newBackend(t, newFakeBao()).Get(context.Background(), "secret/x#key")
+	if err == nil || errors.Is(err, plugin.ErrNotFound) || !strings.Contains(err.Error(), "secret/data/") {
+		t.Errorf("Get on a KV v2 path without data/ = %v; want an error naming the data segment, not not-found", err)
+	}
+}
+
+func TestGetOnANonKVMountIsAnError(t *testing.T) {
+	_, err := newBackend(t, newFakeBao()).Get(context.Background(), "pki/cert/ca#certificate")
+	if err == nil || errors.Is(err, plugin.ErrNotFound) || !strings.Contains(err.Error(), "not KV") {
+		t.Errorf("Get on a pki mount = %v; want a not-KV error", err)
+	}
+}
+
+func TestGetReadsKVv1ByMountVersion(t *testing.T) {
+	b := newBackend(t, newFakeBao())
+	got, err := b.Get(context.Background(), "kv1/x#key")
+	if err != nil || string(got) != "value" {
+		t.Errorf("Get(kv1/x#key) = %q, %v; want the record's own field", got, err)
+	}
+	if _, err := b.Get(context.Background(), "kv1/x#data"); err == nil || errors.Is(err, plugin.ErrNotFound) {
+		t.Errorf("Get(kv1/x#data) = %v; want a not-a-string error for the object field, not not-found", err)
+	}
+}
+
+func TestGetRefusesOversizedValue(t *testing.T) {
+	_, err := newBackend(t, newFakeBao()).Get(context.Background(), "secret/data/big#key")
+	if err == nil || errors.Is(err, plugin.ErrNotFound) || !strings.Contains(err.Error(), "byte limit") {
+		t.Errorf("Get of an oversized field = %v; want the plugin's own size error", err)
 	}
 }
 
@@ -151,6 +234,33 @@ func TestWriteCourierKeyRetriesCheckAndSet(t *testing.T) {
 	}
 	if cas := body["options"].(map[string]any)["cas"]; cas != float64(3) {
 		t.Errorf("cas = %v; want the version after the conflicts, 3", cas)
+	}
+}
+
+func TestWriteCourierKeyToADeletedRecordUsesItsVersion(t *testing.T) {
+	f := newFakeBao()
+	f.deleted = true
+	f.recordVer.Store(7)
+	if err := newBackend(t, f).WriteCourierKey(context.Background(), "secret/data/x#tls-key", []byte("pem")); err != nil {
+		t.Fatalf("WriteCourierKey: %v", err)
+	}
+	body := <-f.written
+	if cas := body["options"].(map[string]any)["cas"]; cas != float64(7) {
+		t.Errorf("cas = %v; want the deleted record's version, 7", cas)
+	}
+	if data := body["data"].(map[string]any); len(data) != 1 || data["tls-key"] != "pem" {
+		t.Errorf("written data = %v; want only the key", data)
+	}
+}
+
+func TestWriteCourierKeyOnKVv1KeepsTheRecord(t *testing.T) {
+	f := newFakeBao()
+	if err := newBackend(t, f).WriteCourierKey(context.Background(), "kv1/x#tls-key", []byte("pem")); err != nil {
+		t.Fatalf("WriteCourierKey: %v", err)
+	}
+	body := <-f.written
+	if body["key"] != "value" || body["tls-key"] != "pem" || body["metadata"] != "meta" || body["options"] != nil {
+		t.Errorf("written record = %v; want every field kept, the key added, and no KV v2 envelope", body)
 	}
 }
 

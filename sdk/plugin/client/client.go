@@ -272,20 +272,26 @@ func callError(method string, err error) error {
 	if !ok {
 		return fmt.Errorf("%s: %s", method, contract.Sanitize(err.Error()))
 	}
-	switch st.Code() {
-	case codes.NotFound:
+	switch {
+	case st.Code() == codes.NotFound:
+		if msg := st.Message(); msg != "" && msg != plugin.ErrNotFound.Error() {
+			return fmt.Errorf("%s: %w: %s", method, plugin.ErrNotFound, contract.Sanitize(msg))
+		}
 		return fmt.Errorf("%s: %w", method, plugin.ErrNotFound)
-	case codes.Unimplemented:
+	case st.Code() == codes.Unimplemented:
 		return fmt.Errorf("%s: %w", method, plugin.ErrUnsupported)
-	case codes.Internal:
-		// The SDK's own refusal of a response, or a plugin's internal fault:
-		// a defect in the plugin either way.
-		return fmt.Errorf("%s: %w: %s", method, ErrMalformed,
-			contract.Sanitize(strings.TrimPrefix(st.Message(), "Backend Plugin produced a malformed response: ")))
+	case st.Code() == codes.Internal && strings.HasPrefix(st.Message(), contract.MalformedPrefix):
+		// The SDK refused the Backend's response before it left the plugin.
+		return fmt.Errorf("%s: %w: %s", method, ErrMalformed, contract.Sanitize(strings.TrimPrefix(st.Message(), contract.MalformedPrefix)))
 	default:
 		return fmt.Errorf("%s: %s: %s", method, st.Code(), contract.Sanitize(st.Message()))
 	}
 }
+
+// ValidateEnv reports whether a plugin may be configured with the
+// environment variable name set to value: a portable name, a bounded
+// printable value, and not a Go runtime or loader setting.
+func ValidateEnv(name, value string) error { return contract.Env(name, value) }
 
 func malformed(method string, err error) error {
 	return fmt.Errorf("%s: %w: %w", method, ErrMalformed, err)

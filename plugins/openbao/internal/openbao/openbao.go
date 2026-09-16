@@ -6,8 +6,8 @@
 // OpenBao CLI's `bao kv get -mount=secret openai` spells it for the API,
 // "secret/data/openai" on a KV v2 mount or "secret/openai" on a KV v1 mount,
 // and the field in that record. The field's value must be a non-empty
-// string; OpenBao KV holds JSON, and a number, object, or empty string at a
-// location is not a Secret.
+// string of at most 1 MiB; OpenBao KV holds JSON, and a number, object, or
+// empty string at a location is not a Secret.
 //
 // Only the standard library speaks HTTP and TLS, so the plugin follows the
 // core's FIPS 140-3 mode with nothing outside Go's cryptographic module.
@@ -28,7 +28,9 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/potto007/TrustedCourier/sdk/plugin"
@@ -49,10 +51,21 @@ type Config struct {
 
 // Backend serves Secrets from one OpenBao.
 type Backend struct {
-	base      *url.URL
+	base      url.URL
 	token     string
 	namespace string
 	http      *http.Client
+
+	// mounts caches what OpenBao reports about each KV mount, by mount
+	// path, since every call needs the mount's KV version and mounts
+	// rarely change.
+	mu     sync.Mutex
+	mounts map[string]cachedMount
+}
+
+type cachedMount struct {
+	mount
+	fetched time.Time
 }
 
 const (
@@ -60,11 +73,22 @@ const (
 	requestTimeout = 30 * time.Second
 	// maxResponseBytes bounds a response body; a KV record is far smaller.
 	maxResponseBytes = 4 << 20
+	// maxValueBytes is the largest Secret the plugin contract allows.
+	maxValueBytes = 1 << 20
 	// maxLocations is the most a List returns, the plugin contract's limit.
 	maxLocations = 10000
+	// maxListReads bounds the records a List reads, so a short prefix on a
+	// large mount fails with a clear error rather than at the caller's
+	// deadline.
+	maxListReads = 1000
 	// casRetries is how many times a Courier Key write retries after
 	// another writer changed the record.
 	casRetries = 3
+	// mountTTL is how long a mount's version is trusted before it is read
+	// again.
+	mountTTL = 5 * time.Minute
+	// maxVersionBytes bounds the OpenBao version shown in the health detail.
+	maxVersionBytes = 64
 )
 
 // New returns a Backend for cfg. It reads the CA file but does not call
@@ -80,7 +104,6 @@ func New(cfg Config) (*Backend, error) {
 	if base.Path != "" && base.Path != "/" || base.RawQuery != "" || base.Fragment != "" || base.User != nil {
 		return nil, fmt.Errorf("BAO_ADDR %q: want only a scheme, host, and port", cfg.Address)
 	}
-	base.Path, base.RawQuery, base.Fragment = "", "", ""
 	if cfg.Token == "" {
 		return nil, errors.New("BAO_TOKEN or BAO_TOKEN_FILE is required")
 	}
@@ -99,8 +122,9 @@ func New(cfg Config) (*Backend, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = tlsConfig
 	transport.Proxy = nil
+	transport.MaxIdleConnsPerHost = 16 // the core calls from every Delivery at once
 	return &Backend{
-		base:      base,
+		base:      url.URL{Scheme: base.Scheme, Host: base.Host},
 		token:     cfg.Token,
 		namespace: cfg.Namespace,
 		http: &http.Client{
@@ -109,6 +133,7 @@ func New(cfg Config) (*Backend, error) {
 			// The token must never follow a redirect to another host.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
+		mounts: map[string]cachedMount{},
 	}, nil
 }
 
@@ -123,14 +148,18 @@ func (b *Backend) Get(ctx context.Context, location string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	fields, _, err := b.readRecord(ctx, loc.path)
+	m, err := b.mountFor(ctx, loc.path)
 	if err != nil {
 		return nil, err
 	}
-	if fields == nil {
-		return nil, plugin.ErrNotFound
+	rec, err := b.readRecord(ctx, m, loc.path)
+	if err != nil {
+		return nil, err
 	}
-	raw, ok := fields[loc.field]
+	if rec.fields == nil {
+		return nil, fmt.Errorf("%w: no record at %s", plugin.ErrNotFound, loc.path)
+	}
+	raw, ok := rec.fields[loc.field]
 	if !ok {
 		return nil, fmt.Errorf("%w: %s has no field %q", plugin.ErrNotFound, loc.path, loc.field)
 	}
@@ -138,67 +167,105 @@ func (b *Backend) Get(ctx context.Context, location string) ([]byte, error) {
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return nil, fmt.Errorf("%s field %q is not a string; a Secret must be a string", loc.path, loc.field)
 	}
-	if value == "" {
+	switch {
+	case value == "":
 		return nil, fmt.Errorf("%s field %q is empty", loc.path, loc.field)
+	case len(value) > maxValueBytes:
+		return nil, fmt.Errorf("%s field %q is %d bytes, over the %d byte limit for a Secret", loc.path, loc.field, len(value), maxValueBytes)
 	}
 	return []byte(value), nil
 }
 
-// List returns every location starting with prefix, across the KV mounts
-// the token can see. Each record under the prefix is read to name its
-// fields, so a long prefix is much cheaper than a short one.
+// List returns every location starting with prefix. With an empty prefix
+// it walks every KV mount the token can see; otherwise the mount holding
+// the prefix. Each record under the prefix is read to name its fields, so
+// a long prefix is much cheaper than a short one, and a List that would
+// read more than a thousand records fails.
 func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
-	mounts, err := b.kvMounts(ctx)
-	if err != nil {
+	pathPrefix, fieldPrefix, hasField := strings.Cut(prefix, "#")
+	if err := checkPath(pathPrefix, true); err != nil {
+		return nil, fmt.Errorf("prefix %q: %w", prefix, err)
+	}
+	var mounts []mount
+	if pathPrefix == "" {
+		var err error
+		if mounts, err = b.kvMounts(ctx); err != nil {
+			return nil, err
+		}
+	} else if m, err := b.mountFor(ctx, pathPrefix); err == nil {
+		mounts = []mount{m}
+	} else if all, listErr := b.kvMounts(ctx); listErr == nil {
+		// The prefix may be shorter than a mount path, such as "sec".
+		for _, m := range all {
+			if strings.HasPrefix(m.path, pathPrefix) {
+				mounts = append(mounts, m)
+			}
+		}
+	} else {
 		return nil, err
 	}
-	pathPrefix, fieldPrefix, hasField := strings.Cut(prefix, "#")
-	var locations []string
-	emit := func(path string, fields map[string]json.RawMessage) error {
-		for _, field := range slices.Sorted(maps.Keys(fields)) {
-			if !strings.HasPrefix(field, fieldPrefix) {
-				continue
-			}
-			if len(locations) == maxLocations {
-				return fmt.Errorf("more than %d locations start with %q; list a longer prefix", maxLocations, prefix)
-			}
-			locations = append(locations, path+"#"+field)
-		}
-		return nil
-	}
+	l := &lister{b: b, prefix: prefix, fieldPrefix: fieldPrefix}
 	for _, m := range mounts {
 		if hasField {
 			// A whole record path: read that one record.
 			if !strings.HasPrefix(pathPrefix, m.dataRoot()) {
 				continue
 			}
-			fields, _, err := b.readRecord(ctx, pathPrefix)
+			rec, err := l.read(ctx, m, pathPrefix)
 			if err != nil {
 				return nil, err
 			}
-			if fields != nil {
-				if err := emit(pathPrefix, fields); err != nil {
-					return nil, err
-				}
+			if err := l.emit(pathPrefix, rec.fields); err != nil {
+				return nil, err
 			}
 			continue
 		}
 		if !overlaps(m.dataRoot(), pathPrefix) {
 			continue
 		}
-		if err := b.walk(ctx, m, "", pathPrefix, emit); err != nil {
+		if err := l.walk(ctx, m, "", pathPrefix); err != nil {
 			return nil, err
 		}
 	}
-	slices.Sort(locations)
-	return locations, nil
+	slices.Sort(l.locations)
+	return l.locations, nil
+}
+
+// lister accumulates one List.
+type lister struct {
+	b                   *Backend
+	prefix, fieldPrefix string
+	reads               int
+	locations           []string
+}
+
+func (l *lister) read(ctx context.Context, m mount, path string) (record, error) {
+	if l.reads == maxListReads {
+		return record{}, fmt.Errorf("listing %q would read more than %d records; list a longer prefix", l.prefix, maxListReads)
+	}
+	l.reads++
+	return l.b.readRecord(ctx, m, path)
+}
+
+func (l *lister) emit(path string, fields map[string]json.RawMessage) error {
+	for _, field := range slices.Sorted(maps.Keys(fields)) {
+		if !strings.HasPrefix(field, l.fieldPrefix) {
+			continue
+		}
+		if len(l.locations) == maxLocations {
+			return fmt.Errorf("more than %d locations start with %q; list a longer prefix", maxLocations, l.prefix)
+		}
+		l.locations = append(l.locations, path+"#"+field)
+	}
+	return nil
 }
 
 // walk lists the records under dir in m, in order, reading each whose path
 // starts with pathPrefix and descending into each folder that could hold
-// one.
-func (b *Backend) walk(ctx context.Context, m mount, dir, pathPrefix string, emit func(string, map[string]json.RawMessage) error) error {
-	keys, err := b.listKeys(ctx, m.listPath(dir))
+// one. A key OpenBao holds that cannot be spelled as a location, one with
+// a '#' in it, is skipped.
+func (l *lister) walk(ctx context.Context, m mount, dir, pathPrefix string) error {
+	keys, err := l.b.listKeys(ctx, m.listPath(dir))
 	if err != nil {
 		return err
 	}
@@ -206,23 +273,20 @@ func (b *Backend) walk(ctx context.Context, m mount, dir, pathPrefix string, emi
 		full := m.dataRoot() + dir + key
 		if strings.HasSuffix(key, "/") {
 			if overlaps(full, pathPrefix) {
-				if err := b.walk(ctx, m, dir+key, pathPrefix, emit); err != nil {
+				if err := l.walk(ctx, m, dir+key, pathPrefix); err != nil {
 					return err
 				}
 			}
 			continue
 		}
-		if !strings.HasPrefix(full, pathPrefix) {
+		if !strings.HasPrefix(full, pathPrefix) || checkPath(full, false) != nil {
 			continue
 		}
-		fields, _, err := b.readRecord(ctx, full)
+		rec, err := l.read(ctx, m, full)
 		if err != nil {
 			return err
 		}
-		if fields == nil {
-			continue // deleted since it was listed
-		}
-		if err := emit(full, fields); err != nil {
+		if err := l.emit(full, rec.fields); err != nil {
 			return err
 		}
 	}
@@ -242,7 +306,7 @@ func (b *Backend) Health(ctx context.Context) (string, error) {
 		Sealed      bool   `json:"sealed"`
 		Version     string `json:"version"`
 	}
-	status, body, err := b.call(ctx, http.MethodGet, "sys/health?standbyok=true&perfstandbyok=true&uninitcode=501&sealedcode=503", nil)
+	status, body, err := b.call(ctx, http.MethodGet, "sys/health", "standbyok=true&perfstandbyok=true&uninitcode=501&sealedcode=503", nil)
 	if err != nil {
 		return "", err
 	}
@@ -251,7 +315,7 @@ func (b *Backend) Health(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("sys/health: %w", err)
 		}
 	}
-	detail := "OpenBao " + health.Version
+	detail := "OpenBao " + printable(health.Version, maxVersionBytes)
 	switch {
 	case status == http.StatusNotImplemented || !health.Initialized && status != http.StatusOK:
 		return detail, errors.New("OpenBao is not initialized")
@@ -262,12 +326,10 @@ func (b *Backend) Health(ctx context.Context) (string, error) {
 	}
 	var lookup struct {
 		Data struct {
-			TTL       int64  `json:"ttl"`
-			Renewable bool   `json:"renewable"`
-			Display   string `json:"display_name"`
+			TTL int64 `json:"ttl"`
 		} `json:"data"`
 	}
-	status, body, err = b.call(ctx, http.MethodGet, "auth/token/lookup-self", nil)
+	status, body, err = b.call(ctx, http.MethodGet, "auth/token/lookup-self", "", nil)
 	if err != nil {
 		return detail, err
 	}
@@ -309,23 +371,21 @@ func (b *Backend) WriteCourierKey(ctx context.Context, location string, value []
 	if err != nil {
 		return err
 	}
-	if !strings.HasPrefix(loc.path, m.dataRoot()) {
-		return fmt.Errorf("%s is on KV v2 mount %s, so its location starts with %s", loc.path, m.path, m.dataRoot())
-	}
 	for attempt := 0; ; attempt++ {
-		fields, version, err := b.readRecord(ctx, loc.path)
+		rec, err := b.readRecord(ctx, m, loc.path)
 		if err != nil {
 			return err
 		}
+		fields := rec.fields
 		if fields == nil {
 			fields = map[string]json.RawMessage{}
 		}
 		fields[loc.field] = encoded
 		var body any = fields
 		if m.v2 {
-			body = map[string]any{"data": fields, "options": map[string]any{"cas": version}}
+			body = map[string]any{"data": fields, "options": map[string]any{"cas": rec.version}}
 		}
-		status, resp, err := b.call(ctx, http.MethodPost, loc.path, body)
+		status, resp, err := b.call(ctx, http.MethodPost, loc.path, "", body)
 		if err != nil {
 			return err
 		}
@@ -333,7 +393,7 @@ func (b *Backend) WriteCourierKey(ctx context.Context, location string, value []
 			return nil
 		}
 		if m.v2 && status == http.StatusBadRequest && strings.Contains(string(resp), "check-and-set") && attempt < casRetries {
-			continue
+			continue // another writer got in between; read the new version
 		}
 		return fmt.Errorf("write %s: %s", loc.path, apiError(status, resp))
 	}
@@ -349,60 +409,93 @@ func parseLocation(s string) (location, error) {
 	if !ok || path == "" || field == "" {
 		return location{}, fmt.Errorf("location %q: want <path>#<field>, such as secret/data/openai#key", s)
 	}
-	if strings.HasPrefix(path, "/") || strings.HasSuffix(path, "/") || strings.Contains(path, "//") || strings.Contains(path, "?") {
-		return location{}, fmt.Errorf("location %q: the path must be an API path without a leading or trailing slash", s)
+	if err := checkPath(path, false); err != nil {
+		return location{}, fmt.Errorf("location %q: %w", s, err)
 	}
 	return location{path: path, field: field}, nil
 }
 
-// readRecord reads the KV record at path. It returns nil fields when there
-// is no record there, and on a KV v2 mount the record's version.
-func (b *Backend) readRecord(ctx context.Context, path string) (map[string]json.RawMessage, int64, error) {
-	status, body, err := b.call(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return nil, 0, err
+// checkPath checks a record path, or with prefix a leading part of one: an
+// API path without a leading slash, empty segments, or characters that a
+// URL or a location would read as something else.
+func checkPath(path string, prefix bool) error {
+	if path == "" && prefix {
+		return nil
 	}
-	switch status {
-	case http.StatusNotFound:
-		return nil, 0, nil
-	case http.StatusOK:
-	default:
-		return nil, 0, fmt.Errorf("read %s: %s", path, apiError(status, body))
+	if strings.HasPrefix(path, "/") || strings.Contains(path, "//") || (!prefix && strings.HasSuffix(path, "/")) {
+		return errors.New("the path must be an API path without a leading slash or empty segments")
+	}
+	if i := strings.IndexFunc(path, func(r rune) bool {
+		return r == '#' || r == '?' || r == '%' || unicode.IsControl(r) || unicode.IsSpace(r)
+	}); i >= 0 {
+		return fmt.Errorf("the path contains %q, which a location cannot hold", path[i:i+utf8.RuneLen([]rune(path[i:])[0])])
+	}
+	return nil
+}
+
+// record is a KV record read from OpenBao: its fields, nil when there is
+// none, and on a KV v2 mount its version, which a deleted record keeps.
+type record struct {
+	fields  map[string]json.RawMessage
+	version int64
+}
+
+// readRecord reads the KV record at path on mount m.
+func (b *Backend) readRecord(ctx context.Context, m mount, path string) (record, error) {
+	if !strings.HasPrefix(path, m.dataRoot()) {
+		return record{}, fmt.Errorf("%s is on KV v2 mount %s, so its location starts with %s", path, m.path, m.dataRoot())
+	}
+	status, body, err := b.call(ctx, http.MethodGet, path, "", nil)
+	if err != nil {
+		return record{}, err
 	}
 	var resp struct {
-		Data map[string]json.RawMessage `json:"data"`
+		Errors []string                   `json:"errors"`
+		Data   map[string]json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, 0, fmt.Errorf("read %s: %w", path, err)
-	}
-	// A KV v2 record wraps its fields in data with metadata beside them.
-	if inner, ok := resp.Data["data"]; ok {
-		if meta, ok := resp.Data["metadata"]; ok {
-			var fields map[string]json.RawMessage
-			if err := json.Unmarshal(inner, &fields); err != nil {
-				return nil, 0, fmt.Errorf("read %s: data is not an object", path)
-			}
-			var metadata struct {
-				Version int64 `json:"version"`
-			}
-			if err := json.Unmarshal(meta, &metadata); err != nil {
-				return nil, 0, fmt.Errorf("read %s: metadata: %w", path, err)
-			}
-			if fields == nil {
-				return nil, metadata.Version, nil // deleted or destroyed version
-			}
-			return fields, metadata.Version, nil
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return record{}, fmt.Errorf("read %s: %w", path, err)
 		}
 	}
-	if resp.Data == nil {
-		return nil, 0, nil
+	switch {
+	case status == http.StatusNotFound && len(resp.Errors) > 0:
+		// Not a missing record but a refused path, such as one that
+		// skips the data segment on a KV v2 mount.
+		return record{}, fmt.Errorf("read %s: %s", path, apiError(status, body))
+	case status != http.StatusOK && status != http.StatusNotFound:
+		return record{}, fmt.Errorf("read %s: %s", path, apiError(status, body))
 	}
-	return resp.Data, 0, nil
+	if !m.v2 {
+		if status == http.StatusNotFound {
+			return record{}, nil
+		}
+		return record{fields: resp.Data}, nil
+	}
+	// A KV v2 response wraps the fields in data with metadata beside them,
+	// and a deleted record answers 404 with its metadata and no fields.
+	var rec record
+	if meta, ok := resp.Data["metadata"]; ok {
+		var metadata struct {
+			Version int64 `json:"version"`
+		}
+		if err := json.Unmarshal(meta, &metadata); err != nil {
+			return record{}, fmt.Errorf("read %s: metadata: %w", path, err)
+		}
+		rec.version = metadata.Version
+	}
+	if status == http.StatusNotFound {
+		return rec, nil
+	}
+	if err := json.Unmarshal(resp.Data["data"], &rec.fields); err != nil {
+		return record{}, fmt.Errorf("read %s: data is not an object", path)
+	}
+	return rec, nil
 }
 
 // listKeys lists the keys under a folder, folders with a trailing slash.
 func (b *Backend) listKeys(ctx context.Context, path string) ([]string, error) {
-	status, body, err := b.call(ctx, "LIST", path, nil)
+	status, body, err := b.call(ctx, "LIST", path, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -460,7 +553,7 @@ func (mi mountInfo) isKV() bool { return mi.Type == "kv" || mi.Type == "generic"
 
 // kvMounts lists the KV mounts the token can see, by path.
 func (b *Backend) kvMounts(ctx context.Context) ([]mount, error) {
-	status, body, err := b.call(ctx, http.MethodGet, "sys/internal/ui/mounts", nil)
+	status, body, err := b.call(ctx, http.MethodGet, "sys/internal/ui/mounts", "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -484,9 +577,13 @@ func (b *Backend) kvMounts(ctx context.Context) ([]mount, error) {
 	return mounts, nil
 }
 
-// mountFor returns the KV mount holding path.
+// mountFor returns the KV mount holding path, from the cache when it was
+// read recently.
 func (b *Backend) mountFor(ctx context.Context, path string) (mount, error) {
-	status, body, err := b.call(ctx, http.MethodGet, "sys/internal/ui/mounts/"+path, nil)
+	if m, ok := b.cachedMount(path); ok {
+		return m, nil
+	}
+	status, body, err := b.call(ctx, http.MethodGet, "sys/internal/ui/mounts/"+path, "", nil)
 	if err != nil {
 		return mount{}, err
 	}
@@ -505,14 +602,36 @@ func (b *Backend) mountFor(ctx context.Context, path string) (mount, error) {
 	if !resp.Data.isKV() {
 		return mount{}, fmt.Errorf("%s is on a %q secrets engine, not KV", path, resp.Data.Type)
 	}
-	return mount{path: resp.Data.Path, v2: resp.Data.Options.Version == "2"}, nil
+	if !strings.HasPrefix(path+"/", resp.Data.Path) {
+		return mount{}, fmt.Errorf("sys/internal/ui/mounts/%s: reports mount %q", path, resp.Data.Path)
+	}
+	m := mount{path: resp.Data.Path, v2: resp.Data.Options.Version == "2"}
+	b.mu.Lock()
+	b.mounts[m.path] = cachedMount{mount: m, fetched: time.Now()}
+	b.mu.Unlock()
+	return m, nil
+}
+
+func (b *Backend) cachedMount(path string) (mount, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for mountPath, c := range b.mounts {
+		if time.Since(c.fetched) > mountTTL {
+			delete(b.mounts, mountPath)
+			continue
+		}
+		if strings.HasPrefix(path+"/", mountPath) {
+			return c.mount, true
+		}
+	}
+	return mount{}, false
 }
 
 // call makes one API call and returns the status and body. A transport
 // error is returned as err; an API error is left to the caller to read
 // from the status, since not found and forbidden mean different things per
 // call.
-func (b *Backend) call(ctx context.Context, method, path string, body any) (int, []byte, error) {
+func (b *Backend) call(ctx context.Context, method, path, query string, body any) (int, []byte, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -521,7 +640,10 @@ func (b *Backend) call(ctx context.Context, method, path string, body any) (int,
 		}
 		reader = bytes.NewReader(encoded)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, b.base.String()+"/v1/"+path, reader)
+	u := b.base
+	u.Path = "/v1/" + path
+	u.RawQuery = query
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), reader)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -554,7 +676,25 @@ func apiError(status int, body []byte) string {
 		Errors []string `json:"errors"`
 	}
 	if err := json.Unmarshal(body, &resp); err == nil && len(resp.Errors) > 0 {
-		return fmt.Sprintf("status %d: %s", status, strings.Join(resp.Errors, "; "))
+		return fmt.Sprintf("status %d: %s", status, printable(strings.Join(resp.Errors, "; "), 512))
 	}
 	return fmt.Sprintf("status %d", status)
+}
+
+// printable makes text OpenBao sent safe for a health detail or an error:
+// control characters and invalid UTF-8 become '?', and it is cut at max
+// bytes.
+func printable(s string, max int) string {
+	var b strings.Builder
+	for _, r := range s {
+		if b.Len() >= max {
+			b.WriteString("...")
+			break
+		}
+		if r == utf8.RuneError || unicode.IsControl(r) {
+			r = '?'
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

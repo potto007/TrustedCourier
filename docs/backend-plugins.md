@@ -1,6 +1,6 @@
 # Writing a Backend Plugin
 
-A Backend Plugin connects TrustedCourier to one kind of Backend: a secret store that is the source of truth for Secrets. TrustedCourier runs it as a separate binary, out of process, as a separate OS user, and treats every response as untrusted input ([ADR-0004](decisions/0004-out-of-process-backend-plugins.md), [ADR-0011](decisions/0011-backend-plugin-host-and-protocol.md)). This guide is for Plugin Authors: how to build one on the plugin SDK, how to run the conformance kit against it, and what the kit demands.
+A Backend Plugin connects TrustedCourier to one kind of Backend: the external system that is the source of truth for Secrets. TrustedCourier runs it as a separate binary, out of process, as a separate OS user, and treats every response as untrusted input ([ADR-0004](decisions/0004-out-of-process-backend-plugins.md), [ADR-0011](decisions/0011-backend-plugin-host-and-protocol.md)). This guide is for Plugin Authors: how to build one on the plugin SDK, how to run the conformance kit against it, and what the kit demands.
 
 The bundled OpenBao plugin in [`plugins/openbao`](../plugins/openbao) is the reference: a complete plugin, with its conformance test, in a few hundred lines.
 
@@ -23,7 +23,7 @@ import (
 	"github.com/potto007/TrustedCourier/sdk/plugin"
 )
 
-type myBackend struct{ /* a client for the store */ }
+type myBackend struct{ /* a client for the Backend */ }
 
 func (b *myBackend) Get(ctx context.Context, location string) ([]byte, error)  { /* ... */ }
 func (b *myBackend) List(ctx context.Context, prefix string) ([]string, error) { /* ... */ }
@@ -55,7 +55,7 @@ Error text reaches the Operator through the server log and `tc status`, sanitize
 
 ### Configuration
 
-The plugin runs as a separate OS user with no access to TrustedCourier's config or database, in an empty environment plus what the Operator sets in `backend_plugins.<name>.env`, and `GODEBUG`, which the core sets to carry its FIPS 140-3 mode. Read your configuration from environment variables, and read credentials from a file named by one (`MY_TOKEN_FILE`), so the token is not in the config the Operator keeps in Git. When the configuration is missing or wrong, print why to stderr and exit non-zero; the server reports the launch failure with your message.
+The plugin runs as a separate OS user with no access to TrustedCourier's config or database, in an empty environment plus what the Operator sets in `backend_plugins.<name>.env`, and `GODEBUG`, which the core sets to carry its FIPS 140-3 mode. The server refuses Go runtime settings and loader settings there, since the binary is pinned by its hash and nothing may change what that hash covers. Read your configuration from environment variables, and read credentials from a file named by one (`MY_TOKEN_FILE`), so the token is not in the config the Operator keeps in Git. When the configuration is missing or wrong, print why to stderr and exit non-zero; the server reports the launch failure with your message.
 
 ### FIPS 140-3 mode
 
@@ -89,9 +89,9 @@ The Fixture describes what the Backend holds while the kit runs:
 | --- | --- |
 | `Secrets` | Locations and the values the Backend holds there. At least one; include a non-ASCII location if your syntax allows one. |
 | `Missing` | A location where the Backend holds nothing. |
-| `Malformed` | Locations where the Backend holds something that is not a Secret. Name at least one of each kind your Backend can produce. |
+| `Malformed` | Locations where the Backend holds something that is not a Secret. At least one, and one of each kind your Backend can produce. |
 | `CourierKeyLocation` | Where the kit may write Courier Keys. Required when the plugin reports `CourierKeyWrite`; the kit writes there twice and reads back. |
-| `Env` | The plugin's environment: how it reaches the Backend. The kit sets `GODEBUG` itself. |
+| `Env` | The plugin's environment: how it reaches the Backend. The kit refuses what a server's config would refuse: names other than letters, digits, and `_`, values over 4096 bytes or with control characters, Go runtime settings such as `GODEBUG` and `GOTRACEBACK`, and loader settings (`LD_*`, `DYLD_*`). The kit sets `GODEBUG` itself. |
 
 The checks, each a subtest:
 

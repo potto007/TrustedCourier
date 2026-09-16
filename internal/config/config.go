@@ -19,7 +19,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/potto007/TrustedCourier/sdk/plugin/client"
 	"go.yaml.in/yaml/v3"
@@ -1342,31 +1341,17 @@ func (p fileBackendPlugin) validate(name, baseDir string) (BackendPlugin, error)
 	}, nil
 }
 
-// pluginEnvNamePattern is what a portable environment variable name looks
-// like.
-var pluginEnvNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
-
-// maxEnvValueBytes bounds one environment value a plugin is given.
-const maxEnvValueBytes = 4096
-
 // validateEnv returns the plugin's configured environment as sorted
-// "NAME=value" entries. GODEBUG is reserved: the Plugin Host sets it to
-// carry the server's FIPS 140-3 mode (ADR-0027).
+// "NAME=value" entries, each checked by the plugin SDK's rules, which
+// reserve GODEBUG and the other Go runtime settings for the Plugin Host and
+// refuse loader settings (ADR-0027, ADR-0028).
 func (p fileBackendPlugin) validateEnv(name string) ([]string, error) {
 	env := make([]string, 0, len(p.Env))
 	for _, k := range slices.Sorted(maps.Keys(p.Env)) {
-		v := p.Env[k]
-		switch {
-		case !pluginEnvNamePattern.MatchString(k):
-			return nil, fmt.Errorf("Backend Plugin %q: env %q: use up to 128 letters, digits, and '_', not starting with a digit", name, k)
-		case k == "GODEBUG":
-			return nil, fmt.Errorf("Backend Plugin %q: env GODEBUG is set by the server to carry its FIPS 140-3 mode and cannot be configured", name)
-		case len(v) > maxEnvValueBytes:
-			return nil, fmt.Errorf("Backend Plugin %q: env %s is %d bytes, over the %d byte limit", name, k, len(v), maxEnvValueBytes)
-		case strings.ContainsFunc(v, unicode.IsControl):
-			return nil, fmt.Errorf("Backend Plugin %q: env %s contains a control character", name, k)
+		if err := client.ValidateEnv(k, p.Env[k]); err != nil {
+			return nil, fmt.Errorf("Backend Plugin %q: %w", name, err)
 		}
-		env = append(env, k+"="+v)
+		env = append(env, k+"="+p.Env[k])
 	}
 	return env, nil
 }

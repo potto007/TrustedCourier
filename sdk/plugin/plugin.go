@@ -61,8 +61,9 @@ var (
 	ErrUnsupported = errors.New("not supported by this Backend Plugin")
 )
 
-// Serve serves b as a Backend Plugin and does not return. Call it from main.
-// It exits with an error if b declares CourierKeyWrite without implementing
+// Serve serves b as a Backend Plugin until the core stops it, then exits the
+// process with status 0; it never returns. Call it from main. It exits with
+// an error if b declares CourierKeyWrite without implementing
 // CourierKeyWriter.
 //
 // Serve hardens the plugin process the way the core hardens itself: core
@@ -83,6 +84,9 @@ func Serve(b Backend) {
 		}
 	}
 	protocol.Serve(&server{backend: b})
+	// go-plugin's Serve returns after an orderly shutdown; the exit status
+	// tells the core it was one.
+	os.Exit(0)
 }
 
 // server adapts a Backend to the wire protocol, holding it to the same
@@ -164,14 +168,17 @@ func (s *server) WriteCourierKey(ctx context.Context, req *protocol.WriteCourier
 }
 
 func malformed(err error) error {
-	// Internal is what the client reports as a malformed response.
-	return status.Error(codes.Internal, "Backend Plugin produced a malformed response: "+err.Error())
+	// Internal with this prefix is what the client reports as a malformed
+	// response.
+	return status.Error(codes.Internal, contract.MalformedPrefix+err.Error())
 }
 
 func toStatus(err error) error {
 	switch {
 	case errors.Is(err, ErrNotFound):
-		return status.Error(codes.NotFound, ErrNotFound.Error())
+		// The message says which location, or which part of it, was not
+		// found; the client keeps it beside ErrNotFound.
+		return status.Error(codes.NotFound, contract.Sanitize(err.Error()))
 	case errors.Is(err, ErrUnsupported):
 		return status.Error(codes.Unimplemented, ErrUnsupported.Error())
 	default:

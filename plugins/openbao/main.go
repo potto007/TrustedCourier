@@ -31,13 +31,17 @@ import (
 
 func main() {
 	cfg, err := configFromEnv()
-	if err == nil {
-		var b *openbao.Backend
-		b, err = openbao.New(cfg)
-		if err == nil {
-			plugin.Serve(b)
-		}
+	if err != nil {
+		fail(err)
 	}
+	b, err := openbao.New(cfg)
+	if err != nil {
+		fail(err)
+	}
+	plugin.Serve(b) // exits the process when the core stops the plugin
+}
+
+func fail(err error) {
 	fmt.Fprintln(os.Stderr, "openbao Backend Plugin:", err)
 	os.Exit(2)
 }

@@ -45,15 +45,16 @@ type Fixture struct {
 	// record without the named field. The plugin must fail a Get there with
 	// its own error saying what is wrong: not ErrNotFound, and not by
 	// serving the value and leaving the SDK to refuse it, which the core
-	// reports as a plugin defect. Optional, but every plugin has such
-	// locations, so name at least one.
+	// reports as a plugin defect. At least one is required; every Backend
+	// can hold an empty value.
 	Malformed []string
 	// CourierKeyLocation is where the kit may write a Courier Key. Required
 	// when the plugin reports the CourierKeyWrite capability.
 	CourierKeyLocation string
 	// Env is the plugin's environment, such as Backend addresses and
-	// credentials. GODEBUG is set by the kit to the test process's FIPS
-	// 140-3 mode.
+	// credentials, as "NAME=value" entries. Each is held to the rules a
+	// server applies to backend_plugins.<name>.env; GODEBUG is set by the
+	// kit to the test process's FIPS 140-3 mode.
 	Env []string
 }
 
@@ -67,8 +68,14 @@ const concurrency = 8
 // of t.
 func Run(t *testing.T, binary string, f Fixture) {
 	t.Helper()
-	if len(f.Secrets) == 0 || f.Missing == "" {
-		t.Fatal("conformance: Fixture needs at least one Secret and a Missing location")
+	if len(f.Secrets) == 0 || f.Missing == "" || len(f.Malformed) == 0 {
+		t.Fatal("conformance: Fixture needs at least one Secret, a Missing location, and a Malformed location")
+	}
+	for _, kv := range f.Env {
+		name, value, _ := strings.Cut(kv, "=")
+		if err := client.ValidateEnv(name, value); err != nil {
+			t.Fatalf("conformance: Fixture.Env: %v; a server would refuse this in backend_plugins.<name>.env", err)
+		}
 	}
 	// The kit's FIPS 140-3 mode reaches the plugin as the core's does.
 	c := launch(t, binary, f, client.GODEBUG())
@@ -125,9 +132,6 @@ func Run(t *testing.T, binary string, f Fixture) {
 	})
 
 	t.Run("GetMalformed", func(t *testing.T) {
-		if len(f.Malformed) == 0 {
-			t.Skip("Fixture names no Malformed locations")
-		}
 		for _, loc := range f.Malformed {
 			v, err := c.Get(ctx(t), loc)
 			switch {

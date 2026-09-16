@@ -108,6 +108,48 @@ func printable(what, s string) error {
 	return nil
 }
 
+// MalformedPrefix starts the message of the Internal status the SDK returns
+// when a Backend's response breaks the contract, so the client can tell the
+// SDK's refusal from a plugin's own Internal error.
+const MalformedPrefix = "Backend Plugin produced a malformed response: "
+
+// Limits on one environment variable a plugin is given.
+const (
+	MaxEnvNameBytes  = 128
+	MaxEnvValueBytes = 4096
+)
+
+// reservedEnv are environment variables a plugin must not be configured
+// with: GODEBUG carries the core's FIPS 140-3 mode, the other Go runtime
+// settings change how the plugin handles a crash or its memory, and the
+// loader variables would load code the SHA-256 pin never covered.
+var reservedEnv = map[string]bool{
+	"GODEBUG": true, "GOTRACEBACK": true, "GOGC": true, "GOMEMLIMIT": true,
+	"GOMAXPROCS": true, "GORACE": true, "GOCOVERDIR": true, "GOFLAGS": true,
+}
+
+// Env checks one environment variable a plugin is configured with.
+func Env(name, value string) error {
+	if name == "" || len(name) > MaxEnvNameBytes {
+		return fmt.Errorf("env %q: use 1 to %d letters, digits, and '_', not starting with a digit", name, MaxEnvNameBytes)
+	}
+	for i, r := range name {
+		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9') {
+			return fmt.Errorf("env %q: use letters, digits, and '_', not starting with a digit", name)
+		}
+	}
+	if reservedEnv[name] {
+		return fmt.Errorf("env %s is a Go runtime setting the server controls and cannot be configured", name)
+	}
+	if strings.HasPrefix(name, "LD_") || strings.HasPrefix(name, "DYLD_") {
+		return fmt.Errorf("env %s is a loader setting and cannot be configured; the plugin binary is pinned by its hash", name)
+	}
+	if len(value) > MaxEnvValueBytes {
+		return fmt.Errorf("env %s is %d bytes, over the %d byte limit", name, len(value), MaxEnvValueBytes)
+	}
+	return printable("env "+name, value)
+}
+
 // Sanitize makes untrusted text from a plugin safe to log or display: invalid
 // UTF-8 and control characters become '?', and it is truncated.
 func Sanitize(s string) string {

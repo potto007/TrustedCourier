@@ -460,8 +460,11 @@ func TestBackendPluginEnvIsValidated(t *testing.T) {
 		wantErr string
 	}{
 		{"GODEBUG", "      GODEBUG: fips140=off\n", "GODEBUG"},
+		{"GOTRACEBACK", "      GOTRACEBACK: crash\n", "GOTRACEBACK"},
+		{"LD_PRELOAD", "      LD_PRELOAD: /tmp/x.so\n", "LD_PRELOAD"},
 		{"bad name", "      \"BAO ADDR\": http://x\n", `env "BAO ADDR"`},
 		{"control character", "      BAO_ADDR: \"http://x\\n\"\n", "control character"},
+		{"invalid UTF-8", "      BAO_ADDR: !!binary \"gA==\"\n", "UTF-8"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
