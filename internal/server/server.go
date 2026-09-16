@@ -114,8 +114,7 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 			}
 			key, err := secrets.CourierKey(ctx, agentTLS.Key)
 			if err != nil {
-				certificate.Release()
-				return nil, nil, fmt.Errorf("fetch the TLS key: %w", err)
+				return certificate, nil, fmt.Errorf("fetch the TLS key: %w", err)
 			}
 			return certificate, key, nil
 		})

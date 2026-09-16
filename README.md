@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction and hash-chained Audit Records under signed checkpoints, work today. A real Backend and TLS do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction and hash-chained Audit Records under signed checkpoints, work today. A real Backend and automatic certificates do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -225,7 +225,7 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 
 - Upstream URLs must be `https`, and TLS is always verified. There is no setting to skip it. For an internal CA, set `ca_bundle` on the Upstream to a PEM file; it replaces the system roots for that Upstream only.
 - Redirects are never followed. The 3xx and its `Location` reach the Agent unchanged, so the Secret is never re-sent to another host.
-- HTTP/1.1 and HTTP/2 both work, to the Agent API (HTTP/2 with prior knowledge, since it is plain HTTP for now) and to the Upstream. Server-sent event streams pass through as they arrive.
+- HTTP/1.1 and HTTP/2 both work, to the Agent API (HTTP/2 by ALPN over TLS, or with prior knowledge on a plain HTTP listener) and to the Upstream. Server-sent event streams pass through as they arrive.
 - WebSockets and other protocol upgrades are refused. An `h2c` offer, as `curl --http2` sends, is answered over HTTP/1.1.
 - A response may stream for as long as the Upstream keeps sending, pauses included. The Delivery ends when neither the Upstream's response nor the Agent's request body moves for 5 minutes, or when a write to the Agent is stuck for 30 seconds. A Delivery cut off mid-response is logged as such.
 - Redaction: an Upstream that echoes the Secret back, as some do in a 401 body, sends the Agent a run of `*` of the same length instead, in headers, body, and trailers. Only exact matches are caught, not a base64 or escaped copy. A stream is held back only by trailing bytes that could begin the Secret.
@@ -505,8 +505,8 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `secrets.<name>.upstreams.<name>.ca_bundle` | no | PEM file of CA certificates that replace the system roots for this Upstream. |
 | `agent_api.listen` | no | IP address and port for the Agent API, such as `127.0.0.1:8200`, `[::1]:8200`, or `0.0.0.0:8443`. Plain HTTP is served only on a loopback address; anywhere else needs `agent_api.tls`. Not with `agent_api.socket`. Omit both to serve no Agent API. |
 | `agent_api.socket` | no | Unix socket path for the Agent API, serving plain HTTP. Connectable by every local user, as a loopback port is; Agent Tokens authenticate Agents. |
-| `agent_api.tls.certificate.backend`, `.location` | for TLS | Where the Operator-supplied certificate chain lives, as PEM with the leaf first, in a Backend ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). Needs `agent_api.listen`. |
-| `agent_api.tls.key.backend`, `.location` | for TLS | Where the certificate's private key lives, as PEM. No Secret Name may map to it. |
+| `agent_api.tls.certificate.backend`, `.location` | for TLS | Where the Operator-supplied certificate chain lives, as PEM with the leaf first, in a Backend ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). Needs `agent_api.listen`. No Secret Name may map to it. |
+| `agent_api.tls.key.backend`, `.location` | for TLS | Where the certificate's private key lives, as PKCS #8, PKCS #1, or SEC 1 PEM. No Secret Name may map to it. |
 | `audit.signing_key.backend` | with `agent_api` | The `backend_plugins` entry that holds the audit signing key. |
 | `audit.signing_key.location` | with `agent_api` | The key's location in that Backend: an Ed25519 private key as PKCS #8 PEM. No Secret Name may map to it. |
 | `audit.checkpoints.records` | no | Sign a checkpoint once this many Audit Records follow the last one. At least 1; defaults to 1000. |

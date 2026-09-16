@@ -19,14 +19,27 @@ import (
 // The socket is bound owner-only and widened to sockMode afterwards, so it
 // is never more open than intended.
 func Listen(path string, dirMode, sockMode os.FileMode, what string) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, fmt.Errorf("create %s directory: %w", what, err)
+	}
+	// MkdirAll leaves an existing directory's mode alone, so one created
+	// owner-only for another socket would keep everyone else from reaching
+	// this one: widen it to at least dirMode.
+	info, err := os.Stat(dir)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s directory: %w", what, err)
+	}
+	if mode := info.Mode().Perm(); mode|dirMode != mode {
+		if err := os.Chmod(dir, mode|dirMode); err != nil {
+			return nil, fmt.Errorf("set %s directory mode: %w", what, err)
+		}
 	}
 	if err := removeStale(path, what); err != nil {
 		return nil, err
 	}
 	var ln net.Listener
-	err := withUmask(0o177, func() error {
+	err = withUmask(0o177, func() error {
 		var err error
 		ln, err = net.Listen("unix", path)
 		return err

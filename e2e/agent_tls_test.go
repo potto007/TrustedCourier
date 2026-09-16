@@ -121,6 +121,9 @@ func TestAgentAPIServesOperatorSuppliedTLS(t *testing.T) {
 	if status := srv.TC("status"); status.ExitCode != 0 || !strings.Contains(status.Stdout, "TLS certificate: loaded") {
 		t.Errorf("tc status does not report the certificate: exit %d\n%s%s", status.ExitCode, status.Stdout, status.Stderr)
 	}
+	if env := srv.TC("env", "openai"); env.ExitCode != 0 || !strings.Contains(env.Stdout, "OPENAI_BASE_URL="+url+"/proxy/openai/api") {
+		t.Errorf("tc env does not print the https base URL: exit %d\n%s%s", env.ExitCode, env.Stdout, env.Stderr)
+	}
 }
 
 func TestAgentAPIServesTLSOnAllInterfaces(t *testing.T) {
@@ -139,6 +142,10 @@ func TestAgentAPIServesTLSOnAllInterfaces(t *testing.T) {
 	got, _ := revealWith(t, client, strings.Replace(url, "0.0.0.0", "127.0.0.1", 1), token, "github")
 	if got.Status != http.StatusOK || got.Body != "test-value-2" {
 		t.Fatalf("reveal over TLS on all interfaces = %d %q, want 200 test-value-2", got.Status, got.Body)
+	}
+	// No Agent can dial 0.0.0.0, so tc env says so instead of printing it.
+	if env := srv.TC("env", "openai"); env.ExitCode == 0 || !strings.Contains(env.Stderr, "every interface") {
+		t.Errorf("tc env with a wildcard listen address: exit %d\n%s%s", env.ExitCode, env.Stdout, env.Stderr)
 	}
 }
 

@@ -14,8 +14,9 @@ info:
     - **Reveal Delivery**: `GET /v1/reveal/{secret_name}` returns the Secret
       itself, where a Policy explicitly allows it.
 
-    Until TLS lands on the Agent listener, the API serves plain HTTP on a
-    loopback address only, over HTTP/1.1 or HTTP/2 with prior knowledge.
+    The API serves TLS, with HTTP/1.1 or HTTP/2 negotiated by ALPN, on any
+    address but loopback. On a loopback address or a unix socket it serves
+    plain HTTP, over HTTP/1.1 or HTTP/2 with prior knowledge.
 
     Every response carries `Cache-Control: no-store` and
     `X-Content-Type-Options: nosniff`.

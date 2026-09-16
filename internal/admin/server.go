@@ -9,6 +9,8 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -229,6 +231,17 @@ func (s *Server) verifyAudit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// listensOnUnspecified reports whether agentURL names an unspecified address
+// such as 0.0.0.0 or [::], which no Agent can dial.
+func listensOnUnspecified(agentURL string) bool {
+	u, err := url.Parse(agentURL)
+	if err != nil {
+		return false
+	}
+	addr, err := netip.ParseAddr(u.Hostname())
+	return err == nil && addr.IsUnspecified()
+}
+
 func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	sn, ok := s.cfg.Snapshot().Secrets[name]
@@ -244,6 +257,9 @@ func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	case s.agent.URL == "":
 		writeError(w, http.StatusBadRequest, "the Agent API is not served; set agent_api.listen")
+		return
+	case listensOnUnspecified(s.agent.URL):
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("the Agent API listens on every interface (%s), so tc env cannot name the host Agents reach it at; substitute the host yourself in %s/proxy/%s/<upstream>", s.agent.URL, s.agent.URL, name))
 		return
 	}
 	upstream := r.URL.Query().Get("upstream")
