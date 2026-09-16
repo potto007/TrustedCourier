@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction and hash-chained Audit Records under signed checkpoints, work today. A real Backend and TLS do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction and hash-chained Audit Records under signed checkpoints, work today. A real Backend and automatic certificates do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -46,6 +46,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Plugin SDK and conformance kit skeleton | done |
 | Secret Names mapped to Backend locations in config | done |
 | Reveal Delivery on a loopback Agent API | done |
+| TLS on the Agent API with Operator-supplied certificates, Agent API on a unix socket | done |
 | Proxy Delivery with header, query, and basic auth Injection Templates, OpenAPI spec for the Agent API | done |
 | Presets for OpenAI, Anthropic, and GitHub, `tc env` | done |
 | Redaction | done |
@@ -53,10 +54,10 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Method and path limits in Policies | done |
 | Hash-chained Audit Records, `tc audit verify` | done |
 | Signed audit checkpoints | done |
-| TLS and ACME | [#13](https://github.com/potto007/TrustedCourier/issues/13), [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
+| ACME | [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
-An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over plain HTTP on loopback, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
+An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
 
 ## Quickstart
 
@@ -172,13 +173,14 @@ backend_plugins:
 
 The plugin user must differ from the server's user and must not be able to read the config file, so a server that runs plugins starts as root. For development, `insecure_share_core_user: true` in place of `user` runs the plugin as the server's own user and logs a warning.
 
-`tc status` shows each plugin's state, health, and capabilities, and whether the [audit signing key](#audit) is loaded:
+`tc status` shows each plugin's state, health, and capabilities, whether the [audit signing key](#audit) is loaded, and, when the Agent API serves TLS, whether its [certificate](#tls-on-the-agent-api) is:
 
 ```
 BACKEND PLUGIN  STATE    HEALTH   CAPABILITIES       RESTARTS  DETAIL
 openbao         running  healthy  courier-key-write  0         ...
 
 Audit signing key: loaded
+TLS certificate: loaded
 ```
 
 ### Proxy Delivery
@@ -223,7 +225,7 @@ TrustedCourier finds the Agent Token where the Injection Template would put the 
 
 - Upstream URLs must be `https`, and TLS is always verified. There is no setting to skip it. For an internal CA, set `ca_bundle` on the Upstream to a PEM file; it replaces the system roots for that Upstream only.
 - Redirects are never followed. The 3xx and its `Location` reach the Agent unchanged, so the Secret is never re-sent to another host.
-- HTTP/1.1 and HTTP/2 both work, to the Agent API (HTTP/2 with prior knowledge, since it is plain HTTP for now) and to the Upstream. Server-sent event streams pass through as they arrive.
+- HTTP/1.1 and HTTP/2 both work, to the Agent API (HTTP/2 by ALPN over TLS, or with prior knowledge on a plain HTTP listener) and to the Upstream. Server-sent event streams pass through as they arrive.
 - WebSockets and other protocol upgrades are refused. An `h2c` offer, as `curl --http2` sends, is answered over HTTP/1.1.
 - A response may stream for as long as the Upstream keeps sending, pauses included. The Delivery ends when neither the Upstream's response nor the Agent's request body moves for 5 minutes, or when a write to the Agent is stuck for 30 seconds. A Delivery cut off mid-response is logged as such.
 - Redaction: an Upstream that echoes the Secret back, as some do in a 401 body, sends the Agent a run of `*` of the same length instead, in headers, body, and trailers. Only exact matches are caught, not a base64 or escaped copy. A stream is held back only by trailing bytes that could begin the Secret.
@@ -360,7 +362,34 @@ The body is the Secret, byte for byte, with `Cache-Control: no-store`. TrustedCo
 | 502 | The Backend could not return the Secret. Details go to the server log only. |
 | 503 | The server has no locked memory left to hold the Secret (raise `RLIMIT_MEMLOCK`), or has not loaded the audit signing key yet or cannot store Audit Records (`tc status` says why). |
 
-The Agent Token may go in `X-TC-Agent-Token` instead of `Authorization`. The Agent API serves plain HTTP, so until TLS lands ([#13](https://github.com/potto007/TrustedCourier/issues/13)) it listens only on a loopback IP address ([ADR-0012](docs/decisions/0012-reveal-delivery-api-and-secret-memory.md)).
+The Agent Token may go in `X-TC-Agent-Token` instead of `Authorization`. The Agent API serves plain HTTP only on a loopback IP address or a unix socket; anywhere else it serves TLS ([ADR-0006](docs/decisions/0006-tls-with-built-in-acme.md)).
+
+### TLS on the Agent API
+
+Agent Tokens and Reveal Deliveries never cross a network in plaintext. To serve Agents beyond loopback, put a certificate chain and its private key in a Backend and name them under `agent_api.tls`; the server refuses a non-loopback `listen` without it:
+
+```yaml
+agent_api:
+  listen: 0.0.0.0:8443
+  tls:
+    certificate:
+      backend: openbao
+      location: secret/data/trustedcourier#tls-certificate
+    key:
+      backend: openbao
+      location: secret/data/trustedcourier#tls-key
+```
+
+The certificate location holds the PEM chain, leaf first; the key location holds the leaf's private key as PEM. Both are Courier Keys: they live in the Backend, never on TrustedCourier's disk, and no Secret Name may map to the key's location. The listener binds at startup, but no TLS handshake completes until the pair is loaded from the Backend; the server retries every few seconds, and `tc status` reports `TLS certificate: not loaded` with the reason, including an expired certificate or a key that does not match. HTTP/2 is negotiated by ALPN. Rotating the pair in the Backend takes a restart ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). Automatic certificates via ACME are [#14](https://github.com/potto007/TrustedCourier/issues/14).
+
+Agents on the same host can use a unix socket instead, which needs no certificate:
+
+```yaml
+agent_api:
+  socket: /run/trustedcourier/agent.sock
+```
+
+The socket is connectable by every local user, as a loopback port is; Agent Tokens do the authenticating. `tc env` needs `agent_api.listen`, since a base URL cannot name a socket.
 
 ### Audit
 
@@ -474,9 +503,12 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `secrets.<name>.upstreams` | with `injection_template`; optional with `preset` | Map of Upstream name to Upstream. Each is served at `/proxy/<Secret Name>/<Upstream name>`. |
 | `secrets.<name>.upstreams.<name>.url` | yes | The Upstream's `https` base URL, optionally with a path. No user information, query, or fragment. |
 | `secrets.<name>.upstreams.<name>.ca_bundle` | no | PEM file of CA certificates that replace the system roots for this Upstream. |
-| `agent_api.listen` | no | Loopback IP address and port for the Agent API, such as `127.0.0.1:8200` or `[::1]:8200`. Omit it to serve no Agent API. |
-| `audit.signing_key.backend` | with `agent_api.listen` | The `backend_plugins` entry that holds the audit signing key. |
-| `audit.signing_key.location` | with `agent_api.listen` | The key's location in that Backend: an Ed25519 private key as PKCS #8 PEM. No Secret Name may map to it. |
+| `agent_api.listen` | no | IP address and port for the Agent API, such as `127.0.0.1:8200`, `[::1]:8200`, or `0.0.0.0:8443`. Plain HTTP is served only on a loopback address; anywhere else needs `agent_api.tls`. Not with `agent_api.socket`. Omit both to serve no Agent API. |
+| `agent_api.socket` | no | Unix socket path for the Agent API, serving plain HTTP. Connectable by every local user, as a loopback port is; Agent Tokens authenticate Agents. |
+| `agent_api.tls.certificate.backend`, `.location` | for TLS | Where the Operator-supplied certificate chain lives, as PEM with the leaf first, in a Backend ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). Needs `agent_api.listen`. No Secret Name may map to it. |
+| `agent_api.tls.key.backend`, `.location` | for TLS | Where the certificate's private key lives, as PKCS #8, PKCS #1, or SEC 1 PEM. No Secret Name may map to it. |
+| `audit.signing_key.backend` | with `agent_api` | The `backend_plugins` entry that holds the audit signing key. |
+| `audit.signing_key.location` | with `agent_api` | The key's location in that Backend: an Ed25519 private key as PKCS #8 PEM. No Secret Name may map to it. |
 | `audit.checkpoints.records` | no | Sign a checkpoint once this many Audit Records follow the last one. At least 1; defaults to 1000. |
 | `audit.checkpoints.interval` | no | Sign a checkpoint at least this often while records are waiting for one, as a Go duration. At least `1s`; defaults to `1m`. |
 
@@ -503,6 +535,7 @@ Policies, Secret Names, Upstreams, Injection Templates, and Presets take effect 
 - The data directory is 0700 and the database files are 0600. The server tightens them again at every start, in case a backup restore loosened them.
 - The admin socket checks the connecting process's UID against `admin.allowed_uids` before it looks at the Operator Credential. The socket file is owner-only unless other users are allowed.
 - A second server pointed at a live socket refuses to start. A stale socket left by a crash is replaced.
+- The Agent API serves plain HTTP only on loopback or a unix socket. Anywhere else it serves TLS from an Operator-supplied certificate and key held in a Backend, never on disk, and completes no handshake until they are loaded ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)).
 - Revoking an Agent Token twice succeeds and keeps the first revocation time.
 - A Backend Plugin binary whose SHA-256 differs from the pinned hash stops the server at boot and is never relaunched after boot. On Linux the server executes the file descriptor it hashed, so swapping the binary after the check does not work ([ADR-0011](docs/decisions/0011-backend-plugin-host-and-protocol.md)).
 - Backend Plugins run as a separate OS user that cannot read the config file or own the data directory, with an empty environment apart from `GODEBUG`. Core and plugin talk over go-plugin's automatic mutual TLS.

@@ -4,9 +4,11 @@ package agentapi
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +25,7 @@ import (
 	"github.com/potto007/TrustedCourier/internal/httpserve"
 	"github.com/potto007/TrustedCourier/internal/resolver"
 	"github.com/potto007/TrustedCourier/internal/secret"
+	"github.com/potto007/TrustedCourier/internal/unixsocket"
 )
 
 // AgentTokenHeader carries the Agent Token when Authorization cannot.
@@ -33,17 +36,34 @@ const AgentTokenHeader = "X-TC-Agent-Token"
 // exist.
 const deniedMessage = "denied: no Policy on this Agent Token allows this Delivery"
 
-// Listen binds addr, which must be a loopback address: the Agent API serves
-// plain HTTP.
-func Listen(addr string) (net.Listener, error) {
-	ln, err := net.Listen("tcp", addr)
+// Listen binds the Agent API listener cfg configures: a unix socket, a TCP
+// address serving TLS with tlsConfig when cfg.TLS is set, or a plain HTTP
+// TCP address, which must be loopback (ADR-0006). tlsConfig is required
+// exactly when cfg.TLS is set.
+//
+// The socket is connectable by every local user, as a loopback address is;
+// Agent Tokens authenticate Agents on either.
+func Listen(cfg config.AgentAPI, tlsConfig *tls.Config) (net.Listener, error) {
+	if (cfg.TLS != nil) != (tlsConfig != nil) {
+		return nil, errors.New("Agent API TLS needs a TLS config exactly when agent_api.tls is set")
+	}
+	if cfg.Socket != "" {
+		if cfg.TLS != nil {
+			return nil, errors.New("Agent API TLS is not served on a unix socket")
+		}
+		return unixsocket.Listen(cfg.Socket, 0o711, 0o666, "Agent API socket")
+	}
+	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("listen on Agent API address: %w", err)
+	}
+	if cfg.TLS != nil {
+		return tls.NewListener(ln, tlsConfig), nil
 	}
 	bound, err := netip.ParseAddrPort(ln.Addr().String())
 	if err != nil || !bound.Addr().Unmap().IsLoopback() {
 		_ = ln.Close()
-		return nil, fmt.Errorf("Agent API bound %s, which is not a loopback address", ln.Addr())
+		return nil, fmt.Errorf("Agent API bound %s, which is not a loopback address, without TLS", ln.Addr())
 	}
 	return ln, nil
 }
@@ -109,17 +129,22 @@ func (s *Server) currentSnapshot() *snapshot {
 	return snap
 }
 
-// Serve serves the Agent API on ln until ctx is done.
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+// Serve serves the Agent API on ln until ctx is done. tlsServed says whether
+// ln serves TLS, where HTTP/2 is negotiated by ALPN; a plain HTTP listener
+// serves HTTP/2 by prior knowledge.
+func (s *Server) Serve(ctx context.Context, ln net.Listener, tlsServed bool) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/reveal/{secret_name}", s.reveal)
 	mux.HandleFunc("/proxy/{secret_name}/{upstream}", s.proxy)
 	mux.HandleFunc("/proxy/{secret_name}/{upstream}/{rest...}", s.proxy)
 
-	// The listener is loopback plain HTTP, so HTTP/2 is by prior knowledge.
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
-	protocols.SetUnencryptedHTTP2(true)
+	if tlsServed {
+		protocols.SetHTTP2(true)
+	} else {
+		protocols.SetUnencryptedHTTP2(true)
+	}
 	handler := noStore(s.requireAudit(mux))
 	srv := &http.Server{
 		Protocols: protocols,
@@ -133,7 +158,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		WriteTimeout:   30 * time.Second,
 		IdleTimeout:    time.Minute,
 		MaxHeaderBytes: 64 << 10,
-		ErrorLog:       slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
+		ErrorLog:       log.New(handshakeErrorsToDebug{s.log}, "", 0),
 	}
 	stop := context.AfterFunc(ctx, func() { s.stopping.Store(true) })
 	defer stop()
@@ -142,6 +167,23 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	// cut it off.
 	s.inflight.Lock()
 	return err
+}
+
+// handshakeErrorsToDebug is net/http's error log. A failed TLS handshake is
+// logged at Debug, not Warn: on a network listener any remote can fail one
+// per connection before an Agent Token is looked at, and the reason (no
+// certificate loaded yet, a client that does not trust the CA) is already
+// reported elsewhere. Everything else net/http reports stays at Warn.
+type handshakeErrorsToDebug struct{ log *slog.Logger }
+
+func (h handshakeErrorsToDebug) Write(p []byte) (int, error) {
+	msg := strings.TrimSuffix(string(p), "\n")
+	level := slog.LevelWarn
+	if strings.HasPrefix(msg, "http: TLS handshake error") {
+		level = slog.LevelDebug
+	}
+	h.log.Log(context.Background(), level, msg)
+	return len(p), nil
 }
 
 // noStore keeps every Agent API response, Secret or not, out of caches.

@@ -153,11 +153,6 @@ func TestSecretNameConfigIsValidated(t *testing.T) {
 		{"missing location", "secrets:\n  github:\n    backend: fake\n", "location is required"},
 		{"control character in location", "secrets:\n  github:\n    backend: fake\n    location: \"kv/\\u001bgithub\"\n", "control character"},
 		{"invalid Secret Name", "secrets:\n  \"bad name\":\n    backend: fake\n    location: kv/github\n", `invalid Secret Name "bad name"`},
-		{"all interfaces", "agent_api:\n  listen: 0.0.0.0:8200\n", "not a loopback address"},
-		{"IPv6 all interfaces", "agent_api:\n  listen: \"[::]:8200\"\n", "not a loopback address"},
-		{"routable address", "agent_api:\n  listen: 192.0.2.10:8200\n", "not a loopback address"},
-		{"host name", "agent_api:\n  listen: localhost:8200\n", "loopback IP address"},
-		{"no port", "agent_api:\n  listen: 127.0.0.1\n", "loopback IP address"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

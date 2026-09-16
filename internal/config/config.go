@@ -73,11 +73,36 @@ type CourierKey struct {
 	Location string
 }
 
-// AgentAPI configures the Agent API listener.
+// AgentAPI configures the Agent API listener: a TCP address or a unix
+// socket, never both. Both empty serves no Agent API.
 type AgentAPI struct {
-	// Listen is the loopback address and port to serve plain HTTP on, such
-	// as 127.0.0.1:8200. Empty serves no Agent API.
+	// Listen is the IP address and port to serve on, such as 127.0.0.1:8200
+	// or 0.0.0.0:8443. Plain HTTP is served only on a loopback address;
+	// anywhere else TLS is set (ADR-0006).
 	Listen string
+	// Socket is the unix socket path to serve plain HTTP on.
+	Socket string
+	// TLS holds the Courier Keys the listener serves TLS with. Nil serves
+	// plain HTTP, which validation allows only on loopback or a unix socket.
+	TLS *AgentTLS
+}
+
+// Served reports whether an Agent API is served at all.
+func (a AgentAPI) Served() bool { return a.Listen != "" || a.Socket != "" }
+
+// Equal reports whether a and b configure the same listener.
+func (a AgentAPI) Equal(b AgentAPI) bool {
+	return a.Listen == b.Listen && a.Socket == b.Socket &&
+		(a.TLS == nil) == (b.TLS == nil) && (a.TLS == nil || *a.TLS == *b.TLS)
+}
+
+// AgentTLS is where the Agent API's Operator-supplied certificate and key
+// live: Courier Keys in a Backend, never on TrustedCourier's disk (ADR-0001).
+type AgentTLS struct {
+	// Certificate holds the certificate chain as PEM, leaf first.
+	Certificate CourierKey
+	// Key holds the leaf's private key as PEM.
+	Key CourierKey
 }
 
 // MaxCacheTTL is the longest a Secret Name may cache its Secret: the cache
@@ -245,7 +270,14 @@ type fileCheckpoints struct {
 }
 
 type fileAgentAPI struct {
-	Listen string `yaml:"listen"`
+	Listen string        `yaml:"listen"`
+	Socket string        `yaml:"socket"`
+	TLS    *fileAgentTLS `yaml:"tls"`
+}
+
+type fileAgentTLS struct {
+	Certificate *fileCourierKey `yaml:"certificate"`
+	Key         *fileCourierKey `yaml:"key"`
 }
 
 type fileSecretName struct {
@@ -398,11 +430,8 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 			}
 		}
 	}
-	if raw.AgentAPI.Listen != "" {
-		if err := checkLoopback(raw.AgentAPI.Listen); err != nil {
-			return nil, err
-		}
-		cfg.AgentAPI.Listen = raw.AgentAPI.Listen
+	if err := raw.AgentAPI.validate(cfg, baseDir); err != nil {
+		return nil, err
 	}
 	if err := raw.Audit.validate(cfg); err != nil {
 		return nil, err
@@ -410,23 +439,58 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 	return cfg, nil
 }
 
+// validate sets cfg.AgentAPI. It needs cfg's admin socket, Backend Plugins,
+// and Secret Names already validated.
+func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
+	switch {
+	case a.Listen != "" && a.Socket != "":
+		return errors.New("set agent_api.listen or agent_api.socket, not both")
+	case a.TLS != nil && a.Listen == "":
+		return errors.New("agent_api.tls needs agent_api.listen: a unix socket serves plain HTTP")
+	}
+	if a.Listen != "" {
+		addr, err := netip.ParseAddrPort(a.Listen)
+		if err != nil {
+			return fmt.Errorf("agent_api.listen %q must be an IP address and port, such as 127.0.0.1:8200", a.Listen)
+		}
+		// TLS is required on every listener except loopback and unix
+		// sockets (ADR-0006).
+		if a.TLS == nil && !addr.Addr().Unmap().IsLoopback() {
+			return fmt.Errorf("agent_api.listen %q is not a loopback address, so agent_api.tls is required: Agent Tokens and Reveal Deliveries never cross a network in plaintext", a.Listen)
+		}
+		cfg.AgentAPI.Listen = a.Listen
+	}
+	if a.Socket != "" {
+		cfg.AgentAPI.Socket = resolve(baseDir, a.Socket)
+		if cfg.AgentAPI.Socket == cfg.Admin.Socket {
+			return fmt.Errorf("agent_api.socket %s is the admin socket; give the Agent API its own", cfg.AgentAPI.Socket)
+		}
+	}
+	if a.TLS != nil {
+		cert, err := a.TLS.Certificate.validateCourierKey("agent_api.tls.certificate", "the Agent API's TLS certificate", cfg)
+		if err != nil {
+			return err
+		}
+		key, err := a.TLS.Key.validateCourierKey("agent_api.tls.key", "the Agent API's TLS key", cfg)
+		if err != nil {
+			return err
+		}
+		cfg.AgentAPI.TLS = &AgentTLS{Certificate: cert, Key: key}
+	}
+	return nil
+}
+
 // validate sets cfg.Audit. It needs cfg's Backend Plugins, Secret Names, and
 // Agent API already validated.
 func (a fileAudit) validate(cfg *Config) error {
 	if a.SigningKey == nil {
-		if cfg.AgentAPI.Listen != "" {
-			return errors.New("audit.signing_key is required with agent_api.listen: every Delivery attempt is audited, and TrustedCourier signs the audit chain with that Courier Key")
+		if cfg.AgentAPI.Served() {
+			return errors.New("audit.signing_key is required with agent_api: every Delivery attempt is audited, and TrustedCourier signs the audit chain with that Courier Key")
 		}
 	} else {
-		key, err := a.SigningKey.validate(cfg.BackendPlugins)
+		key, err := a.SigningKey.validateCourierKey("audit.signing_key", "the audit signing key", cfg)
 		if err != nil {
-			return fmt.Errorf("audit.signing_key: %w", err)
-		}
-		// A Courier Key is never delivered to Agents.
-		for _, name := range slices.Sorted(maps.Keys(cfg.Secrets)) {
-			if s := cfg.Secrets[name]; s.Backend == key.Backend && s.Location == key.Location {
-				return fmt.Errorf("Secret Name %q maps to the audit signing key's location; a Courier Key is never delivered to Agents", name)
-			}
+			return err
 		}
 		cfg.Audit.SigningKey = &key
 	}
@@ -453,33 +517,29 @@ func (a fileAudit) validate(cfg *Config) error {
 	return nil
 }
 
-func (k fileCourierKey) validate(plugins map[string]BackendPlugin) (CourierKey, error) {
+// validateCourierKey validates the Courier Key at config key configKey,
+// described as what, against cfg's Backend Plugins and Secret Names. k may
+// be nil, when the key is missing.
+func (k *fileCourierKey) validateCourierKey(configKey, what string, cfg *Config) (CourierKey, error) {
 	switch {
-	case k.Backend == "":
-		return CourierKey{}, errors.New("backend is required")
+	case k == nil || k.Backend == "":
+		return CourierKey{}, fmt.Errorf("%s: backend is required", configKey)
 	case k.Location == "":
-		return CourierKey{}, errors.New("location is required")
+		return CourierKey{}, fmt.Errorf("%s: location is required", configKey)
 	}
 	if err := client.ValidateLocation(k.Location); err != nil {
-		return CourierKey{}, err
+		return CourierKey{}, fmt.Errorf("%s: %w", configKey, err)
 	}
-	if _, ok := plugins[k.Backend]; !ok {
-		return CourierKey{}, fmt.Errorf("unknown backend %q; name one of backend_plugins", k.Backend)
+	if _, ok := cfg.BackendPlugins[k.Backend]; !ok {
+		return CourierKey{}, fmt.Errorf("%s: unknown backend %q; name one of backend_plugins", configKey, k.Backend)
+	}
+	// A Courier Key is never delivered to Agents.
+	for _, name := range slices.Sorted(maps.Keys(cfg.Secrets)) {
+		if s := cfg.Secrets[name]; s.Backend == k.Backend && s.Location == k.Location {
+			return CourierKey{}, fmt.Errorf("Secret Name %q maps to the location of %s; a Courier Key is never delivered to Agents", name, what)
+		}
 	}
 	return CourierKey{Backend: k.Backend, Location: k.Location}, nil
-}
-
-// checkLoopback accepts only a loopback IP address and port: the Agent API
-// serves plain HTTP, and TLS is required on every other listener (ADR-0006).
-func checkLoopback(listen string) error {
-	addr, err := netip.ParseAddrPort(listen)
-	if err != nil {
-		return fmt.Errorf("agent_api.listen %q must be a loopback IP address and port, such as 127.0.0.1:8200", listen)
-	}
-	if !addr.Addr().Unmap().IsLoopback() {
-		return fmt.Errorf("agent_api.listen %q is not a loopback address; the Agent API serves plain HTTP, so it may only listen on loopback", listen)
-	}
-	return nil
 }
 
 func (s fileSecretName) validate(name, baseDir string, plugins map[string]BackendPlugin) (SecretName, error) {

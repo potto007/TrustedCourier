@@ -43,6 +43,17 @@ type Status struct {
 	BackendPlugins  []BackendPluginStatus `json:"backend_plugins"`
 	AuditSigningKey AuditSigningKeyStatus `json:"audit_signing_key"`
 	AuditRecords    AuditRecordsStatus    `json:"audit_records"`
+	// TLSCertificate is the Agent API's certificate state, or nil when the
+	// Agent API does not serve TLS.
+	TLSCertificate *TLSCertificateStatus `json:"tls_certificate,omitempty"`
+}
+
+// TLSCertificateStatus is whether the Agent API's TLS certificate is loaded.
+// No TLS handshake completes until it is.
+type TLSCertificateStatus struct {
+	Loaded bool `json:"loaded"`
+	// Detail is why the certificate is not loaded, or empty when it is.
+	Detail string `json:"detail"`
 }
 
 // AuditRecordsStatus is whether Audit Records are being stored. The Agent API
