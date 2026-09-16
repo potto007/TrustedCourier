@@ -119,10 +119,10 @@ func StartDevOpenBao(t *testing.T) *OpenBao {
 
 func runOpenBao(t *testing.T, docker, rootToken string, args ...string) *OpenBao {
 	t.Helper()
-	// Only stdout holds the container ID; a pull, when the image is not
-	// present, reports on stderr.
 	// A fixed port, so the address in a config file survives a restart.
 	address := fmt.Sprintf("127.0.0.1:%d", FreePort(t))
+	// Only stdout holds the container ID; a pull, when the image is not
+	// present, reports on stderr.
 	var stderr strings.Builder
 	run := exec.Command(docker, append([]string{"run", "--detach", "--rm", "--cap-add=IPC_LOCK",
 		"--publish", address + ":8200"}, args...)...)

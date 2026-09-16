@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, Proxy and Reveal Delivery over TLS with Operator-supplied or ACME certificates, Redaction, and hash-chained Audit Records under signed checkpoints work today. A real Backend does not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, Proxy and Reveal Delivery over TLS with Operator-supplied or ACME certificates, Redaction, hash-chained Audit Records under signed checkpoints, the bundled OpenBao Backend, and `tc init` with a docker compose stack work today. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -26,7 +26,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 - **Backend Plugins run out of process** ([ADR-0004](docs/decisions/0004-out-of-process-backend-plugins.md)) through hashicorp/go-plugin, pinned by SHA-256, with their responses treated as untrusted input.
 - **TLS everywhere, with built-in ACME** ([ADR-0006](docs/decisions/0006-tls-with-built-in-acme.md)).
 - **Tamper-evident audit** ([ADR-0007](docs/decisions/0007-tamper-evident-audit.md)). Audit Records are hash-chained with signed checkpoints and never contain Secret values or bodies.
-- **Batteries included** ([ADR-0008](docs/decisions/0008-bundled-openbao-static-seal.md)). `tc init` and one docker compose file will bring up TrustedCourier with a bundled OpenBao Backend.
+- **Batteries included** ([ADR-0008](docs/decisions/0008-bundled-openbao-static-seal.md)). `tc init` and one docker compose file bring up TrustedCourier with a bundled OpenBao Backend ([ADR-0029](docs/decisions/0029-tc-init-seal-key-hand-off-and-bootstrap-order.md)).
 - **All Go** ([ADR-0003](docs/decisions/0003-go-over-rust-core.md)), with FIPS 140-3 mode as a runtime switch that every Backend Plugin must follow ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)).
 
 [`CONTEXT.md`](CONTEXT.md) defines the vocabulary (Operator, Agent, Agent Token, Policy, Secret Name, Backend, Delivery, and so on). The code, docs, and issues use those terms exactly.
@@ -57,9 +57,9 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | ACME with TLS-ALPN-01 and HTTP-01, certificates as Courier Keys | done |
 | ACME DNS-01 with built-in DNS providers | done |
 | Remote admin listener with mutual TLS | done |
-| `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
+| `tc init` and docker compose, static release binaries | done |
 
-An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied or ACME certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. Secrets and Courier Keys live in OpenBao through the bundled [OpenBao Backend Plugin](#the-openbao-backend-plugin); `tc init` and the compose file that set OpenBao up wait on [#19](https://github.com/potto007/TrustedCourier/issues/19).
+An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied or ACME certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. Secrets and Courier Keys live in OpenBao through the bundled [OpenBao Backend Plugin](#the-openbao-backend-plugin), which [`tc init` and the compose file](#the-bundled-openbao-docker-compose-and-tc-init) set up.
 
 ## Quickstart
 
@@ -150,6 +150,50 @@ emqckmg73t6p2xaj  openai-proxy  2026-10-14T16:42:39Z  never      revoked
 `token issue` and `token list` take `--json` for scripting. Every Agent Token needs an expiry, given as `--expires-in` (a Go duration such as `12h`, or whole days such as `30d`) or `--expires-at` (RFC 3339). `--policy` repeats to attach several Policies, and an unknown Policy name is rejected.
 
 Stop the server with Ctrl-C or SIGTERM.
+
+### The bundled OpenBao: docker compose and `tc init`
+
+With no secret store of your own, [`deploy/compose.yaml`](deploy/compose.yaml) runs TrustedCourier and OpenBao together, and `tc init` sets OpenBao up ([ADR-0008](docs/decisions/0008-bundled-openbao-static-seal.md), [ADR-0029](docs/decisions/0029-tc-init-seal-key-hand-off-and-bootstrap-order.md)). From `deploy/`, with the Agent API's public name and your ACME contact filled into [`trustedcourier.yaml`](deploy/trustedcourier.yaml):
+
+```sh
+chmod 600 trustedcourier.yaml               # the plugin user must not read it
+docker compose build
+docker compose run --rm trustedcourier tc plugin sha256 /usr/local/lib/trustedcourier/plugins/openbao
+# paste the hash into trustedcourier.yaml
+docker compose run --rm trustedcourier tc init --config /etc/trustedcourier/trustedcourier.yaml --seal-key-file /openbao/seal/unseal.key
+docker compose up -d
+```
+
+`tc init` waits for OpenBao, initializes it with the static seal, mounts a KV v2 engine at `secret/`, issues the Backend Plugin a token with a policy covering only that mount, stores an audit signing key through the plugin, and creates the Operator Credential. It prints, once:
+
+```
+Static seal key (base64 of /openbao/seal/unseal.key; back it up, OpenBao cannot start without it; TrustedCourier does not keep it):
+...
+Recovery keys (any 3 of the 5 regenerate the root token; shown once, TrustedCourier does not keep them):
+...
+Root token (shown once, TrustedCourier does not keep it; store Secrets with it, then keep it offline):
+s....
+Backend Plugin openbao: token with policy trustedcourier written to /var/lib/trustedcourier/openbao/token (expires 2027-09-16T18:00:00Z; the plugin does not renew it).
+Audit signing key: generated and stored at secret/data/trustedcourier#audit-signing-key.
+
+Operator Credential (shown once; store it now, it cannot be shown again):
+tcoc_...
+```
+
+Nothing keeps the seal key, recovery keys, or root token but you. The seal key is OpenBao's, on the `openbao-seal` volume, never in TrustedCourier's data directory ([ADR-0001](docs/decisions/0001-no-secrets-or-courier-keys-on-disk.md)); OpenBao's container waits for `tc init` to write it and hands it to OpenBao in its environment, so `tc init` and `docker compose up` work in either order. `tc init` refuses an OpenBao that is already initialized; to finish a bootstrap that stopped part way, rerun it with a root token in `BAO_TOKEN`. `--recovery-shares` and `--recovery-threshold` change the split; `--plugin-token-ttl` the plugin token's lifetime (a year by default, which the compose file's OpenBao allows; another OpenBao caps it at its `max_lease_ttl`, and `tc init` prints the expiry it got).
+
+Store Secrets with the root token, from inside OpenBao's container, and administer TrustedCourier from inside its own:
+
+```sh
+docker compose exec -e BAO_TOKEN=s.... openbao bao kv put -mount=secret openai key=sk-...
+docker compose exec -e TC_OPERATOR_CREDENTIAL=tcoc_... trustedcourier tc token issue --policy openai-proxy --expires-in 30d
+```
+
+> **A static seal key on the same host is a convenience, not a security boundary.** Anyone who can read the `openbao-seal` and `openbao-data` volumes can read every Secret. For production, move OpenBao's seal to a KMS or HSM: OpenBao's [seal documentation](https://openbao.org/docs/concepts/seal/) covers the seal types and the migration from one seal to another, with the recovery keys `tc init` showed.
+
+For a demo on one machine, with no domain and nothing persistent, [`compose.dev.yaml`](deploy/compose.dev.yaml) runs OpenBao in in-memory dev mode and the Agent API on the host's loopback without TLS; `tc init --dev` then takes OpenBao's root token from `BAO_DEV_ROOT_TOKEN_ID`, which a `.env` file gives both containers. The steps are at the top of that file. Everything in OpenBao is lost when it stops.
+
+Outside containers, [`scripts/build-release.sh`](scripts/build-release.sh) builds `tc` and the OpenBao plugin as static, stripped binaries against the validated FIPS 140-3 module, with a `SHA256SUMS` in the form the config pins, and `tc init` runs the same way against any OpenBao whose config has a `seal "static"` reading the key file you name.
 
 ### Backend Plugins
 
@@ -587,6 +631,7 @@ A chain rewritten with recomputed hashes, a checkpoint that was deleted or does 
 ## CLI
 
 ```
+tc init --config <path> (--seal-key-file <path> | --dev) [--backend <name>] [--recovery-shares <n>] [--recovery-threshold <n>] [--plugin-token-ttl <duration>] [--wait <duration>]
 tc server run --config <path>
 tc token issue --policy <name> [--policy <name>...] (--expires-in <lifetime> | --expires-at <RFC 3339>) [--json]
 tc token list [--json]
@@ -605,6 +650,8 @@ tc plugin sha256 <path>
 | `TC_ADMIN_URL` | The [remote admin listener](#remote-administration), as `https://host:port`, used instead of the socket when set. |
 | `TC_ADMIN_CLIENT_CERT`, `TC_ADMIN_CLIENT_KEY` | PEM files holding the client certificate and its private key `tc` presents to `TC_ADMIN_URL`. Both are required with it. |
 | `TC_ADMIN_CA_BUNDLE` | PEM file of CA certificates that verify the listener's certificate. Defaults to the system roots. |
+| `BAO_DEV_ROOT_TOKEN_ID` | OpenBao's dev-mode root token, for `tc init --dev`. |
+| `BAO_TOKEN` | A root token, for `tc init` against an OpenBao that is already initialized. |
 
 Exit codes are 0 for success, 1 for a failed operation, and 2 for a malformed command line.
 
@@ -721,6 +768,7 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `internal/admin` | Admin API server and client over the unix socket. |
 | `internal/agentapi` | Agent API server: Proxy Delivery and Reveal Delivery. |
 | `internal/audit` | Audit Records: appended to SQLite, hash-chained, streamed as JSON lines, covered by signed checkpoints, and verified. |
+| `internal/bootstrap` | `tc init`'s OpenBao side: the static seal key, `sys/init`, the KV mount, the plugin's policy and token. |
 | `internal/cli` | Command-line parsing and output. |
 | `internal/config` | Config loading and validation. |
 | `internal/pluginhost` | Plugin Host: verifies, launches, supervises, and reports Backend Plugins, and fetches Secrets through them. |
@@ -733,6 +781,8 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `sdk/plugin` | Plugin SDK module: the `Backend` interface and `Serve` for Plugin Authors, the wire protocol (`protocol`), the validating client (`client`), the conformance kit (`conformance`), and the fake Backend Plugin used by tests. |
 | `plugins/openbao` | OpenBao Backend Plugin module, on the SDK and the standard library, with its conformance test against a dev-mode OpenBao container. |
 | `docs/backend-plugins.md` | The Plugin Author guide: the SDK, the contract, and the conformance kit. |
+| `deploy` | The docker compose stack with the bundled OpenBao, its Dockerfile, and the configs it ships with. |
+| `scripts/build-release.sh` | Static release build of `tc` and the OpenBao plugin. |
 
 ## Development
 
@@ -752,9 +802,9 @@ go run ./scripts/testprogress -log /tmp/tc-tests.log -label "TrustedCourier test
 
 CI builds with `GOFIPS140=certified`, the validated FIPS 140-3 module, and runs every module twice, once with `GODEBUG=fips140=off` and once with `fips140=on`. Set both the same way to reproduce a CI leg locally; `fips140=only` also passes and catches any non-approved algorithm as a panic. The race detector is required, not optional ([ADR-0003](docs/decisions/0003-go-over-rust-core.md) relies on it).
 
-`TestBackendPluginRunsAsSeparateUser` needs a root server to switch the plugin's user and skips otherwise. CI runs it, with the separate-user refusal tests, a second time under `sudo`.
+`TestBackendPluginRunsAsSeparateUser` and `TestInitGivesTokenFileToPluginUser` need a root server to switch the plugin's user and skip otherwise. CI runs them, with the separate-user refusal tests, a second time under `sudo`.
 
-The OpenBao plugin's conformance test starts a dev-mode `openbao/openbao` container with `docker` and skips without it; set `TC_OPENBAO_ADDR` and `TC_OPENBAO_TOKEN` (a root token) to run it against an OpenBao of your own instead. CI sets `TC_REQUIRE_OPENBAO=1`, which turns the skip into a failure.
+The OpenBao plugin's conformance test and the `tc init` tests start `openbao/openbao` containers with `docker` and skip without it; the conformance test also takes `TC_OPENBAO_ADDR` and `TC_OPENBAO_TOKEN` (a root token) to run against an OpenBao of your own. CI sets `TC_REQUIRE_OPENBAO=1`, which turns the skip into a failure. `TestComposeStackBootstraps` builds the image and runs the whole compose stack; it takes minutes and runs only with `TC_COMPOSE_TEST=1`.
 
 The plugin protocol's Go code is generated. After editing `sdk/plugin/protocol/backend.proto`, run `buf generate` in that directory with `protoc-gen-go` and `protoc-gen-go-grpc` on `PATH`.
 
