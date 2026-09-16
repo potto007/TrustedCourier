@@ -587,6 +587,7 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `backend_plugins.<name>.sha256` | yes | The binary's SHA-256 as `tc plugin sha256` prints it. |
 | `backend_plugins.<name>.user` | one of these two | OS user name or ID the plugin runs as. |
 | `backend_plugins.<name>.insecure_share_core_user` | one of these two | `true` runs the plugin as the server's own user. Development only. |
+| `backend_plugins.<name>.env` | no | Map of environment variable name to value the plugin gets, such as its Backend's address. Values are up to 4096 bytes without control characters. `GODEBUG` is reserved for the server's [FIPS 140-3 mode](#fips-140-3-mode). Put credentials in a file the plugin user can read, not in the config. |
 | `secrets` | no | Map of Secret Name to where its Secret lives. |
 | `secrets.<name>.backend` | yes | The `backend_plugins` entry that holds the Secret. |
 | `secrets.<name>.location` | yes | The Secret's location in that Backend, up to 1024 bytes without control characters. |

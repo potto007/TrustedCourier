@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/potto007/TrustedCourier/sdk/plugin/client"
 	"go.yaml.in/yaml/v3"
@@ -339,6 +340,15 @@ type BackendPlugin struct {
 	// InsecureShareCoreUser runs the plugin as the server's own user, giving
 	// it access to the config and database. For development only.
 	InsecureShareCoreUser bool
+	// Env is the plugin's environment beyond what the Plugin Host sets, as
+	// "NAME=value" entries sorted by name. It never contains GODEBUG.
+	Env []string
+}
+
+// Equal reports whether a and b configure the same Backend Plugin.
+func (a BackendPlugin) Equal(b BackendPlugin) bool {
+	return a.Name == b.Name && a.Path == b.Path && a.SHA256 == b.SHA256 && a.User == b.User &&
+		a.InsecureShareCoreUser == b.InsecureShareCoreUser && slices.Equal(a.Env, b.Env)
 }
 
 // Admin configures the admin API.
@@ -532,10 +542,11 @@ type fileUpstream struct {
 }
 
 type fileBackendPlugin struct {
-	Path                  string `yaml:"path"`
-	SHA256                string `yaml:"sha256"`
-	User                  string `yaml:"user"`
-	InsecureShareCoreUser bool   `yaml:"insecure_share_core_user"`
+	Path                  string            `yaml:"path"`
+	SHA256                string            `yaml:"sha256"`
+	User                  string            `yaml:"user"`
+	InsecureShareCoreUser bool              `yaml:"insecure_share_core_user"`
+	Env                   map[string]string `yaml:"env"`
 }
 
 type fileAdmin struct {
@@ -1317,13 +1328,47 @@ func (p fileBackendPlugin) validate(name, baseDir string) (BackendPlugin, error)
 	case p.User != "" && p.InsecureShareCoreUser:
 		return BackendPlugin{}, fmt.Errorf("Backend Plugin %q: set user or insecure_share_core_user, not both", name)
 	}
+	env, err := p.validateEnv(name)
+	if err != nil {
+		return BackendPlugin{}, err
+	}
 	return BackendPlugin{
 		Name:                  name,
 		Path:                  resolve(baseDir, p.Path),
 		SHA256:                strings.ToLower(p.SHA256),
 		User:                  p.User,
 		InsecureShareCoreUser: p.InsecureShareCoreUser,
+		Env:                   env,
 	}, nil
+}
+
+// pluginEnvNamePattern is what a portable environment variable name looks
+// like.
+var pluginEnvNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+
+// maxEnvValueBytes bounds one environment value a plugin is given.
+const maxEnvValueBytes = 4096
+
+// validateEnv returns the plugin's configured environment as sorted
+// "NAME=value" entries. GODEBUG is reserved: the Plugin Host sets it to
+// carry the server's FIPS 140-3 mode (ADR-0027).
+func (p fileBackendPlugin) validateEnv(name string) ([]string, error) {
+	env := make([]string, 0, len(p.Env))
+	for _, k := range slices.Sorted(maps.Keys(p.Env)) {
+		v := p.Env[k]
+		switch {
+		case !pluginEnvNamePattern.MatchString(k):
+			return nil, fmt.Errorf("Backend Plugin %q: env %q: use up to 128 letters, digits, and '_', not starting with a digit", name, k)
+		case k == "GODEBUG":
+			return nil, fmt.Errorf("Backend Plugin %q: env GODEBUG is set by the server to carry its FIPS 140-3 mode and cannot be configured", name)
+		case len(v) > maxEnvValueBytes:
+			return nil, fmt.Errorf("Backend Plugin %q: env %s is %d bytes, over the %d byte limit", name, k, len(v), maxEnvValueBytes)
+		case strings.ContainsFunc(v, unicode.IsControl):
+			return nil, fmt.Errorf("Backend Plugin %q: env %s contains a control character", name, k)
+		}
+		env = append(env, k+"="+v)
+	}
+	return env, nil
 }
 
 // namePattern constrains Policy names and Secret Names so they are safe on a

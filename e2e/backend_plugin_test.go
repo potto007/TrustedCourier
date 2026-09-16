@@ -441,3 +441,38 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return data
 }
+
+func TestBackendPluginGetsConfiguredEnv(t *testing.T) {
+	tc := harness.New(t)
+	srv := tc.Start(harness.BaseConfig + `    env:
+      FAKEBACKEND_LABEL: from-config
+`)
+	p := waitForPlugin(t, srv, "fake", running)
+	if !p.Healthy || !strings.Contains(p.Detail, "env=from-config") {
+		t.Errorf("fake Backend Plugin health = %v %q, want its detail to show the configured env", p.Healthy, p.Detail)
+	}
+}
+
+func TestBackendPluginEnvIsValidated(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string
+		wantErr string
+	}{
+		{"GODEBUG", "      GODEBUG: fips140=off\n", "GODEBUG"},
+		{"bad name", "      \"BAO ADDR\": http://x\n", `env "BAO ADDR"`},
+		{"control character", "      BAO_ADDR: \"http://x\\n\"\n", "control character"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc := harness.New(t)
+			code, stderr := tc.Refused(harness.BaseConfig + "    env:\n" + c.env)
+			if code == 0 {
+				t.Fatal("TrustedCourier started")
+			}
+			if !strings.Contains(stderr, c.wantErr) {
+				t.Fatalf("stderr does not contain %q:\n%s", c.wantErr, stderr)
+			}
+		})
+	}
+}

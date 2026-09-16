@@ -350,10 +350,10 @@ func (p *supervised) launch() (*client.Client, error) {
 	defer func() { _ = f.Close() }()
 	cmd := verifiedCommand(f, p.cfg.Path)
 	cmd.Dir = "/"
-	// The plugin's whole environment: the server's FIPS 140-3 mode, which
-	// may come from the build's default rather than the server's own
-	// GODEBUG, so it is always spelled out.
-	cmd.Env = []string{"GODEBUG=" + client.GODEBUG()}
+	// The plugin's whole environment: what the Operator configured, plus the
+	// server's FIPS 140-3 mode, which may come from the build's default
+	// rather than the server's own GODEBUG, so it is always spelled out.
+	cmd.Env = append(slices.Clone(p.cfg.Env), "GODEBUG="+client.GODEBUG())
 	if err := setCredential(cmd, p.cred); err != nil {
 		return nil, err
 	}

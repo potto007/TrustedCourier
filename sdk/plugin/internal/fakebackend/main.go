@@ -12,7 +12,9 @@
 // log line; "nofips" bypasses the SDK and reports itself outside FIPS
 // 140-3 mode whatever mode it runs in, as a plugin built without the SDK
 // or on an old one would; "fipson" likewise reports FIPS mode "on", never
-// "only". label, when set, appears in the health detail.
+// "only". label, when set, appears in the health detail, as does the
+// FAKEBACKEND_LABEL environment variable, so a test can see what
+// environment the core gave the plugin.
 //
 // When a file named after the binary plus ".secrets.json" exists, Get serves
 // the JSON object of locations to values in it instead of the built-in
@@ -167,6 +169,9 @@ func (b *backend) Health(context.Context) (string, error) {
 	detail := fmt.Sprintf("fake Backend, uid=%d gid=%d", os.Getuid(), os.Getgid())
 	if label != "" {
 		detail += ", " + label
+	}
+	if env := os.Getenv("FAKEBACKEND_LABEL"); env != "" {
+		detail += ", env=" + env
 	}
 	if mode == "unhealthy" {
 		return detail, errors.New("Backend sealed")
