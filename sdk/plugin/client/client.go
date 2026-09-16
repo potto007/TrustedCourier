@@ -31,6 +31,11 @@ import (
 // StartTimeout bounds launching a plugin through its first response.
 const StartTimeout = 10 * time.Second
 
+// ErrMalformed means a plugin's response broke the protocol contract: it
+// was refused on arrival, or the SDK refused it before it left the plugin.
+// It is a plugin defect, never a Backend state.
+var ErrMalformed = errors.New("malformed response from Backend Plugin")
+
 // Client is one running Backend Plugin process.
 type Client struct {
 	process *goplugin.Client
@@ -272,11 +277,16 @@ func callError(method string, err error) error {
 		return fmt.Errorf("%s: %w", method, plugin.ErrNotFound)
 	case codes.Unimplemented:
 		return fmt.Errorf("%s: %w", method, plugin.ErrUnsupported)
+	case codes.Internal:
+		// The SDK's own refusal of a response, or a plugin's internal fault:
+		// a defect in the plugin either way.
+		return fmt.Errorf("%s: %w: %s", method, ErrMalformed,
+			contract.Sanitize(strings.TrimPrefix(st.Message(), "Backend Plugin produced a malformed response: ")))
 	default:
 		return fmt.Errorf("%s: %s: %s", method, st.Code(), contract.Sanitize(st.Message()))
 	}
 }
 
 func malformed(method string, err error) error {
-	return fmt.Errorf("%s: malformed response from Backend Plugin: %w", method, err)
+	return fmt.Errorf("%s: %w: %w", method, ErrMalformed, err)
 }

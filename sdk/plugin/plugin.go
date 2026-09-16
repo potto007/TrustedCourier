@@ -164,6 +164,7 @@ func (s *server) WriteCourierKey(ctx context.Context, req *protocol.WriteCourier
 }
 
 func malformed(err error) error {
+	// Internal is what the client reports as a malformed response.
 	return status.Error(codes.Internal, "Backend Plugin produced a malformed response: "+err.Error())
 }
 
