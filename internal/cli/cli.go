@@ -344,7 +344,18 @@ func status(args []string, stdout io.Writer) error {
 	}
 	if cert := st.TLSCertificate; cert != nil {
 		if cert.Loaded {
-			_, err = fmt.Fprintln(stdout, "TLS certificate: loaded")
+			line := "TLS certificate: loaded"
+			if cert.NotAfter != "" {
+				line += " (expires " + cert.NotAfter
+				if cert.RenewAt != "" {
+					line += ", renews " + cert.RenewAt
+				}
+				line += ")"
+			}
+			if cert.RenewalError != "" {
+				line += "; renewal failing: " + cert.RenewalError
+			}
+			_, err = fmt.Fprintln(stdout, line)
 		} else {
 			_, err = fmt.Fprintf(stdout, "TLS certificate: not loaded (%s); the Agent API completes no TLS handshake until it is\n", cert.Detail)
 		}

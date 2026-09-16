@@ -53,3 +53,15 @@ func (r *Resolver) Close() {
 func (r *Resolver) CourierKey(ctx context.Context, key config.CourierKey) (*secret.Secret, error) {
 	return r.plugins.Get(ctx, key.Backend, key.Location)
 }
+
+// WriteCourierKey stores value as the Courier Key at key. value is the
+// caller's to wipe.
+func (r *Resolver) WriteCourierKey(ctx context.Context, key config.CourierKey, value []byte) error {
+	return r.plugins.WriteCourierKey(ctx, key.Backend, key.Location, value)
+}
+
+// CanWriteCourierKey reports whether key's Backend stores Courier Keys, as
+// the Plugin Host reports it.
+func (r *Resolver) CanWriteCourierKey(key config.CourierKey) error {
+	return r.plugins.CanWriteCourierKeys(key.Backend)
+}

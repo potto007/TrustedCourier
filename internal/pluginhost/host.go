@@ -149,6 +149,57 @@ var ErrNotRunning = errors.New("Backend Plugin is not running")
 // Get fetches the Secret at location from the named Backend Plugin. The
 // caller must Release it.
 func (h *Host) Get(ctx context.Context, backendPlugin, location string) (*secret.Secret, error) {
+	c, err := h.running(backendPlugin)
+	if err != nil {
+		return nil, err
+	}
+	gctx, cancel := context.WithTimeout(ctx, getTimeout)
+	defer cancel()
+	value, err := c.Get(gctx, location)
+	if err != nil {
+		return nil, fmt.Errorf("Backend Plugin %q: %w", backendPlugin, err)
+	}
+	return secret.New(value)
+}
+
+// ErrReadOnly reports a Backend Plugin without the courier-key-write
+// capability.
+var ErrReadOnly = errors.New("cannot store Courier Keys: it does not have the courier-key-write capability")
+
+// CanWriteCourierKeys reports nil when the named Backend Plugin is running
+// and stores Courier Keys, ErrReadOnly when it runs without that capability,
+// and ErrNotRunning while it is down.
+func (h *Host) CanWriteCourierKeys(backendPlugin string) error {
+	c, err := h.running(backendPlugin)
+	if err != nil {
+		return err
+	}
+	if !c.Capabilities().CourierKeyWrite {
+		return fmt.Errorf("Backend Plugin %q %w", backendPlugin, ErrReadOnly)
+	}
+	return nil
+}
+
+// WriteCourierKey stores value as the Courier Key at location in the named
+// Backend Plugin. value is the caller's to wipe.
+func (h *Host) WriteCourierKey(ctx context.Context, backendPlugin, location string, value []byte) error {
+	c, err := h.running(backendPlugin)
+	if err != nil {
+		return err
+	}
+	if !c.Capabilities().CourierKeyWrite {
+		return fmt.Errorf("Backend Plugin %q %w", backendPlugin, ErrReadOnly)
+	}
+	wctx, cancel := context.WithTimeout(ctx, getTimeout)
+	defer cancel()
+	if err := c.WriteCourierKey(wctx, location, value); err != nil {
+		return fmt.Errorf("Backend Plugin %q: %w", backendPlugin, err)
+	}
+	return nil
+}
+
+// running returns the named plugin's client while it runs.
+func (h *Host) running(backendPlugin string) (*client.Client, error) {
 	i := slices.IndexFunc(h.plugins, func(p *supervised) bool { return p.cfg.Name == backendPlugin })
 	if i < 0 {
 		return nil, fmt.Errorf("Backend Plugin %q is not configured", backendPlugin)
@@ -160,13 +211,7 @@ func (h *Host) Get(ctx context.Context, backendPlugin, location string) (*secret
 	if c == nil {
 		return nil, fmt.Errorf("Backend Plugin %q: %w", backendPlugin, ErrNotRunning)
 	}
-	gctx, cancel := context.WithTimeout(ctx, getTimeout)
-	defer cancel()
-	value, err := c.Get(gctx, location)
-	if err != nil {
-		return nil, fmt.Errorf("Backend Plugin %q: %w", backendPlugin, err)
-	}
-	return secret.New(value)
+	return c, nil
 }
 
 // FileSHA256 returns the SHA-256 of the file at path as the config pins it.

@@ -75,6 +75,7 @@ func buildAndRun(m *testing.M, dir string) (int, error) {
 		{&FakePlugin, "fake", ""},
 		{&ReplacementPlugin, "replacement", "-X main.label=replacement"},
 		{&UnhealthyPlugin, "unhealthy", "-X main.mode=unhealthy"},
+		{&ReadOnlyPlugin, "readonly", "-X main.mode=readonly"},
 		{&CrashingPlugin, "crashing", "-X main.mode=crash"},
 		{&MalformedPlugin, "malformed", "-X main.mode=malformed"},
 	} {
@@ -97,9 +98,10 @@ type PluginBinary struct {
 // own hash. FakePlugin is well behaved and reports its uid in its health
 // detail; ReplacementPlugin is the same with "replacement" in the detail;
 // UnhealthyPlugin reports "Backend sealed" alongside that detail;
-// CrashingPlugin exits before the handshake; MalformedPlugin breaks the
-// protocol contract in every response and writes a forged log line.
-var FakePlugin, ReplacementPlugin, UnhealthyPlugin, CrashingPlugin, MalformedPlugin PluginBinary
+// ReadOnlyPlugin cannot store Courier Keys; CrashingPlugin exits before the
+// handshake; MalformedPlugin breaks the protocol contract in every response
+// and writes a forged log line.
+var FakePlugin, ReplacementPlugin, UnhealthyPlugin, ReadOnlyPlugin, CrashingPlugin, MalformedPlugin PluginBinary
 
 func buildPlugin(sdkDir, out, ldflags string) (PluginBinary, error) {
 	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", out, "./internal/fakebackend")
@@ -212,6 +214,7 @@ type ConfigVars struct {
 	UID       int
 	Fake      PluginBinary
 	Unhealthy PluginBinary
+	ReadOnly  PluginBinary
 	Crashing  PluginBinary
 	Malformed PluginBinary
 
@@ -252,6 +255,35 @@ func (in *Installation) SetBackendSecrets(pluginPath string, secrets map[string]
 	if err := os.Rename(tmp, pluginPath+".secrets.json"); err != nil {
 		in.t.Fatal(err)
 	}
+}
+
+// BackendSecrets returns what the fake Backend Plugin installed at pluginPath
+// holds, by location, including the Courier Keys TrustedCourier stored in it.
+// SetBackendSecrets must have been called for the plugin first.
+func (in *Installation) BackendSecrets(pluginPath string) map[string]string {
+	in.t.Helper()
+	data, err := os.ReadFile(pluginPath + ".secrets.json")
+	if err != nil {
+		in.t.Fatal(err)
+	}
+	secrets := map[string]string{}
+	if err := json.Unmarshal(data, &secrets); err != nil {
+		in.t.Fatal(err)
+	}
+	return secrets
+}
+
+// FreePort returns a TCP port that was free when it was checked, for a
+// listener whose port another process must know before it binds.
+func FreePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
 }
 
 // ReplacePlugin atomically replaces the binary at path with bin, as an
@@ -350,6 +382,7 @@ func (in *Installation) writeConfig(tmpl string) string {
 		UID:       os.Getuid(),
 		Fake:      FakePlugin,
 		Unhealthy: UnhealthyPlugin,
+		ReadOnly:  ReadOnlyPlugin,
 		Crashing:  CrashingPlugin,
 		Malformed: MalformedPlugin,
 		in:        in,

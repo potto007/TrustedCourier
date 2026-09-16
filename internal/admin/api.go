@@ -54,6 +54,15 @@ type TLSCertificateStatus struct {
 	Loaded bool `json:"loaded"`
 	// Detail is why the certificate is not loaded, or empty when it is.
 	Detail string `json:"detail"`
+	// NotAfter is when the loaded certificate expires, as RFC 3339, or
+	// empty when none is loaded.
+	NotAfter string `json:"not_after,omitempty"`
+	// RenewAt is when ACME renews the loaded certificate, as RFC 3339, or
+	// empty without ACME.
+	RenewAt string `json:"renew_at,omitempty"`
+	// RenewalError is why the last ACME renewal failed while the certificate
+	// stays loaded, or empty.
+	RenewalError string `json:"renewal_error,omitempty"`
 }
 
 // AuditRecordsStatus is whether Audit Records are being stored. The Agent API

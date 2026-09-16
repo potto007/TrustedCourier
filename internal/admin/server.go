@@ -61,7 +61,7 @@ type AgentAPI struct {
 	// Certificate reports the TLS certificate's state. Nil when the Agent
 	// API does not serve TLS.
 	Certificate interface {
-		Status() (loaded bool, detail string)
+		Status() TLSCertificateStatus
 	}
 }
 
@@ -196,8 +196,8 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	out.AuditSigningKey.Loaded, out.AuditSigningKey.Detail = s.audit.KeyStatus()
 	out.AuditRecords.Pending, out.AuditRecords.Detail = s.audit.Backlog()
 	if s.agent.Certificate != nil {
-		out.TLSCertificate = &TLSCertificateStatus{}
-		out.TLSCertificate.Loaded, out.TLSCertificate.Detail = s.agent.Certificate.Status()
+		status := s.agent.Certificate.Status()
+		out.TLSCertificate = &status
 	}
 	for _, p := range s.plugins.Status(r.Context()) {
 		out.BackendPlugins = append(out.BackendPlugins, BackendPluginStatus{

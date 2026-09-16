@@ -6,14 +6,15 @@
 //	go build -ldflags "-X main.mode=crash" ./internal/fakebackend
 //
 // Modes: "" is a well-behaved Backend built on the SDK; "unhealthy" is the
-// same but reports itself unhealthy; "crash" exits before the handshake;
-// "malformed" bypasses the SDK, breaks the protocol contract in every
-// response, and writes a forged log line. label, when set, appears in the
-// health detail.
+// same but reports itself unhealthy; "readonly" is the same but cannot store
+// Courier Keys; "crash" exits before the handshake; "malformed" bypasses the
+// SDK, breaks the protocol contract in every response, and writes a forged
+// log line. label, when set, appears in the health detail.
 //
 // When a file named after the binary plus ".secrets.json" exists, Get serves
 // the JSON object of locations to values in it instead of the built-in
-// Secrets.
+// Secrets, and WriteCourierKey stores into that file, so a test can see what
+// TrustedCourier stored and a restarted server finds it again.
 package main
 
 import (
@@ -42,7 +43,7 @@ var (
 
 func main() {
 	switch mode {
-	case "", "unhealthy":
+	case "", "unhealthy", "readonly":
 		plugin.Serve(newBackend())
 	case "crash":
 		fmt.Fprintln(os.Stderr, "fakebackend: crashing on purpose")
@@ -161,14 +162,37 @@ func (b *backend) Health(context.Context) (string, error) {
 }
 
 func (b *backend) Capabilities() plugin.Capabilities {
-	return plugin.Capabilities{CourierKeyWrite: true}
+	return plugin.Capabilities{CourierKeyWrite: mode != "readonly"}
 }
 
 func (b *backend) WriteCourierKey(_ context.Context, location string, value []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if secrets, err := secretsFile(); err != nil {
+		return err
+	} else if secrets != nil {
+		secrets[location] = string(value)
+		return writeSecretsFile(secrets)
+	}
 	b.secrets[location] = slices.Clone(value)
 	return nil
+}
+
+// writeSecretsFile replaces <executable>.secrets.json with secrets.
+func writeSecretsFile(secrets map[string]string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(secrets)
+	if err != nil {
+		return err
+	}
+	tmp := exe + ".secrets.json.write"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, exe+".secrets.json")
 }
 
 // malformedBackend answers every call with a response that breaks the
