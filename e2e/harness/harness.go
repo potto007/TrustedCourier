@@ -87,6 +87,9 @@ func buildAndRun(m *testing.M, dir string) (int, error) {
 			return 0, err
 		}
 	}
+	if OpenBaoPlugin, err = buildBinary(filepath.Join(root, "plugins", "openbao"), filepath.Join(dir, "openbao"), ".", ""); err != nil {
+		return 0, err
+	}
 	return m.Run(), nil
 }
 
@@ -109,10 +112,15 @@ type PluginBinary struct {
 var FakePlugin, ReplacementPlugin, UnhealthyPlugin, ReadOnlyPlugin, CrashingPlugin, MalformedPlugin, NoFIPSPlugin, FIPSOnPlugin PluginBinary
 
 func buildPlugin(sdkDir, out, ldflags string) (PluginBinary, error) {
-	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", out, "./internal/fakebackend")
-	build.Dir = sdkDir
+	return buildBinary(sdkDir, out, "./internal/fakebackend", ldflags)
+}
+
+// buildBinary builds the package at pkg in the module at dir into out.
+func buildBinary(dir, out, pkg, ldflags string) (PluginBinary, error) {
+	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", out, pkg)
+	build.Dir = dir
 	if b, err := build.CombinedOutput(); err != nil {
-		return PluginBinary{}, fmt.Errorf("build fake Backend Plugin: %w\n%s", err, b)
+		return PluginBinary{}, fmt.Errorf("build %s in %s: %w\n%s", pkg, dir, err, b)
 	}
 	data, err := os.ReadFile(out)
 	if err != nil {
@@ -228,6 +236,7 @@ type ConfigVars struct {
 	Malformed PluginBinary
 	NoFIPS    PluginBinary
 	FIPSOn    PluginBinary
+	OpenBao   PluginBinary
 
 	in *Installation
 }
@@ -398,6 +407,7 @@ func (in *Installation) writeConfig(tmpl string) string {
 		Malformed: MalformedPlugin,
 		NoFIPS:    NoFIPSPlugin,
 		FIPSOn:    FIPSOnPlugin,
+		OpenBao:   OpenBaoPlugin,
 		in:        in,
 	}
 	if err := parsed.Execute(&buf, vars); err != nil {
@@ -808,4 +818,11 @@ func exitCode(err error) int {
 		return exitErr.ExitCode()
 	}
 	return -1
+}
+
+// WriteConfig renders configTemplate to the installation's config file, for
+// a tc command that reads it without a server, and returns its path.
+func (in *Installation) WriteConfig(configTemplate string) string {
+	in.t.Helper()
+	return in.writeConfig(configTemplate)
 }

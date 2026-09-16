@@ -30,3 +30,12 @@ func setCredential(_ *exec.Cmd, cred *credential) error {
 	}
 	return nil
 }
+
+// GiveFile has no user to give the file to: no plugin runs as a separate
+// user here.
+func GiveFile(_ string, pc config.BackendPlugin) error {
+	if pc.InsecureShareCoreUser {
+		return nil
+	}
+	return errNoSeparateUser
+}
