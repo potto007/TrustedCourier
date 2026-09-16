@@ -470,5 +470,13 @@ func (i *Issuer) hmacKey(ctx context.Context) ([]byte, error) {
 		clear(mac)
 		return nil, errors.New("the ACME External Account Binding key is not base64url")
 	}
+	if n < minEABKeyBytes {
+		clear(mac)
+		return nil, fmt.Errorf("the ACME External Account Binding key decodes to %d bytes; a MAC key is at least %d", n, minEABKeyBytes)
+	}
 	return mac[:n], nil
 }
+
+// minEABKeyBytes is the shortest MAC key HMAC-SHA256 accepts in FIPS
+// 140-only mode, where a shorter one panics. CAs issue 32 bytes or more.
+const minEABKeyBytes = 14

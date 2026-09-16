@@ -2,11 +2,13 @@ package plugin
 
 import (
 	"context"
+	"crypto/fips140"
 	"errors"
 	"fmt"
 	"os"
 
 	"github.com/potto007/TrustedCourier/sdk/plugin/internal/contract"
+	"github.com/potto007/TrustedCourier/sdk/plugin/internal/harden"
 	"github.com/potto007/TrustedCourier/sdk/plugin/protocol"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -62,7 +64,18 @@ var (
 // Serve serves b as a Backend Plugin and does not return. Call it from main.
 // It exits with an error if b declares CourierKeyWrite without implementing
 // CourierKeyWriter.
+//
+// Serve hardens the plugin process the way the core hardens itself: core
+// dumps are disabled before the first Secret is handled, and it exits if
+// that fails. It reports the process's FIPS 140-3 mode (crypto/fips140),
+// which a core in FIPS mode requires to match its own (ADR-0004); the core
+// passes its mode to the plugin through GODEBUG, so a plugin built with
+// the SDK runs in the mode the core does.
 func Serve(b Backend) {
+	if err := harden.DisableCoreDumps(); err != nil {
+		fmt.Fprintln(os.Stderr, "plugin: disable core dumps:", err)
+		os.Exit(1)
+	}
 	if b.Capabilities().CourierKeyWrite {
 		if _, ok := b.(CourierKeyWriter); !ok {
 			fmt.Fprintln(os.Stderr, "plugin: Backend declares CourierKeyWrite but does not implement CourierKeyWriter")
@@ -81,7 +94,12 @@ type server struct {
 }
 
 func (s *server) Capabilities(context.Context, *protocol.CapabilitiesRequest) (*protocol.CapabilitiesResponse, error) {
-	return &protocol.CapabilitiesResponse{CourierKeyWrite: s.backend.Capabilities().CourierKeyWrite}, nil
+	return &protocol.CapabilitiesResponse{
+		CourierKeyWrite: s.backend.Capabilities().CourierKeyWrite,
+		Fips140Enabled:  fips140.Enabled(),
+		Fips140Version:  fips140.Version(),
+		Fips140Only:     fips140.Enforced(),
+	}, nil
 }
 
 func (s *server) Health(ctx context.Context, _ *protocol.HealthRequest) (*protocol.HealthResponse, error) {

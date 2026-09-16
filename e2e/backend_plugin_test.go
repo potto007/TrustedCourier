@@ -23,6 +23,7 @@ type pluginStatus struct {
 	Healthy      bool     `json:"healthy"`
 	Detail       string   `json:"detail"`
 	Capabilities []string `json:"capabilities"`
+	FIPS140      string   `json:"fips140"`
 	Restarts     int      `json:"restarts"`
 }
 

@@ -30,6 +30,10 @@ import (
 // stderr.
 func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error {
 	log := slog.New(slog.NewTextHandler(stderr, nil))
+	// The Operator chooses FIPS 140-3 mode with GODEBUG=fips140 on the
+	// standard binary (ADR-0003); say which mode this is.
+	fips := admin.HostFIPS140()
+	log.Info("FIPS 140-3 mode", "fips140", fips.Mode, "module", fips.Module)
 
 	cfg, err := config.Load(configPath)
 	if err != nil {

@@ -59,7 +59,7 @@ func New(cfg config.DNS, creds Credentials, client *http.Client) (Provider, erro
 	case config.DNSProviderCloudflare:
 		return newCloudflare(cfg, creds, client), nil
 	case config.DNSProviderRoute53:
-		return newRoute53(cfg, creds, client), nil
+		return newRoute53(cfg, creds, client)
 	case config.DNSProviderAzure:
 		return newAzure(cfg, creds, client), nil
 	case config.DNSProviderGoogle:

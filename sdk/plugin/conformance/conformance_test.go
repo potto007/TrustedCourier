@@ -65,6 +65,30 @@ func TestConformanceFailsMalformedPlugin(t *testing.T) {
 	}
 }
 
+// TestConformanceFailsNonFIPSPluginInFIPSMode runs the kit in FIPS mode
+// against a plugin that reports itself outside FIPS mode, in a child test
+// process as above.
+func TestConformanceFailsNonFIPSPluginInFIPSMode(t *testing.T) {
+	if bin := os.Getenv("CONFORMANCE_NOFIPS_PLUGIN"); bin != "" {
+		conformance.Run(t, bin, fakeFixture)
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestConformanceFailsNonFIPSPluginInFIPSMode$", "-test.v")
+	cmd.Env = append(os.Environ(), "CONFORMANCE_NOFIPS_PLUGIN="+buildFake(t, "nofips"), "GODEBUG=fips140=on")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("conformance kit in FIPS mode passed a plugin outside FIPS mode:\n%s", out)
+	}
+	for _, want := range []string{
+		"--- FAIL: TestConformanceFailsNonFIPSPluginInFIPSMode/FIPS140",
+		"kit runs in FIPS 140-3 mode on but the plugin reports off",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("kit output is missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestPluginDoesNotDependOnCore(t *testing.T) {
 	out, err := exec.Command("go", "list", "-deps", "../internal/fakebackend").CombinedOutput()
 	if err != nil {

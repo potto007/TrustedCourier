@@ -84,6 +84,18 @@ func Detail(d string) error {
 	return printable("health detail", d)
 }
 
+// MaxVersionBytes bounds the FIPS 140-3 module version a plugin reports,
+// such as "v1.0.0" or "latest".
+const MaxVersionBytes = 64
+
+// FIPS140Version checks the module version a plugin reports.
+func FIPS140Version(v string) error {
+	if len(v) > MaxVersionBytes {
+		return fmt.Errorf("fips140_version is %d bytes, over the %d byte limit", len(v), MaxVersionBytes)
+	}
+	return printable("fips140_version", v)
+}
+
 // printable rejects invalid UTF-8 and control characters, which could
 // forge log lines or drive an Operator's terminal.
 func printable(what, s string) error {

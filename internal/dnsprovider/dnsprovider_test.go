@@ -49,7 +49,7 @@ func fixtures(t *testing.T, zones ...string) []fixture {
 		provider: config.DNSProviderRoute53,
 		cfg:      config.DNS{Provider: config.DNSProviderRoute53, Endpoint: r53.URL},
 		creds:    dnsprovider.Credentials{"access_key_id": []byte("AKIDEXAMPLE"), "secret_access_key": []byte("aws-secret")},
-		badCreds: dnsprovider.Credentials{"access_key_id": []byte("AKIDEXAMPLE"), "secret_access_key": []byte("wrong")},
+		badCreds: dnsprovider.Credentials{"access_key_id": []byte("AKIDEXAMPLE"), "secret_access_key": []byte("wrong-secret-key")},
 		records:  r53.Records, client: trusting(r53.Server),
 	})
 
@@ -190,6 +190,21 @@ func TestPresentReportsRefusedCredentials(t *testing.T) {
 				t.Error("a record was set with refused credentials")
 			}
 		})
+	}
+}
+
+// TestNewRefusesShortRoute53Secret: a secret access key too short to HMAC
+// with in FIPS 140-only mode is a credential error, not a panic.
+func TestNewRefusesShortRoute53Secret(t *testing.T) {
+	for _, f := range fixtures(t, "example.com") {
+		if f.provider != config.DNSProviderRoute53 {
+			continue
+		}
+		creds := dnsprovider.Credentials{"access_key_id": []byte("AKIDEXAMPLE"), "secret_access_key": []byte("tiny")}
+		_, err := dnsprovider.New(f.cfg, creds, f.client)
+		if err == nil || !strings.Contains(err.Error(), "secret_access_key") || strings.Contains(err.Error(), "tiny") {
+			t.Fatalf("New with a short secret: %v, want an error naming the field and not the value", err)
+		}
 	}
 }
 

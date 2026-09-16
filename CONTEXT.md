@@ -54,6 +54,10 @@ _Avoid_: Store, provider, engine, vault
 A separately built and released program that connects TrustedCourier to one kind of Backend. Its responses are treated as untrusted input.
 _Avoid_: Driver, connector, adapter, provider
 
+**FIPS mode**:
+The runtime state, chosen by the Operator with `GODEBUG=fips140`, in which every process that touches Secrets uses only Go's validated FIPS 140-3 module. A Backend Plugin reports its mode with its capabilities, and the core in FIPS mode refuses one that is not.
+_Avoid_: FIPS build, FIPS binary (it is the same binary)
+
 ### Delivery
 
 **Delivery**:

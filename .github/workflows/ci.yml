@@ -20,6 +20,10 @@ jobs:
     defaults:
       run:
         working-directory: ${{ matrix.module }}
+    env:
+      # Build against Go's validated FIPS 140-3 module, as release builds
+      # do. tc pins the mode off by default; the matrix sets it explicitly.
+      GOFIPS140: certified
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -41,7 +45,7 @@ jobs:
         env:
           GODEBUG: fips140=${{ matrix.fips140 }}
         run: >-
-          sudo --preserve-env=GODEBUG env
+          sudo --preserve-env=GODEBUG,GOFIPS140 env
           "PATH=$PATH" "GOCACHE=$RUNNER_TEMP/root-gocache" "GOMODCACHE=$(go env GOMODCACHE)"
           GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-buildvcs=false
           go test -race -count=1 -run '^TestBackendPlugin(RunsAs|MustRunAs)SeparateUser$' ./e2e

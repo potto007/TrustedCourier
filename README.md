@@ -27,7 +27,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 - **TLS everywhere, with built-in ACME** ([ADR-0006](docs/decisions/0006-tls-with-built-in-acme.md)).
 - **Tamper-evident audit** ([ADR-0007](docs/decisions/0007-tamper-evident-audit.md)). Audit Records are hash-chained with signed checkpoints and never contain Secret values or bodies.
 - **Batteries included** ([ADR-0008](docs/decisions/0008-bundled-openbao-static-seal.md)). `tc init` and one docker compose file will bring up TrustedCourier with a bundled OpenBao Backend.
-- **All Go** ([ADR-0003](docs/decisions/0003-go-over-rust-core.md)), with FIPS 140-3 mode as a runtime switch.
+- **All Go** ([ADR-0003](docs/decisions/0003-go-over-rust-core.md)), with FIPS 140-3 mode as a runtime switch that every Backend Plugin must follow ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)).
 
 [`CONTEXT.md`](CONTEXT.md) defines the vocabulary (Operator, Agent, Agent Token, Policy, Secret Name, Backend, Delivery, and so on). The code, docs, and issues use those terms exactly.
 
@@ -175,15 +175,25 @@ backend_plugins:
 
 The plugin user must differ from the server's user and must not be able to read the config file, so a server that runs plugins starts as root. For development, `insecure_share_core_user: true` in place of `user` runs the plugin as the server's own user and logs a warning.
 
-`tc status` shows each plugin's state, health, and capabilities, whether the [audit signing key](#audit) is loaded, and, when the Agent API serves TLS, whether its [certificate](#tls-on-the-agent-api) is:
+`tc status` shows the server's [FIPS 140-3 mode](#fips-140-3-mode), each plugin's state, health, and capabilities, whether the [audit signing key](#audit) is loaded, and, when the Agent API serves TLS, whether its [certificate](#tls-on-the-agent-api) is:
 
 ```
+FIPS 140-3 mode: on (module v1.0.0)
+
 BACKEND PLUGIN  STATE    HEALTH   CAPABILITIES       RESTARTS  DETAIL
 openbao         running  healthy  courier-key-write  0         ...
 
 Audit signing key: loaded
 TLS certificate: loaded (expires 2026-12-14T00:00:00Z, renews 2026-11-14T00:00:00Z)
 ```
+
+`tc status --json` also reports each running plugin's mode as `fips140`.
+
+### FIPS 140-3 mode
+
+TrustedCourier uses Go's cryptographic module, so FIPS 140-3 mode is a runtime switch on the standard binary ([ADR-0003](docs/decisions/0003-go-over-rust-core.md)): set `GODEBUG=fips140=on` in the server's environment, or `GODEBUG=fips140=only` to make any use of a non-approved algorithm a panic rather than a fallback. The mode is off unless set, in every build: release and CI binaries are built with `GOFIPS140=certified`, which links the validated module, and `tc` pins its own default to off where Go's would be on. A plain `go build` links the in-tree copy of the module, reported as module `latest`, which is the same code without the validation. `tc status` shows both the mode and the module.
+
+Every process that touches Secrets is inside the boundary ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)). The server spells its mode out in each Backend Plugin's `GODEBUG`, whether the mode came from the environment or from the build's default; a plugin built on the SDK reports its mode right after the handshake; and a server refuses to run a plugin that reports a weaker mode than its own (`off` under `on`, or anything but `only` under `only`). Such a plugin shows as `refused` in `tc status` with the remedy, is not relaunched until the server restarts, and the other plugins keep serving. The [conformance kit](#repository-layout) checks a plugin follows the kit's mode.
 
 ### Proxy Delivery
 
@@ -646,6 +656,8 @@ Policies, Secret Names, Upstreams, Injection Templates, and Presets take effect 
 - Revoking an Agent Token twice succeeds and keeps the first revocation time.
 - A Backend Plugin binary whose SHA-256 differs from the pinned hash stops the server at boot and is never relaunched after boot. On Linux the server executes the file descriptor it hashed, so swapping the binary after the check does not work ([ADR-0011](docs/decisions/0011-backend-plugin-host-and-protocol.md)).
 - Backend Plugins run as a separate OS user that cannot read the config file or own the data directory, with an empty environment apart from `GODEBUG`. Core and plugin talk over go-plugin's automatic mutual TLS.
+- In FIPS 140-3 mode the server refuses, once and for all, any Backend Plugin whose first response reports a weaker mode than its own, so no Secret is served through a process outside the boundary ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)).
+- Every `tc` process and every plugin built on the SDK sets its core file size limit to zero, hard and soft, before it does anything else, and on Linux marks itself not dumpable, so its memory cannot be read by another process of the same user through ptrace or `/proc`.
 - Every plugin response is checked against the protocol contract (size limits, valid UTF-8, no control characters) before the server uses it, and plugin error text and log output are sanitized.
 - A plugin that crashes is restarted with exponential backoff, from 250 ms to 30 s. It never takes the server down.
 - In the core, a Secret lives in `mlock`ed memory outside the Go heap, is wiped when the response is written, and prints as a placeholder if formatted or logged. A Delivery fails rather than hold a Secret in memory that could be swapped. The e2e harness fails any test whose server output, the audit stream included, contains a Secret value.
@@ -692,7 +704,7 @@ The full suite takes several minutes, and `go test` prints nothing for a package
 go run ./scripts/testprogress -log /tmp/tc-tests.log -label "TrustedCourier tests" -- go test -race -json ./...
 ```
 
-CI runs every module twice, once with `GODEBUG=fips140=off` and once with `fips140=on`. The race detector is required, not optional ([ADR-0003](docs/decisions/0003-go-over-rust-core.md) relies on it).
+CI builds with `GOFIPS140=certified`, the validated FIPS 140-3 module, and runs every module twice, once with `GODEBUG=fips140=off` and once with `fips140=on`. Set both the same way to reproduce a CI leg locally; `fips140=only` also passes and catches any non-approved algorithm as a panic. The race detector is required, not optional ([ADR-0003](docs/decisions/0003-go-over-rust-core.md) relies on it).
 
 `TestBackendPluginRunsAsSeparateUser` needs a root server to switch the plugin's user and skips otherwise. CI runs it, with the separate-user refusal tests, a second time under `sudo`.
 

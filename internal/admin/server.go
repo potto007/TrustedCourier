@@ -268,7 +268,10 @@ func (s *Server) revokeAgentToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
-	out := Status{BackendPlugins: []BackendPluginStatus{}}
+	out := Status{
+		FIPS140:        HostFIPS140(),
+		BackendPlugins: []BackendPluginStatus{},
+	}
 	out.AuditSigningKey.Loaded, out.AuditSigningKey.Detail = s.audit.KeyStatus()
 	out.AuditRecords.Pending, out.AuditRecords.Detail = s.audit.Backlog()
 	if s.agent.Certificate != nil {
@@ -287,6 +290,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 			Healthy:      p.Healthy,
 			Detail:       p.Detail,
 			Capabilities: p.Capabilities,
+			FIPS140:      p.FIPS140,
 			Restarts:     p.Restarts,
 		})
 	}
