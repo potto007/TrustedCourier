@@ -11,7 +11,8 @@
 // SDK, breaks the protocol contract in every response, and writes a forged
 // log line; "nofips" bypasses the SDK and reports itself outside FIPS
 // 140-3 mode whatever mode it runs in, as a plugin built without the SDK
-// or on an old one would. label, when set, appears in the health detail.
+// or on an old one would; "fipson" likewise reports FIPS mode "on", never
+// "only". label, when set, appears in the health detail.
 //
 // When a file named after the binary plus ".secrets.json" exists, Get serves
 // the JSON object of locations to values in it instead of the built-in
@@ -58,6 +59,8 @@ func main() {
 		protocol.Serve(malformedBackend{})
 	case "nofips":
 		protocol.Serve(noFIPSBackend{})
+	case "fipson":
+		protocol.Serve(noFIPSBackend{claimOn: true})
 	default:
 		fmt.Fprintf(os.Stderr, "fakebackend: unknown mode %q\n", mode)
 		os.Exit(2)
@@ -209,7 +212,11 @@ type malformedBackend struct {
 // Capabilities reports the process's real FIPS mode, so a core in FIPS mode
 // admits the plugin and the malformed responses are what it sees.
 func (malformedBackend) Capabilities(context.Context, *protocol.CapabilitiesRequest) (*protocol.CapabilitiesResponse, error) {
-	return &protocol.CapabilitiesResponse{Fips140Enabled: fips140.Enabled(), Fips140Version: fips140.Version()}, nil
+	return &protocol.CapabilitiesResponse{
+		Fips140Enabled: fips140.Enabled(),
+		Fips140Only:    fips140.Enforced(),
+		Fips140Version: fips140.Version(),
+	}, nil
 }
 
 func (malformedBackend) Health(context.Context, *protocol.HealthRequest) (*protocol.HealthResponse, error) {
@@ -224,16 +231,18 @@ func (malformedBackend) List(context.Context, *protocol.ListRequest) (*protocol.
 	return &protocol.ListResponse{Locations: []string{"\x00", "elsewhere/secret", "elsewhere/secret"}}, nil
 }
 
-// noFIPSBackend is well formed but reports itself outside FIPS 140-3 mode,
-// whatever mode its process runs in.
+// noFIPSBackend is well formed but reports a fixed FIPS 140-3 state
+// whatever mode its process runs in: "off" in the nofips mode, "on" (never
+// "only") in the fipson mode.
 type noFIPSBackend struct {
 	protocol.UnimplementedBackendServer
+	claimOn bool
 }
 
-func (noFIPSBackend) Capabilities(context.Context, *protocol.CapabilitiesRequest) (*protocol.CapabilitiesResponse, error) {
-	return &protocol.CapabilitiesResponse{Fips140Version: "latest"}, nil
+func (b noFIPSBackend) Capabilities(context.Context, *protocol.CapabilitiesRequest) (*protocol.CapabilitiesResponse, error) {
+	return &protocol.CapabilitiesResponse{Fips140Enabled: b.claimOn, Fips140Version: "latest"}, nil
 }
 
 func (noFIPSBackend) Health(context.Context, *protocol.HealthRequest) (*protocol.HealthResponse, error) {
-	return &protocol.HealthResponse{Healthy: true, Detail: "fake Backend outside FIPS mode"}, nil
+	return &protocol.HealthResponse{Healthy: true, Detail: "fake Backend with a fixed FIPS mode"}, nil
 }

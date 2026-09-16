@@ -3,7 +3,11 @@
 // uses to call it.
 package admin
 
-import "time"
+import (
+	"time"
+
+	"github.com/potto007/TrustedCourier/sdk/plugin/client"
+)
 
 // Agent Token statuses.
 const (
@@ -54,14 +58,19 @@ type Status struct {
 	RemoteAdminTLSCertificate *TLSCertificateStatus `json:"remote_admin_tls_certificate,omitempty"`
 }
 
-// FIPS140Status is a process's FIPS 140-3 state (ADR-0003).
+// FIPS140Status is the server process's FIPS 140-3 state (ADR-0003).
 type FIPS140Status struct {
-	// Enabled reports whether the process runs in FIPS 140-3 mode
-	// (GODEBUG=fips140=on or only).
-	Enabled bool `json:"enabled"`
+	// Mode is "off", "on", or "only", as GODEBUG=fips140 spells it.
+	Mode string `json:"mode"`
 	// Module is the Go FIPS 140-3 module the binary was built with, such as
 	// "v1.0.0", or "latest" for an unvalidated in-tree module.
 	Module string `json:"module"`
+}
+
+// HostFIPS140 is the calling process's FIPS 140-3 state.
+func HostFIPS140() FIPS140Status {
+	host := client.HostFIPS140()
+	return FIPS140Status{Mode: host.Mode(), Module: host.Version}
 }
 
 // TLSCertificateStatus is whether the Agent API's TLS certificate is loaded.
@@ -101,7 +110,8 @@ type AuditSigningKeyStatus struct {
 // BackendPluginStatus is one Backend Plugin's state.
 type BackendPluginStatus struct {
 	Name string `json:"name"`
-	// State is starting, running, restarting, or stopped.
+	// State is starting, running, restarting, stopped, or refused (outside
+	// the server's FIPS 140-3 mode; not relaunched until a restart).
 	State string `json:"state"`
 	// PID is present only while the plugin runs.
 	PID     int  `json:"pid,omitempty"`
@@ -109,10 +119,11 @@ type BackendPluginStatus struct {
 	// Detail is the plugin's health detail, or why it is not healthy.
 	Detail       string   `json:"detail"`
 	Capabilities []string `json:"capabilities"`
-	// FIPS140 reports whether the running plugin is in FIPS 140-3 mode. A
-	// server in FIPS mode runs no plugin that is not.
-	FIPS140  bool `json:"fips140"`
-	Restarts int  `json:"restarts"`
+	// FIPS140 is the running plugin's FIPS 140-3 mode ("off", "on", or
+	// "only"), empty while it is not running. The server runs no plugin
+	// in a weaker mode than its own.
+	FIPS140  string `json:"fips140"`
+	Restarts int    `json:"restarts"`
 }
 
 // AuditVerification is the result of checking the audit chain.

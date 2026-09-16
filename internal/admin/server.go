@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"crypto/fips140"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -270,7 +269,7 @@ func (s *Server) revokeAgentToken(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	out := Status{
-		FIPS140:        FIPS140Status{Enabled: fips140.Enabled(), Module: fips140.Version()},
+		FIPS140:        HostFIPS140(),
 		BackendPlugins: []BackendPluginStatus{},
 	}
 	out.AuditSigningKey.Loaded, out.AuditSigningKey.Detail = s.audit.KeyStatus()

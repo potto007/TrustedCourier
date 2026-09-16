@@ -18,9 +18,7 @@ package conformance
 import (
 	"bytes"
 	"context"
-	"crypto/fips140"
 	"errors"
-	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -42,7 +40,8 @@ type Fixture struct {
 	// when the plugin reports the CourierKeyWrite capability.
 	CourierKeyLocation string
 	// Env is the plugin's environment, such as Backend addresses and
-	// credentials. GODEBUG is passed through from the test process.
+	// credentials. GODEBUG is set by the kit to the test process's FIPS
+	// 140-3 mode.
 	Env []string
 }
 
@@ -57,25 +56,21 @@ func Run(t *testing.T, binary string, f Fixture) {
 		t.Fatal("conformance: Fixture needs at least one Secret and a Missing location")
 	}
 	cmd := exec.Command(binary)
-	cmd.Env = slices.Clone(f.Env)
-	if v, ok := os.LookupEnv("GODEBUG"); ok {
-		cmd.Env = append(cmd.Env, "GODEBUG="+v)
-	}
+	// The kit's FIPS 140-3 mode reaches the plugin as the core's does.
+	cmd.Env = append(slices.Clone(f.Env), "GODEBUG="+client.GODEBUG())
 	c, err := client.Start(cmd, nil)
 	if err != nil {
 		t.Fatalf("launch plugin: %v", err)
 	}
 	t.Cleanup(c.Kill)
 
-	// The kit process's mode reaches the plugin through GODEBUG, as the
-	// core's does, so a plugin built on the SDK reports the kit's mode.
 	t.Run("FIPS140", func(t *testing.T) {
 		st := c.FIPS140()
 		if st.Version == "" {
 			t.Error("plugin reports no FIPS 140-3 module version; build it on the current SDK")
 		}
-		if fips140.Enabled() && !st.Enabled {
-			t.Error("kit runs in FIPS 140-3 mode but the plugin does not; a core in FIPS mode refuses it")
+		if host := client.HostFIPS140(); !st.Covers(host) {
+			t.Errorf("kit runs in FIPS 140-3 mode %s but the plugin reports %s; a core in that mode refuses it", host.Mode(), st.Mode())
 		}
 	})
 

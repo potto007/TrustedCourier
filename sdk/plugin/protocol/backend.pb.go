@@ -75,8 +75,12 @@ type CapabilitiesResponse struct {
 	// fips140_version is the Go FIPS 140-3 module version the plugin was built
 	// with ("latest" for an unvalidated in-tree module).
 	Fips140Version string `protobuf:"bytes,3,opt,name=fips140_version,json=fips140Version,proto3" json:"fips140_version,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// fips140_only reports whether the plugin process runs in FIPS 140-3
+	// "only" mode, where a non-approved algorithm panics rather than falls
+	// back. A core in only mode refuses a plugin that is not.
+	Fips140Only   bool `protobuf:"varint,4,opt,name=fips140_only,json=fips140Only,proto3" json:"fips140_only,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CapabilitiesResponse) Reset() {
@@ -128,6 +132,13 @@ func (x *CapabilitiesResponse) GetFips140Version() string {
 		return x.Fips140Version
 	}
 	return ""
+}
+
+func (x *CapabilitiesResponse) GetFips140Only() bool {
+	if x != nil {
+		return x.Fips140Only
+	}
+	return false
 }
 
 type HealthRequest struct {
@@ -487,11 +498,12 @@ var File_backend_proto protoreflect.FileDescriptor
 const file_backend_proto_rawDesc = "" +
 	"\n" +
 	"\rbackend.proto\x12\x19trustedcourier.backend.v1\"\x15\n" +
-	"\x13CapabilitiesRequest\"\x94\x01\n" +
+	"\x13CapabilitiesRequest\"\xb7\x01\n" +
 	"\x14CapabilitiesResponse\x12*\n" +
 	"\x11courier_key_write\x18\x01 \x01(\bR\x0fcourierKeyWrite\x12'\n" +
 	"\x0ffips140_enabled\x18\x02 \x01(\bR\x0efips140Enabled\x12'\n" +
-	"\x0ffips140_version\x18\x03 \x01(\tR\x0efips140Version\"\x0f\n" +
+	"\x0ffips140_version\x18\x03 \x01(\tR\x0efips140Version\x12!\n" +
+	"\ffips140_only\x18\x04 \x01(\bR\vfips140Only\"\x0f\n" +
 	"\rHealthRequest\"B\n" +
 	"\x0eHealthResponse\x12\x18\n" +
 	"\ahealthy\x18\x01 \x01(\bR\ahealthy\x12\x16\n" +

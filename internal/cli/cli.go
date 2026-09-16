@@ -56,7 +56,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	// Secrets, tc env prints them, and the other commands carry the Operator
 	// Credential. None of them may ever write a core dump (ADR-0001).
 	err := harden.DisableCoreDumps()
-	if err == nil {
+	if err != nil {
+		err = fmt.Errorf("disable core dumps: %w", err)
+	} else {
 		err = run(args, stdout, stderr)
 	}
 	switch {
@@ -354,7 +356,7 @@ func status(args []string, stdout io.Writer) error {
 	if *asJSON {
 		return writeJSON(stdout, st)
 	}
-	fmt.Fprintf(stdout, "FIPS 140-3 mode: %s (module %s)\n\n", onOff(st.FIPS140.Enabled), st.FIPS140.Module)
+	fmt.Fprintf(stdout, "FIPS 140-3 mode: %s (module %s)\n\n", st.FIPS140.Mode, st.FIPS140.Module)
 	if len(st.BackendPlugins) == 0 {
 		fmt.Fprintln(stdout, "No Backend Plugins configured.")
 	} else {
@@ -425,13 +427,6 @@ func status(args []string, stdout io.Writer) error {
 	_, err = fmt.Fprintf(stdout, "Audit Records: %d waiting to be stored; Deliveries are refused (%s)\n",
 		st.AuditRecords.Pending, st.AuditRecords.Detail)
 	return err
-}
-
-func onOff(b bool) string {
-	if b {
-		return "on"
-	}
-	return "off"
 }
 
 // reload has the server reload its config file.

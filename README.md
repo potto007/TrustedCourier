@@ -187,13 +187,13 @@ Audit signing key: loaded
 TLS certificate: loaded (expires 2026-12-14T00:00:00Z, renews 2026-11-14T00:00:00Z)
 ```
 
-`tc status --json` also reports, per plugin, whether it runs in FIPS mode.
+`tc status --json` also reports each running plugin's mode as `fips140`.
 
 ### FIPS 140-3 mode
 
 TrustedCourier uses Go's cryptographic module, so FIPS 140-3 mode is a runtime switch on the standard binary ([ADR-0003](docs/decisions/0003-go-over-rust-core.md)): set `GODEBUG=fips140=on` in the server's environment, or `GODEBUG=fips140=only` to make any use of a non-approved algorithm a panic rather than a fallback. Release and CI binaries are built with `GOFIPS140=certified`, which links the validated module and turns the mode on by default; `GODEBUG=fips140=off` turns it off. A plain `go build` links the in-tree copy of the module, reported as module `latest`, which is the same code without the validation. `tc status` shows both the mode and the module.
 
-Every process that touches Secrets is inside the boundary ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)). The server passes its `GODEBUG` to each Backend Plugin, a plugin built on the SDK reports its mode right after the handshake, and a server in FIPS mode refuses to run a plugin that does not report FIPS mode: the plugin stays down, `tc status` shows why, and the other plugins keep serving. The [conformance kit](#repository-layout) checks a plugin follows the kit's mode.
+Every process that touches Secrets is inside the boundary ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)). The server spells its mode out in each Backend Plugin's `GODEBUG`, whether the mode came from the environment or from the build's default; a plugin built on the SDK reports its mode right after the handshake; and a server refuses to run a plugin that reports a weaker mode than its own (`off` under `on`, or anything but `only` under `only`). Such a plugin shows as `refused` in `tc status` with the remedy, is not relaunched until the server restarts, and the other plugins keep serving. The [conformance kit](#repository-layout) checks a plugin follows the kit's mode.
 
 ### Proxy Delivery
 
@@ -656,7 +656,7 @@ Policies, Secret Names, Upstreams, Injection Templates, and Presets take effect 
 - Revoking an Agent Token twice succeeds and keeps the first revocation time.
 - A Backend Plugin binary whose SHA-256 differs from the pinned hash stops the server at boot and is never relaunched after boot. On Linux the server executes the file descriptor it hashed, so swapping the binary after the check does not work ([ADR-0011](docs/decisions/0011-backend-plugin-host-and-protocol.md)).
 - Backend Plugins run as a separate OS user that cannot read the config file or own the data directory, with an empty environment apart from `GODEBUG`. Core and plugin talk over go-plugin's automatic mutual TLS.
-- In FIPS 140-3 mode the server refuses any Backend Plugin whose first response does not report FIPS mode, so no Secret is served through a process outside the boundary ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)).
+- In FIPS 140-3 mode the server refuses, once and for all, any Backend Plugin whose first response reports a weaker mode than its own, so no Secret is served through a process outside the boundary ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)).
 - Every `tc` process and every plugin built on the SDK sets its core file size limit to zero, hard and soft, before it does anything else, and on Linux marks itself not dumpable, so its memory cannot be read by another process of the same user through ptrace or `/proc`.
 - Every plugin response is checked against the protocol contract (size limits, valid UTF-8, no control characters) before the server uses it, and plugin error text and log output are sanitized.
 - A plugin that crashes is restarted with exponential backoff, from 250 ms to 30 s. It never takes the server down.

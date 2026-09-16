@@ -81,7 +81,7 @@ func TestConformanceFailsNonFIPSPluginInFIPSMode(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--- FAIL: TestConformanceFailsNonFIPSPluginInFIPSMode/FIPS140",
-		"a core in FIPS mode refuses it",
+		"kit runs in FIPS 140-3 mode on but the plugin reports off",
 	} {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("kit output is missing %q:\n%s", want, out)

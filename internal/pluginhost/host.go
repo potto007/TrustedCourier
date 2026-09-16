@@ -7,7 +7,6 @@ package pluginhost
 import (
 	"bytes"
 	"context"
-	"crypto/fips140"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -35,6 +34,9 @@ const (
 	StateRunning    = "running"
 	StateRestarting = "restarting"
 	StateStopped    = "stopped"
+	// StateRefused is a plugin the server will not run and will not
+	// relaunch: it is outside the server's FIPS 140-3 mode.
+	StateRefused = "refused"
 )
 
 const (
@@ -66,8 +68,9 @@ type Status struct {
 	// it is not healthy.
 	Detail       string
 	Capabilities []string
-	// FIPS140 reports whether the running plugin is in FIPS 140-3 mode.
-	FIPS140 bool
+	// FIPS140 is the running plugin's FIPS 140-3 mode: "off", "on", or
+	// "only"; empty while it is not running.
+	FIPS140 string
 	// Restarts counts relaunches after the first launch.
 	Restarts int
 }
@@ -267,7 +270,13 @@ type supervised struct {
 }
 
 func (p *supervised) run(ctx context.Context) {
-	defer p.setState(StateStopped, "")
+	defer func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.state != StateRefused {
+			p.state, p.lastErr = StateStopped, ""
+		}
+	}()
 	backoff := minBackoff
 	for attempt := 0; ctx.Err() == nil; attempt++ {
 		if attempt > 0 {
@@ -278,6 +287,11 @@ func (p *supervised) run(ctx context.Context) {
 		}
 		started := time.Now()
 		c, err := p.launch()
+		if errors.Is(err, ErrNotFIPS) {
+			p.log.Error("Backend Plugin refused; it will not be relaunched", "error", err)
+			p.setState(StateRefused, err.Error())
+			return
+		}
 		if err != nil {
 			p.log.Error("Backend Plugin failed to start", "error", err)
 			p.setState(StateRestarting, err.Error())
@@ -286,7 +300,7 @@ func (p *supervised) run(ctx context.Context) {
 			p.client, p.state, p.lastErr = c, StateRunning, ""
 			p.mu.Unlock()
 			p.log.Info("Backend Plugin running", "pid", c.PID(), "capabilities", c.Capabilities().Names(),
-				"fips140", c.FIPS140().Enabled, "fips140_module", c.FIPS140().Version)
+				"fips140", c.FIPS140().Mode(), "fips140_module", c.FIPS140().Version)
 
 			exited := waitExit(ctx, c)
 			c.Kill()
@@ -336,9 +350,10 @@ func (p *supervised) launch() (*client.Client, error) {
 	defer func() { _ = f.Close() }()
 	cmd := verifiedCommand(f, p.cfg.Path)
 	cmd.Dir = "/"
-	if v, ok := os.LookupEnv("GODEBUG"); ok {
-		cmd.Env = []string{"GODEBUG=" + v}
-	}
+	// The plugin's whole environment: the server's FIPS 140-3 mode, which
+	// may come from the build's default rather than the server's own
+	// GODEBUG, so it is always spelled out.
+	cmd.Env = []string{"GODEBUG=" + client.GODEBUG()}
 	if err := setCredential(cmd, p.cred); err != nil {
 		return nil, err
 	}
@@ -346,20 +361,22 @@ func (p *supervised) launch() (*client.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A core in FIPS 140-3 mode serves Secrets only through processes in
-	// FIPS mode (ADR-0004). The plugin inherits GODEBUG above, so one built
-	// on the SDK follows the core; one that does not report FIPS mode is
-	// outside the boundary.
-	if fips140.Enabled() && !c.FIPS140().Enabled {
+	// A server in FIPS 140-3 mode serves Secrets only through processes in
+	// at least its mode (ADR-0004, ADR-0027). A plugin built on the SDK
+	// follows the GODEBUG above; one that reports a weaker mode is outside
+	// the boundary, and no relaunch changes that.
+	if host := client.HostFIPS140(); !c.FIPS140().Covers(host) {
 		c.Kill()
-		return nil, ErrNotFIPS
+		return nil, fmt.Errorf("%w: it reports FIPS 140-3 mode %s and the server runs in mode %s; rebuild it on the current plugin SDK",
+			ErrNotFIPS, c.FIPS140().Mode(), host.Mode())
 	}
 	return c, nil
 }
 
-// ErrNotFIPS reports a Backend Plugin refused because the server runs in
-// FIPS 140-3 mode and the plugin does not.
-var ErrNotFIPS = errors.New("Backend Plugin is not in FIPS 140-3 mode; the server is, and refuses to serve Secrets through it")
+// ErrNotFIPS reports a Backend Plugin refused because it is not in the
+// server's FIPS 140-3 mode. The refusal is final: the plugin is not
+// relaunched until the server restarts.
+var ErrNotFIPS = errors.New("Backend Plugin refused: it is not in FIPS 140-3 mode")
 
 func (p *supervised) setState(state, lastErr string) {
 	p.mu.Lock()
@@ -383,7 +400,7 @@ func (p *supervised) status(ctx context.Context) Status {
 	}
 	s.PID = c.PID()
 	s.Capabilities = c.Capabilities().Names()
-	s.FIPS140 = c.FIPS140().Enabled
+	s.FIPS140 = c.FIPS140().Mode()
 	hctx, cancel := context.WithTimeout(ctx, healthTimeout)
 	defer cancel()
 	detail, err := c.Health(hctx)

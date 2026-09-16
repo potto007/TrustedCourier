@@ -79,6 +79,7 @@ func buildAndRun(m *testing.M, dir string) (int, error) {
 		{&CrashingPlugin, "crashing", "-X main.mode=crash"},
 		{&MalformedPlugin, "malformed", "-X main.mode=malformed"},
 		{&NoFIPSPlugin, "nofips", "-X main.mode=nofips"},
+		{&FIPSOnPlugin, "fipson", "-X main.mode=fipson"},
 	} {
 		var err error
 		if *p.bin, err = buildPlugin(filepath.Join(root, "sdk", "plugin"), filepath.Join(dir, p.name), p.flags); err != nil {
@@ -102,8 +103,9 @@ type PluginBinary struct {
 // ReadOnlyPlugin cannot store Courier Keys; CrashingPlugin exits before the
 // handshake; MalformedPlugin breaks the protocol contract in every response
 // and writes a forged log line; NoFIPSPlugin reports itself outside FIPS
-// 140-3 mode whatever mode it runs in.
-var FakePlugin, ReplacementPlugin, UnhealthyPlugin, ReadOnlyPlugin, CrashingPlugin, MalformedPlugin, NoFIPSPlugin PluginBinary
+// 140-3 mode whatever mode it runs in, and FIPSOnPlugin reports mode "on"
+// (never "only") likewise.
+var FakePlugin, ReplacementPlugin, UnhealthyPlugin, ReadOnlyPlugin, CrashingPlugin, MalformedPlugin, NoFIPSPlugin, FIPSOnPlugin PluginBinary
 
 func buildPlugin(sdkDir, out, ldflags string) (PluginBinary, error) {
 	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", out, "./internal/fakebackend")
@@ -224,6 +226,7 @@ type ConfigVars struct {
 	Crashing  PluginBinary
 	Malformed PluginBinary
 	NoFIPS    PluginBinary
+	FIPSOn    PluginBinary
 
 	in *Installation
 }
@@ -393,6 +396,7 @@ func (in *Installation) writeConfig(tmpl string) string {
 		Crashing:  CrashingPlugin,
 		Malformed: MalformedPlugin,
 		NoFIPS:    NoFIPSPlugin,
+		FIPSOn:    FIPSOnPlugin,
 		in:        in,
 	}
 	if err := parsed.Execute(&buf, vars); err != nil {

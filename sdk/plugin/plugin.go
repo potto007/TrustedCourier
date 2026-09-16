@@ -67,10 +67,10 @@ var (
 //
 // Serve hardens the plugin process the way the core hardens itself: core
 // dumps are disabled before the first Secret is handled, and it exits if
-// that fails. It reports whether the process runs in FIPS 140-3 mode
-// (crypto/fips140), which a core in FIPS mode requires (ADR-0004); the
-// core passes its own GODEBUG to the plugin, so a plugin built with the
-// SDK runs in the mode the core does.
+// that fails. It reports the process's FIPS 140-3 mode (crypto/fips140),
+// which a core in FIPS mode requires to match its own (ADR-0004); the core
+// passes its mode to the plugin through GODEBUG, so a plugin built with
+// the SDK runs in the mode the core does.
 func Serve(b Backend) {
 	if err := harden.DisableCoreDumps(); err != nil {
 		fmt.Fprintln(os.Stderr, "plugin: disable core dumps:", err)
@@ -98,6 +98,7 @@ func (s *server) Capabilities(context.Context, *protocol.CapabilitiesRequest) (*
 		CourierKeyWrite: s.backend.Capabilities().CourierKeyWrite,
 		Fips140Enabled:  fips140.Enabled(),
 		Fips140Version:  fips140.Version(),
+		Fips140Only:     fips140.Enforced(),
 	}, nil
 }
 

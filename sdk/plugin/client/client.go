@@ -8,11 +8,14 @@ package client
 
 import (
 	"context"
+	"crypto/fips140"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -41,9 +44,54 @@ type Client struct {
 type FIPS140 struct {
 	// Enabled reports whether the plugin process runs in FIPS 140-3 mode.
 	Enabled bool
+	// Only reports whether it runs in "only" mode, where a non-approved
+	// algorithm panics rather than falls back. Implies Enabled.
+	Only bool
 	// Version is the Go FIPS 140-3 module the plugin was built with, such as
 	// "v1.0.0", or "latest" for an unvalidated in-tree module.
 	Version string
+}
+
+// Mode is the state as GODEBUG spells it: "off", "on", or "only".
+func (f FIPS140) Mode() string {
+	switch {
+	case f.Only:
+		return "only"
+	case f.Enabled:
+		return "on"
+	}
+	return "off"
+}
+
+// Covers reports whether a plugin in state f is inside the boundary of a
+// host in state host: it must be in FIPS mode when the host is, and in
+// only mode when the host is.
+func (f FIPS140) Covers(host FIPS140) bool {
+	return (f.Enabled || !host.Enabled) && (f.Only || !host.Only)
+}
+
+// HostFIPS140 is the calling process's own FIPS 140-3 state.
+func HostFIPS140() FIPS140 {
+	return FIPS140{Enabled: fips140.Enabled(), Only: fips140.Enforced(), Version: fips140.Version()}
+}
+
+// GODEBUG returns the GODEBUG value that puts a plugin in the calling
+// process's FIPS 140-3 mode: the process's own GODEBUG, with the mode
+// appended when it is not spelled out there. The mode may come from the
+// build's default (GOFIPS140) rather than the environment, and a plugin
+// built differently would not share that default.
+func GODEBUG() string {
+	v := os.Getenv("GODEBUG")
+	for setting := range strings.SplitSeq(v, ",") {
+		if strings.HasPrefix(setting, "fips140=") {
+			return v
+		}
+	}
+	mode := "fips140=" + HostFIPS140().Mode()
+	if v == "" {
+		return mode
+	}
+	return v + "," + mode
 }
 
 // Start launches cmd, which must not be started, performs the handshake,
@@ -97,10 +145,14 @@ func dispense(process *goplugin.Client) (*Client, error) {
 		return nil, callError("Capabilities", err)
 	}
 	c.caps = plugin.Capabilities{CourierKeyWrite: resp.GetCourierKeyWrite()}
-	if err := contract.Detail(resp.GetFips140Version()); err != nil {
-		return nil, malformed("Capabilities", fmt.Errorf("fips140_version: %w", err))
+	if err := contract.FIPS140Version(resp.GetFips140Version()); err != nil {
+		return nil, malformed("Capabilities", err)
 	}
-	c.fips = FIPS140{Enabled: resp.GetFips140Enabled(), Version: resp.GetFips140Version()}
+	c.fips = FIPS140{
+		Enabled: resp.GetFips140Enabled() || resp.GetFips140Only(),
+		Only:    resp.GetFips140Only(),
+		Version: resp.GetFips140Version(),
+	}
 	return c, nil
 }
 
