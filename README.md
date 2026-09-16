@@ -164,7 +164,7 @@ docker compose run --rm trustedcourier tc init --config /etc/trustedcourier/trus
 docker compose up -d
 ```
 
-`tc init` waits for OpenBao, initializes it with the static seal, mounts a KV v2 engine at `secret/`, issues the Backend Plugin a token with a policy covering only that mount, stores an audit signing key through the plugin, and creates the Operator Credential. It prints, once:
+`tc init` waits for OpenBao, initializes it with the static seal, mounts a KV v2 engine at `secret/`, issues the Backend Plugin a token with a policy covering only that mount, runs the plugin once to prove it reaches OpenBao, stores an audit signing key through it, and creates the Operator Credential. It prints, once:
 
 ```
 Static seal key (base64 of /openbao/seal/unseal.key; back it up, OpenBao cannot start without it; TrustedCourier does not keep it):
@@ -174,6 +174,7 @@ Recovery keys (any 3 of the 5 regenerate the root token; shown once, TrustedCour
 Root token (shown once, TrustedCourier does not keep it; store Secrets with it, then keep it offline):
 s....
 Backend Plugin openbao: token with policy trustedcourier written to /var/lib/trustedcourier/openbao/token (expires 2027-09-16T18:00:00Z; the plugin does not renew it).
+Backend Plugin openbao: launched and healthy.
 Audit signing key: generated and stored at secret/data/trustedcourier#audit-signing-key.
 
 Operator Credential (shown once; store it now, it cannot be shown again):
@@ -799,6 +800,8 @@ The full suite takes several minutes, and `go test` prints nothing for a package
 ```sh
 go run ./scripts/testprogress -log /tmp/tc-tests.log -label "TrustedCourier tests" -- go test -race -json ./...
 ```
+
+`scripts/test-band.sh <log> <label> [go test args]` wraps that, truncating the log first and ending it with the sentinel from the exit code, so it is the way to start any run that should show in the band.
 
 CI builds with `GOFIPS140=certified`, the validated FIPS 140-3 module, and runs every module twice, once with `GODEBUG=fips140=off` and once with `fips140=on`. Set both the same way to reproduce a CI leg locally; `fips140=only` also passes and catches any non-approved algorithm as a panic. The race detector is required, not optional ([ADR-0003](docs/decisions/0003-go-over-rust-core.md) relies on it).
 
