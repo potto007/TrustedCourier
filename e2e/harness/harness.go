@@ -35,6 +35,12 @@ import (
 
 var tcBinary string
 
+// repoRoot is the repository root, set by Main.
+var repoRoot string
+
+// RepoRoot returns the repository root the harness built tc from.
+func RepoRoot() string { return repoRoot }
+
 // Main builds the tc binary once for the test package, runs the tests, and
 // removes the build. Call it from TestMain.
 func Main(m *testing.M) {
@@ -58,6 +64,7 @@ func buildAndRun(m *testing.M, dir string) (int, error) {
 		return 0, fmt.Errorf("locate module root: %w", err)
 	}
 	root := filepath.Dir(strings.TrimSpace(string(gomod)))
+	repoRoot = root
 	tcBinary = filepath.Join(dir, "tc")
 	args := []string{"build", "-o", tcBinary}
 	if raceEnabled {
@@ -724,7 +731,13 @@ func (s *Server) TC(args ...string) Result {
 // given extra environment. It never fails the test itself, so it is safe to
 // call from subtests; a timeout is reported as exit code -1.
 func (in *Installation) TC(env []string, args ...string) Result {
-	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
+	return in.TCTimeout(cliTimeout, env, args...)
+}
+
+// TCTimeout is TC with its own time limit, for a command that waits on
+// other processes, such as tc init.
+func (in *Installation) TCTimeout(timeout time.Duration, env []string, args ...string) Result {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, tcBinary, args...)
 	cmd.Env = childEnv(append([]string{"TC_ADMIN_SOCKET=" + in.Socket}, env...)...)
@@ -735,7 +748,7 @@ func (in *Installation) TC(env []string, args ...string) Result {
 	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode(err)}
 	if ctx.Err() != nil {
 		res.ExitCode = -1
-		res.Stderr += fmt.Sprintf("\nharness: tc %v timed out after %v", args, cliTimeout)
+		res.Stderr += fmt.Sprintf("\nharness: tc %v timed out after %v", args, timeout)
 	}
 	if strings.Contains(res.Stderr, "WARNING: DATA RACE") {
 		res.ExitCode = -1

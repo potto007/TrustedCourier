@@ -1,12 +1,15 @@
 package e2e
 
 import (
+	"crypto/rand"
 	"debug/elf"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -14,17 +17,15 @@ import (
 	"github.com/potto007/TrustedCourier/e2e/harness"
 )
 
-// repoRoot is the repository root, the parent of the e2e package.
 func repoRoot(t *testing.T) string {
 	t.Helper()
-	root, err := filepath.Abs("..")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return root
+	return harness.RepoRoot()
 }
 
 func TestReleaseBinariesAreStatic(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("release binaries are checked as Linux ELF files")
+	}
 	out := t.TempDir()
 	build := exec.Command(filepath.Join(repoRoot(t), "scripts", "build-release.sh"), out)
 	// Built against the in-tree FIPS module here, as go test is; the
@@ -63,6 +64,15 @@ func TestReleaseBinariesAreStatic(t *testing.T) {
 	if res.ExitCode != 0 || !strings.Contains(res.Stdout, "tc init") {
 		t.Errorf("the static tc does not run: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
 	}
+}
+
+func randomBytes(t *testing.T, n int) []byte {
+	t.Helper()
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func runBinary(t *testing.T, path string, args ...string) harness.Result {
@@ -174,7 +184,9 @@ func TestComposeStackBootstraps(t *testing.T) {
 	}
 	compose := composeOrSkip(t, "compose.yaml", "compose.test.yaml")
 	dir := t.TempDir()
-	project := "tc-e2e-" + strings.ToLower(regexp.MustCompile(`[^a-z0-9]`).ReplaceAllString(filepath.Base(dir), ""))
+	// A project of its own per run, so an interrupted run's volumes never
+	// meet the next run.
+	project := "tc-e2e-" + hex.EncodeToString(randomBytes(t, 4))
 	env := []string{"COMPOSE_PROJECT_NAME=" + project, "TC_TEST_CONFIG=" + filepath.Join(dir, "trustedcourier.yaml")}
 	t.Cleanup(func() {
 		if res := compose(env, "down", "--volumes", "--timeout", "10"); res.ExitCode != 0 {

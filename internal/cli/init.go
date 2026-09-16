@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -145,15 +146,17 @@ func (in *initializer) run(ctx context.Context) error {
 			return fmt.Errorf("OpenBao at %s is not an initialized, unsealed dev server (initialized=%v sealed=%v)", client.Address, health.Initialized, health.Sealed)
 		}
 	case health.Initialized:
-		if sealKeyCreated {
-			_ = os.Remove(in.o.sealKeyFile)
+		// The key file is never removed: an OpenBao that just booted may
+		// hold it, and a restart would wait for it.
+		if health.Sealed {
+			if sealKeyCreated {
+				return fmt.Errorf("OpenBao at %s is initialized but sealed: it was initialized with another seal key than the one just written to %s. Restore the key it was initialized with there, and remove this one", client.Address, in.o.sealKeyFile)
+			}
+			return fmt.Errorf("OpenBao at %s is initialized but sealed: the seal key at %s is not the one it was initialized with", client.Address, in.o.sealKeyFile)
 		}
 		client.Token = os.Getenv(rootTokenEnv)
 		if client.Token == "" {
 			return fmt.Errorf("OpenBao at %s is already initialized; tc init initializes it once. To finish setting TrustedCourier up against it, rerun with a root token in %s", client.Address, rootTokenEnv)
-		}
-		if health.Sealed {
-			return fmt.Errorf("OpenBao at %s is sealed; check its seal key", client.Address)
 		}
 		fmt.Fprintf(in.stdout, "OpenBao at %s is already initialized; continuing with the token in %s.\n\n", client.Address, rootTokenEnv)
 	default:
@@ -230,6 +233,14 @@ func (in *initializer) setUpPlugin(ctx context.Context, client *bootstrap.Client
 	if err := client.WritePluginPolicy(ctx); err != nil {
 		return err
 	}
+	// A rerun keeps a token that still works rather than leaving a live one
+	// behind unrecorded.
+	if existing, err := os.ReadFile(tokenFile); err == nil {
+		if ttl, err := client.CheckPluginToken(ctx, strings.TrimSpace(string(existing))); err == nil {
+			fmt.Fprintf(in.stdout, "Backend Plugin %s: token in %s kept (%s).\n", in.plugin.Name, tokenFile, tokenExpiry(ttl))
+			return in.runPlugin(ctx, host)
+		}
+	}
 	token, err := client.CreatePluginToken(ctx, in.o.pluginTokenTTL)
 	if err != nil {
 		return fmt.Errorf("issue the Backend Plugin's token: %w", err)
@@ -237,55 +248,71 @@ func (in *initializer) setUpPlugin(ctx context.Context, client *bootstrap.Client
 	if err := writeTokenFile(tokenFile, token.Token, in.plugin); err != nil {
 		return err
 	}
-	expiry := "does not expire"
-	if token.TTL > 0 {
-		expiry = fmt.Sprintf("expires %s; the plugin does not renew it", time.Now().Add(token.TTL).UTC().Format(time.RFC3339))
-	}
-	fmt.Fprintf(in.stdout, "Backend Plugin %s: token with policy %s written to %s (%s).\n", in.plugin.Name, bootstrap.PolicyName, tokenFile, expiry)
+	fmt.Fprintf(in.stdout, "Backend Plugin %s: token with policy %s written to %s (%s).\n", in.plugin.Name, bootstrap.PolicyName, tokenFile, tokenExpiry(token.TTL))
+	return in.runPlugin(ctx, host)
+}
 
-	key := in.cfg.Audit.SigningKey
-	if key == nil || key.Backend != in.plugin.Name {
-		return nil
+func tokenExpiry(ttl time.Duration) string {
+	if ttl <= 0 {
+		return "does not expire"
 	}
-	return in.storeSigningKey(ctx, host, *key)
+	return fmt.Sprintf("expires %s; the plugin does not renew it", time.Now().Add(ttl).UTC().Format(time.RFC3339))
 }
 
 // writeTokenFile writes token to path, readable by the plugin's user only.
+// The file is created, never reused, and handed over by descriptor, so a
+// plugin user who owns the directory cannot redirect the write.
 func writeTokenFile(path, token string, pc config.BackendPlugin) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create the token file's directory: %w", err)
 	}
 	tmp := path + ".new"
-	if err := os.WriteFile(tmp, []byte(token+"\n"), 0o600); err != nil {
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("clear the Backend Plugin's stale token file: %w", err)
+	}
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return fmt.Errorf("write the Backend Plugin's token file: %w", err)
 	}
-	if err := os.Chmod(tmp, 0o600); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("restrict the Backend Plugin's token file: %w", err)
+	err = func() error {
+		if _, err := f.WriteString(token + "\n"); err != nil {
+			return err
+		}
+		if err := f.Chmod(0o600); err != nil {
+			return err
+		}
+		if err := pluginhost.GiveFile(f, pc); err != nil {
+			return err
+		}
+		return f.Sync()
+	}()
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
 	}
-	if err := pluginhost.GiveFile(tmp, pc); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	if err == nil {
+		err = os.Rename(tmp, path)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("write the Backend Plugin's token file: %w", err)
 	}
 	return nil
 }
 
-// storeSigningKey runs the Backend Plugin, as the server will, and stores a
-// new Ed25519 audit signing key at key unless one is there.
-func (in *initializer) storeSigningKey(ctx context.Context, host *pluginhost.Host, key config.CourierKey) error {
+// runPlugin runs the Backend Plugin once, as the server will, proving it
+// launches and reaches its Backend with the token, and stores the audit
+// signing key through it when the config keeps that key there.
+func (in *initializer) runPlugin(ctx context.Context, host *pluginhost.Host) error {
 	pluginCtx, stop := context.WithCancel(ctx)
 	defer host.Wait()
 	defer stop()
 	host.Start(pluginCtx)
+	name := in.plugin.Name
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		var status pluginhost.Status
 		for _, s := range host.Status(ctx) {
-			if s.Name == key.Backend {
+			if s.Name == name {
 				status = s
 			}
 		}
@@ -293,10 +320,21 @@ func (in *initializer) storeSigningKey(ctx context.Context, host *pluginhost.Hos
 			break
 		}
 		if status.State == pluginhost.StateRefused || time.Now().After(deadline) {
-			return fmt.Errorf("Backend Plugin %s is %s and not healthy: %s", key.Backend, status.State, status.Detail)
+			return fmt.Errorf("Backend Plugin %s is %s and not healthy: %s", name, status.State, status.Detail)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	fmt.Fprintf(in.stdout, "Backend Plugin %s: launched and healthy.\n", name)
+	key := in.cfg.Audit.SigningKey
+	if key == nil || key.Backend != name {
+		return nil
+	}
+	return in.storeSigningKey(ctx, host, *key)
+}
+
+// storeSigningKey stores a new Ed25519 audit signing key at key through the
+// running Backend Plugin, unless one is there.
+func (in *initializer) storeSigningKey(ctx context.Context, host *pluginhost.Host, key config.CourierKey) error {
 	existing, err := host.Get(ctx, key.Backend, key.Location)
 	switch {
 	case err == nil:

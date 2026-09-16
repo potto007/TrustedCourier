@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/potto007/TrustedCourier/e2e/harness"
 )
@@ -88,7 +90,9 @@ const (
 func runInit(t *testing.T, tc *harness.Installation, env []string, flags ...string) (harness.Result, initOutput) {
 	t.Helper()
 	args := append([]string{"init", "--config", filepath.Join(tc.Dir(), "config.yaml")}, flags...)
-	res := tc.TC(env, args...)
+	// tc init waits for OpenBao (up to --wait) and the plugin's health; a
+	// runner under load needs more than a plain command's limit.
+	res := tc.TCTimeout(3*time.Minute, env, args...)
 	return res, initOutput(res.Stdout)
 }
 
@@ -159,6 +163,15 @@ func TestInitBootstrapsOpenBaoWithStaticSeal(t *testing.T) {
 	}
 	if key := bao.KVField(rootToken, "trustedcourier", "audit-signing-key"); !strings.Contains(key, "PRIVATE KEY") {
 		t.Errorf("tc init did not store an audit signing key: %q", key)
+	}
+	// The shipped OpenBao config lets the plugin's token live the year tc
+	// init asks for; the default cap would cut it to 32 days.
+	m := regexp.MustCompile(`Backend Plugin openbao: .*expires (\S+);`).FindStringSubmatch(res.Stdout)
+	if m == nil {
+		t.Fatalf("tc init did not print the plugin token's expiry:\n%s", res.Stdout)
+	}
+	if expiry, err := time.Parse(time.RFC3339, m[1]); err != nil || time.Until(expiry) < 360*24*time.Hour {
+		t.Errorf("plugin token expires %s, want about a year out", m[1])
 	}
 
 	// The static seal unseals OpenBao on its own after a restart.
@@ -243,6 +256,9 @@ func TestInitDevUsesDevModeOpenBao(t *testing.T) {
 	}
 	if !strings.Contains(res.Stdout, "Operator Credential: already created") {
 		t.Errorf("second tc init --dev does not say the Operator Credential exists:\n%s", res.Stdout)
+	}
+	if !strings.Contains(res.Stdout, "token in "+tokenFile+" kept") {
+		t.Errorf("second tc init --dev issued the plugin a new token instead of keeping the working one:\n%s", res.Stdout)
 	}
 	if again := bao.KVField(bao.RootToken, "trustedcourier", "audit-signing-key"); again != signingKey {
 		t.Errorf("second tc init --dev replaced the audit signing key")

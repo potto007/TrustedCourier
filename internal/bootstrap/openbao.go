@@ -17,8 +17,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/potto007/TrustedCourier/internal/config"
 )
@@ -67,7 +70,12 @@ func EnsureSealKey(path string) (key []byte, created bool, err error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("create the seal key file: %w", err)
 	}
-	if _, err := f.Write(key); err != nil {
+	// Durable before OpenBao is initialized against it: the store must never
+	// outlive the only key that opens it.
+	if _, err := f.Write(key); err == nil {
+		err = f.Sync()
+	}
+	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
 		return nil, false, fmt.Errorf("write the seal key file: %w", err)
@@ -105,7 +113,9 @@ func NewClient(address, caCertFile string) (*Client, error) {
 	return &Client{
 		Address: strings.TrimRight(address, "/"),
 		http: &http.Client{
-			Transport: &http.Transport{TLSClientConfig: tlsConfig, Proxy: http.ProxyFromEnvironment},
+			// No proxy from the environment: the root token goes to
+			// OpenBao and nowhere else, as the plugin does.
+			Transport: &http.Transport{TLSClientConfig: tlsConfig, Proxy: nil},
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -296,6 +306,35 @@ func (c *Client) CreatePluginToken(ctx context.Context, ttl time.Duration) (Plug
 	return PluginToken{Token: resp.Auth.ClientToken, TTL: time.Duration(resp.Auth.LeaseDuration) * time.Second}, nil
 }
 
+// CheckPluginToken reports whether token is a valid token carrying
+// PolicyName, and its remaining TTL, zero when it does not expire.
+func (c *Client) CheckPluginToken(ctx context.Context, token string) (time.Duration, error) {
+	if token == "" {
+		return 0, errors.New("empty token")
+	}
+	check := &Client{Address: c.Address, Token: token, http: c.http}
+	status, body, err := check.call(ctx, http.MethodGet, "auth/token/lookup-self", nil)
+	if err != nil {
+		return 0, err
+	}
+	if status != http.StatusOK {
+		return 0, fmt.Errorf("auth/token/lookup-self: %s", apiError(status, body))
+	}
+	var resp struct {
+		Data struct {
+			Policies []string `json:"policies"`
+			TTL      int64    `json:"ttl"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, fmt.Errorf("auth/token/lookup-self: %w", err)
+	}
+	if !slices.Contains(resp.Data.Policies, PolicyName) {
+		return 0, fmt.Errorf("the token does not carry policy %s", PolicyName)
+	}
+	return time.Duration(resp.Data.TTL) * time.Second, nil
+}
+
 // call makes one API call and returns the status and body. A status of 0
 // with an error means OpenBao did not answer.
 func (c *Client) call(ctx context.Context, method, path string, body any) (int, []byte, error) {
@@ -327,13 +366,31 @@ func (c *Client) call(ctx context.Context, method, path string, body any) (int, 
 }
 
 // apiError describes an OpenBao error response by its status and the
-// errors it lists, never the whole body.
+// errors it lists, never the whole body, with control characters removed
+// and the text bounded, since it reaches the Operator's terminal.
 func apiError(status int, body []byte) string {
 	var e struct {
 		Errors []string `json:"errors"`
 	}
 	if json.Unmarshal(body, &e) == nil && len(e.Errors) > 0 {
-		return fmt.Sprintf("status %d: %s", status, strings.Join(e.Errors, "; "))
+		return fmt.Sprintf("status %d: %s", status, printable(strings.Join(e.Errors, "; "), 512))
 	}
 	return fmt.Sprintf("status %d", status)
+}
+
+// printable keeps the first max bytes of s, with any control character or
+// invalid UTF-8 replaced by '?'.
+func printable(s string, max int) string {
+	var b strings.Builder
+	for _, r := range s {
+		if b.Len() >= max {
+			b.WriteString("...")
+			break
+		}
+		if r == utf8.RuneError || unicode.IsControl(r) {
+			r = '?'
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

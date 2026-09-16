@@ -38,23 +38,9 @@ const SealKeyFile = "unseal.key"
 const OpenBaoWaitForSealKey = `while [ ! -s /openbao/seal/` + SealKeyFile + ` ]; do sleep 1; done; ` +
 	`BAO_SEAL_KEY=$(base64 -w0 /openbao/seal/` + SealKeyFile + `) exec docker-entrypoint.sh server`
 
-// openBaoStaticSealConfig is the OpenBao config the tests run with the
-// static seal: a plain listener, file storage inside the container, and
-// the seal key tc init writes.
-const openBaoStaticSealConfig = `
-ui = false
-listener "tcp" {
-  address     = "0.0.0.0:8200"
-  tls_disable = true
-}
-storage "file" {
-  path = "/openbao/file"
-}
-seal "static" {
-  current_key_id = "trustedcourier-1"
-  current_key    = "env://BAO_SEAL_KEY"
-}
-`
+// OpenBaoConfigFile is the OpenBao config the compose stack ships, which
+// the static-seal tests run OpenBao with, so the two cannot drift.
+const OpenBaoConfigFile = "deploy/openbao/openbao.hcl"
 
 // OpenBao is an OpenBao container a test runs.
 type OpenBao struct {
@@ -93,7 +79,11 @@ func StartOpenBao(t *testing.T, sealDir string) *OpenBao {
 	if err := os.Chmod(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(configDir, "openbao.hcl"), []byte(openBaoStaticSealConfig), 0o644); err != nil {
+	shipped, err := os.ReadFile(filepath.Join(repoRoot, OpenBaoConfigFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "openbao.hcl"), shipped, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return runOpenBao(t, docker, "",

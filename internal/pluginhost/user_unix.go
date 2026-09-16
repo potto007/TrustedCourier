@@ -142,10 +142,11 @@ func setCredential(cmd *exec.Cmd, cred *credential) error {
 	return nil
 }
 
-// GiveFile hands the file at path to the Backend Plugin's OS user, for a
-// file the plugin must read, such as its Backend's token. It does nothing
-// when the plugin shares the server's user.
-func GiveFile(path string, pc config.BackendPlugin) error {
+// GiveFile hands the open file f to the Backend Plugin's OS user, for a
+// file the plugin must read, such as its Backend's token. By descriptor, so
+// the file handed over is the one written. It does nothing when the plugin
+// shares the server's user.
+func GiveFile(f *os.File, pc config.BackendPlugin) error {
 	if pc.InsecureShareCoreUser {
 		return nil
 	}
@@ -157,8 +158,8 @@ func GiveFile(path string, pc config.BackendPlugin) error {
 	if err != nil {
 		return fmt.Errorf("user %q: %w", pc.User, err)
 	}
-	if err := os.Chown(path, int(cred.Uid), int(cred.Gid)); err != nil {
-		return fmt.Errorf("give %s to user %q: %w", path, pc.User, err)
+	if err := f.Chown(int(cred.Uid), int(cred.Gid)); err != nil {
+		return fmt.Errorf("give %s to user %q: %w", f.Name(), pc.User, err)
 	}
 	return nil
 }
