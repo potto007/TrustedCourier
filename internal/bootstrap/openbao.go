@@ -72,7 +72,7 @@ func EnsureSealKey(path string) (key []byte, created bool, err error) {
 	}
 	// Durable before OpenBao is initialized against it: the store must never
 	// outlive the only key that opens it.
-	if _, err := f.Write(key); err == nil {
+	if _, err = f.Write(key); err == nil {
 		err = f.Sync()
 	}
 	if err != nil {
