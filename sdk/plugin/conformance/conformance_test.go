@@ -28,11 +28,59 @@ var fakeFixture = conformance.Fixture{
 		"kv/üabc":   []byte("test-value-3"),
 	},
 	Missing:            "kv/missing",
+	Malformed:          []string{"kv/empty"},
 	CourierKeyLocation: "courier/tls-key",
 }
 
 func TestFakePluginPassesConformance(t *testing.T) {
 	conformance.Run(t, buildFake(t, ""), fakeFixture)
+}
+
+// TestKitCoversEveryCheck runs the kit against the fake plugin in a child
+// test process and checks every conformance check ran and passed, so a
+// check cannot silently drop out of the kit.
+func TestKitCoversEveryCheck(t *testing.T) {
+	if bin := os.Getenv("CONFORMANCE_FAKE_PLUGIN"); bin != "" {
+		conformance.Run(t, bin, fakeFixture)
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestKitCoversEveryCheck$", "-test.v")
+	cmd.Env = append(os.Environ(), "CONFORMANCE_FAKE_PLUGIN="+buildFake(t, ""))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("kit failed the fake plugin:\n%s", out)
+	}
+	for _, check := range []string{
+		"FIPS140", "FIPS140Follows", "Capabilities", "Health", "Get", "GetMissing",
+		"GetMalformed", "List", "ListNoMatch", "Concurrent", "CourierKeyWrite",
+	} {
+		if !strings.Contains(string(out), "--- PASS: TestKitCoversEveryCheck/"+check+" ") {
+			t.Errorf("kit output does not show check %s passing:\n%s", check, out)
+		}
+	}
+}
+
+// TestKitFailsPluginWithoutMalformedHandling runs the kit against a plugin
+// that serves a value at a malformed location, bypassing the SDK's checks.
+func TestKitFailsPluginWithoutMalformedHandling(t *testing.T) {
+	if bin := os.Getenv("CONFORMANCE_LENIENT_PLUGIN"); bin != "" {
+		conformance.Run(t, bin, fakeFixture)
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestKitFailsPluginWithoutMalformedHandling$", "-test.v")
+	cmd.Env = append(os.Environ(), "CONFORMANCE_LENIENT_PLUGIN="+buildFake(t, "lenient"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("conformance kit passed a plugin that serves a malformed Secret:\n%s", out)
+	}
+	for _, want := range []string{
+		"--- FAIL: TestKitFailsPluginWithoutMalformedHandling/GetMalformed",
+		"--- PASS: TestKitFailsPluginWithoutMalformedHandling/Get ",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("kit output is missing %q:\n%s", want, out)
+		}
+	}
 }
 
 // TestConformanceFailsMalformedPlugin runs the kit against a plugin that

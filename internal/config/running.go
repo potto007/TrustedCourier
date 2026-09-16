@@ -78,7 +78,7 @@ func restartKeys(old, cfg *Config) []string {
 	if !old.AgentAPI.Equal(cfg.AgentAPI) {
 		keys = append(keys, "agent_api")
 	}
-	if !maps.Equal(old.BackendPlugins, cfg.BackendPlugins) {
+	if !maps.EqualFunc(old.BackendPlugins, cfg.BackendPlugins, BackendPlugin.Equal) {
 		keys = append(keys, "backend_plugins")
 	}
 	oldKey, newKey := old.Audit.SigningKey, cfg.Audit.SigningKey

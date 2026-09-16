@@ -37,6 +37,9 @@ jobs:
       - name: go test (race detector)
         env:
           GODEBUG: fips140=${{ matrix.fips140 }}
+          # The OpenBao plugin's conformance test runs a real OpenBao
+          # container with docker and must never silently skip in CI.
+          TC_REQUIRE_OPENBAO: "1"
         # The e2e package alone runs close to go test's default 10m limit.
         run: go test -race -timeout 30m ./...
       # Running a Backend Plugin as a separate OS user needs a root server.

@@ -339,6 +339,15 @@ type BackendPlugin struct {
 	// InsecureShareCoreUser runs the plugin as the server's own user, giving
 	// it access to the config and database. For development only.
 	InsecureShareCoreUser bool
+	// Env is the plugin's environment beyond what the Plugin Host sets, as
+	// "NAME=value" entries sorted by name. It never contains GODEBUG.
+	Env []string
+}
+
+// Equal reports whether a and b configure the same Backend Plugin.
+func (a BackendPlugin) Equal(b BackendPlugin) bool {
+	return a.Name == b.Name && a.Path == b.Path && a.SHA256 == b.SHA256 && a.User == b.User &&
+		a.InsecureShareCoreUser == b.InsecureShareCoreUser && slices.Equal(a.Env, b.Env)
 }
 
 // Admin configures the admin API.
@@ -532,10 +541,11 @@ type fileUpstream struct {
 }
 
 type fileBackendPlugin struct {
-	Path                  string `yaml:"path"`
-	SHA256                string `yaml:"sha256"`
-	User                  string `yaml:"user"`
-	InsecureShareCoreUser bool   `yaml:"insecure_share_core_user"`
+	Path                  string            `yaml:"path"`
+	SHA256                string            `yaml:"sha256"`
+	User                  string            `yaml:"user"`
+	InsecureShareCoreUser bool              `yaml:"insecure_share_core_user"`
+	Env                   map[string]string `yaml:"env"`
 }
 
 type fileAdmin struct {
@@ -1317,13 +1327,33 @@ func (p fileBackendPlugin) validate(name, baseDir string) (BackendPlugin, error)
 	case p.User != "" && p.InsecureShareCoreUser:
 		return BackendPlugin{}, fmt.Errorf("Backend Plugin %q: set user or insecure_share_core_user, not both", name)
 	}
+	env, err := p.validateEnv(name)
+	if err != nil {
+		return BackendPlugin{}, err
+	}
 	return BackendPlugin{
 		Name:                  name,
 		Path:                  resolve(baseDir, p.Path),
 		SHA256:                strings.ToLower(p.SHA256),
 		User:                  p.User,
 		InsecureShareCoreUser: p.InsecureShareCoreUser,
+		Env:                   env,
 	}, nil
+}
+
+// validateEnv returns the plugin's configured environment as sorted
+// "NAME=value" entries, each checked by the plugin SDK's rules, which
+// reserve GODEBUG and the other Go runtime settings for the Plugin Host and
+// refuse loader settings (ADR-0027, ADR-0028).
+func (p fileBackendPlugin) validateEnv(name string) ([]string, error) {
+	env := make([]string, 0, len(p.Env))
+	for _, k := range slices.Sorted(maps.Keys(p.Env)) {
+		if err := client.ValidateEnv(k, p.Env[k]); err != nil {
+			return nil, fmt.Errorf("Backend Plugin %q: %w", name, err)
+		}
+		env = append(env, k+"="+p.Env[k])
+	}
+	return env, nil
 }
 
 // namePattern constrains Policy names and Secret Names so they are safe on a

@@ -31,6 +31,11 @@ import (
 // StartTimeout bounds launching a plugin through its first response.
 const StartTimeout = 10 * time.Second
 
+// ErrMalformed means a plugin's response broke the protocol contract: it
+// was refused on arrival, or the SDK refused it before it left the plugin.
+// It is a plugin defect, never a Backend state.
+var ErrMalformed = errors.New("malformed response from Backend Plugin")
+
 // Client is one running Backend Plugin process.
 type Client struct {
 	process *goplugin.Client
@@ -267,16 +272,27 @@ func callError(method string, err error) error {
 	if !ok {
 		return fmt.Errorf("%s: %s", method, contract.Sanitize(err.Error()))
 	}
-	switch st.Code() {
-	case codes.NotFound:
+	switch {
+	case st.Code() == codes.NotFound:
+		if msg := st.Message(); msg != "" && msg != plugin.ErrNotFound.Error() {
+			return fmt.Errorf("%s: %w: %s", method, plugin.ErrNotFound, contract.Sanitize(msg))
+		}
 		return fmt.Errorf("%s: %w", method, plugin.ErrNotFound)
-	case codes.Unimplemented:
+	case st.Code() == codes.Unimplemented:
 		return fmt.Errorf("%s: %w", method, plugin.ErrUnsupported)
+	case st.Code() == codes.Internal && strings.HasPrefix(st.Message(), contract.MalformedPrefix):
+		// The SDK refused the Backend's response before it left the plugin.
+		return fmt.Errorf("%s: %w: %s", method, ErrMalformed, contract.Sanitize(strings.TrimPrefix(st.Message(), contract.MalformedPrefix)))
 	default:
 		return fmt.Errorf("%s: %s: %s", method, st.Code(), contract.Sanitize(st.Message()))
 	}
 }
 
+// ValidateEnv reports whether a plugin may be configured with the
+// environment variable name set to value: a portable name, a bounded
+// printable value, and not a Go runtime or loader setting.
+func ValidateEnv(name, value string) error { return contract.Env(name, value) }
+
 func malformed(method string, err error) error {
-	return fmt.Errorf("%s: malformed response from Backend Plugin: %w", method, err)
+	return fmt.Errorf("%s: %w: %w", method, ErrMalformed, err)
 }

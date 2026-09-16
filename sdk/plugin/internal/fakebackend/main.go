@@ -12,7 +12,10 @@
 // log line; "nofips" bypasses the SDK and reports itself outside FIPS
 // 140-3 mode whatever mode it runs in, as a plugin built without the SDK
 // or on an old one would; "fipson" likewise reports FIPS mode "on", never
-// "only". label, when set, appears in the health detail.
+// "only"; "lenient" bypasses the SDK and serves whatever the Backend holds,
+// the empty value at kv/empty included. label, when set, appears in the health detail, as does the
+// FAKEBACKEND_LABEL environment variable, so a test can see what
+// environment the core gave the plugin.
 //
 // When a file named after the binary plus ".secrets.json" exists, Get serves
 // the JSON object of locations to values in it instead of the built-in
@@ -43,6 +46,8 @@ import (
 
 	"github.com/potto007/TrustedCourier/sdk/plugin"
 	"github.com/potto007/TrustedCourier/sdk/plugin/protocol"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -66,6 +71,8 @@ func main() {
 		protocol.Serve(noFIPSBackend{})
 	case "fipson":
 		protocol.Serve(noFIPSBackend{claimOn: true})
+	case "lenient":
+		protocol.Serve(lenientBackend{backend: newBackend()})
 	default:
 		fmt.Fprintf(os.Stderr, "fakebackend: unknown mode %q\n", mode)
 		os.Exit(2)
@@ -78,6 +85,8 @@ var Secrets = map[string]string{
 	"kv/github": "test-value-2",
 	// Non-ASCII, with a multi-byte character across its midpoint.
 	"kv/üabc": "test-value-3",
+	// Held, but not a Secret: the SDK refuses to serve an empty value.
+	"kv/empty": "",
 	// The audit signing key the e2e harness configures.
 	"courier/audit-signing-key": auditSigningKey(),
 }
@@ -123,6 +132,9 @@ func (b *backend) Get(_ context.Context, location string) ([]byte, error) {
 	if !ok {
 		return nil, plugin.ErrNotFound
 	}
+	if len(v) == 0 {
+		return nil, fmt.Errorf("%s holds an empty value, not a Secret", location)
+	}
 	return slices.Clone(v), nil
 }
 
@@ -167,6 +179,9 @@ func (b *backend) Health(context.Context) (string, error) {
 	detail := fmt.Sprintf("fake Backend, uid=%d gid=%d", os.Getuid(), os.Getgid())
 	if label != "" {
 		detail += ", " + label
+	}
+	if env := os.Getenv("FAKEBACKEND_LABEL"); env != "" {
+		detail += ", env=" + env
 	}
 	if mode == "unhealthy" {
 		return detail, errors.New("Backend sealed")
@@ -234,6 +249,54 @@ func (malformedBackend) Get(context.Context, *protocol.GetRequest) (*protocol.Ge
 
 func (malformedBackend) List(context.Context, *protocol.ListRequest) (*protocol.ListResponse, error) {
 	return &protocol.ListResponse{Locations: []string{"\x00", "elsewhere/secret", "elsewhere/secret"}}, nil
+}
+
+// lenientBackend serves the well-behaved Backend without the SDK's checks,
+// so a value the SDK would refuse, such as the empty one at kv/empty,
+// reaches the wire as a plugin written against the raw protocol might send
+// it.
+type lenientBackend struct {
+	protocol.UnimplementedBackendServer
+	backend *backend
+}
+
+func (lenientBackend) Capabilities(context.Context, *protocol.CapabilitiesRequest) (*protocol.CapabilitiesResponse, error) {
+	return &protocol.CapabilitiesResponse{
+		CourierKeyWrite: true,
+		Fips140Enabled:  fips140.Enabled(),
+		Fips140Only:     fips140.Enforced(),
+		Fips140Version:  fips140.Version(),
+	}, nil
+}
+
+func (l lenientBackend) Health(ctx context.Context, _ *protocol.HealthRequest) (*protocol.HealthResponse, error) {
+	detail, err := l.backend.Health(ctx)
+	return &protocol.HealthResponse{Healthy: err == nil, Detail: detail}, nil
+}
+
+func (l lenientBackend) Get(_ context.Context, req *protocol.GetRequest) (*protocol.GetResponse, error) {
+	l.backend.mu.RLock()
+	defer l.backend.mu.RUnlock()
+	v, ok := l.backend.secrets[req.GetLocation()]
+	if !ok {
+		return nil, status.Error(codes.NotFound, "not found")
+	}
+	return &protocol.GetResponse{Value: slices.Clone(v)}, nil
+}
+
+func (l lenientBackend) List(ctx context.Context, req *protocol.ListRequest) (*protocol.ListResponse, error) {
+	locs, err := l.backend.List(ctx, req.GetPrefix())
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	return &protocol.ListResponse{Locations: locs}, nil
+}
+
+func (l lenientBackend) WriteCourierKey(ctx context.Context, req *protocol.WriteCourierKeyRequest) (*protocol.WriteCourierKeyResponse, error) {
+	if err := l.backend.WriteCourierKey(ctx, req.GetLocation(), req.GetValue()); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	return &protocol.WriteCourierKeyResponse{}, nil
 }
 
 // noFIPSBackend is well formed but reports a fixed FIPS 140-3 state
