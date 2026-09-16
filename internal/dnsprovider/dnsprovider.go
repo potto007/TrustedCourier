@@ -160,44 +160,42 @@ func zoneCandidates(cfg config.DNS, name string) []string {
 	return out
 }
 
-// findZone finds the zone that holds name with lookup, which reports the
+// zoneCache remembers, for one order, which candidate zones the provider
+// holds and their ids, so each zone is looked up once however many names
+// it holds.
+type zoneCache struct {
+	ids     map[string]string // zone id by zone name
+	missing map[string]bool   // zone names the provider does not hold
+}
+
+// find finds the zone that holds name with lookup, which reports the
 // provider's id for a candidate zone and whether it exists. The first
 // candidate found, the longest, wins.
-func findZone(ctx context.Context, cfg config.DNS, name string, lookup func(ctx context.Context, zone string) (id string, ok bool, err error)) (id, zone string, err error) {
+func (c *zoneCache) find(ctx context.Context, cfg config.DNS, name string, lookup func(ctx context.Context, zone string) (id string, ok bool, err error)) (id, zone string, err error) {
+	if c.ids == nil {
+		c.ids, c.missing = map[string]string{}, map[string]bool{}
+	}
 	for _, candidate := range zoneCandidates(cfg, name) {
+		if id, ok := c.ids[candidate]; ok {
+			return id, candidate, nil
+		}
+		if c.missing[candidate] {
+			continue
+		}
 		id, ok, err := lookup(ctx, candidate)
 		if err != nil {
 			return "", "", err
 		}
 		if ok {
+			c.ids[candidate] = id
 			return id, candidate, nil
 		}
+		c.missing[candidate] = true
 	}
 	if cfg.Zone != "" {
 		return "", "", fmt.Errorf("%s: the zone %s is not at the provider", cfg.Provider, cfg.Zone)
 	}
 	return "", "", fmt.Errorf("%s: %w: %s", cfg.Provider, errNoZone, name)
-}
-
-// zoneCache remembers zones found during one order.
-type zoneCache struct {
-	ids map[string]string // zone id by record name
-	zns map[string]string // zone name by record name
-}
-
-func (c *zoneCache) get(name string) (id, zone string, ok bool) {
-	if c.ids == nil {
-		return "", "", false
-	}
-	id, ok = c.ids[name]
-	return id, c.zns[name], ok
-}
-
-func (c *zoneCache) put(name, id, zone string) {
-	if c.ids == nil {
-		c.ids, c.zns = map[string]string{}, map[string]string{}
-	}
-	c.ids[name], c.zns[name] = id, zone
 }
 
 // withValue returns values with value added once.

@@ -297,16 +297,20 @@ func (i *Issuer) authorizeByDNS(ctx context.Context, client *acme.Client, authzU
 			return err
 		}
 		c := dnsChallenge{domain: domain, authzURL: authz.URI, challenge: authz.Challenges[idx], name: dns01Prefix + domain, value: value}
+		// Pending before Present: a Present that fails after the provider
+		// applied it still gets its record removed.
+		pending = append(pending, c)
 		if err := provider.Present(ctx, c.name, c.value); err != nil {
 			return fmt.Errorf("set the DNS-01 record for %s: %w", domain, err)
 		}
-		pending = append(pending, c)
 		i.log.Info("DNS-01 record set", "record", c.name, "provider", i.cfg.DNS.Provider)
 	}
-	for _, c := range pending {
-		if err := dnsprovider.WaitPropagated(ctx, *i.cfg.DNS, c.name, c.value); err != nil {
-			return fmt.Errorf("validate %s by %s: %w", c.domain, config.ChallengeDNS01, err)
-		}
+	records := make([]dnsprovider.Record, len(pending))
+	for n, c := range pending {
+		records[n] = dnsprovider.Record{Name: c.name, Value: c.value}
+	}
+	if err := dnsprovider.WaitPropagated(ctx, *i.cfg.DNS, records); err != nil {
+		return fmt.Errorf("validate by %s: %w", config.ChallengeDNS01, err)
 	}
 	for _, c := range pending {
 		if _, err := client.Accept(ctx, c.challenge); err != nil {

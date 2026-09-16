@@ -98,14 +98,15 @@ func (g *google) Present(ctx context.Context, name, value string) error {
 	if err != nil {
 		return err
 	}
-	current, err := g.values(ctx, zone, name)
+	current, err := g.set(ctx, zone, name)
 	if err != nil {
 		return err
 	}
-	if slices.Contains(current, value) {
+	values := unquoteAll(current.RRDatas)
+	if slices.Contains(values, value) {
 		return nil
 	}
-	return g.change(ctx, zone, name, current, withValue(current, value))
+	return g.change(ctx, zone, name, current, withValue(values, value))
 }
 
 func (g *google) Cleanup(ctx context.Context, name, value string) error {
@@ -113,22 +114,20 @@ func (g *google) Cleanup(ctx context.Context, name, value string) error {
 	if err != nil {
 		return err
 	}
-	current, err := g.values(ctx, zone, name)
+	current, err := g.set(ctx, zone, name)
 	if err != nil {
 		return err
 	}
-	if !slices.Contains(current, value) {
+	values := unquoteAll(current.RRDatas)
+	if !slices.Contains(values, value) {
 		return nil
 	}
-	return g.change(ctx, zone, name, current, withoutValue(current, value))
+	return g.change(ctx, zone, name, current, withoutValue(values, value))
 }
 
 // zone finds the managed zone name of the zone that holds name.
 func (g *google) zone(ctx context.Context, name string) (string, error) {
-	if id, _, ok := g.zones.get(name); ok {
-		return id, nil
-	}
-	id, zone, err := findZone(ctx, g.cfg, name, func(ctx context.Context, zone string) (string, bool, error) {
+	id, _, err := g.zones.find(ctx, g.cfg, name, func(ctx context.Context, zone string) (string, bool, error) {
 		req, err := g.request(ctx, http.MethodGet, "/projects/"+url.PathEscape(g.project)+"/managedZones", url.Values{"dnsName": {fqdn(zone)}}, nil)
 		if err != nil {
 			return "", false, err
@@ -159,45 +158,49 @@ func (g *google) zone(ctx context.Context, name string) (string, error) {
 		}
 		return found, found != "", nil
 	})
-	if err != nil {
-		return "", err
-	}
-	g.zones.put(name, id, zone)
-	return id, nil
+	return id, err
 }
 
-// values lists the TXT values at name in the managed zone, unquoted.
-func (g *google) values(ctx context.Context, zone, name string) ([]string, error) {
+// set fetches the TXT record set at name in the managed zone, as the API
+// carries it, or a set with no data when there is none.
+func (g *google) set(ctx context.Context, zone, name string) (googleRRSet, error) {
 	req, err := g.request(ctx, http.MethodGet, "/projects/"+url.PathEscape(g.project)+"/managedZones/"+url.PathEscape(zone)+"/rrsets", url.Values{"name": {fqdn(name)}, "type": {"TXT"}}, nil)
 	if err != nil {
-		return nil, err
+		return googleRRSet{}, err
 	}
 	var resp struct {
 		Sets []googleRRSet `json:"rrsets"`
 	}
 	if err := g.do(ctx, req, &resp); err != nil {
-		return nil, err
+		return googleRRSet{}, err
 	}
-	var values []string
 	for _, s := range resp.Sets {
 		if strings.EqualFold(s.Name, fqdn(name)) && s.Type == "TXT" {
-			for _, v := range s.RRDatas {
-				values = append(values, unquote(v))
-			}
+			return s, nil
 		}
 	}
-	return values, nil
+	return googleRRSet{}, nil
 }
 
-// change replaces the TXT set at name, currently holding current, with
-// values, in one atomic change.
-func (g *google) change(ctx context.Context, zone, name string, current, values []string) error {
+// unquoteAll unquotes each of values.
+func unquoteAll(values []string) []string {
+	out := make([]string, len(values))
+	for i, v := range values {
+		out[i] = unquote(v)
+	}
+	return out
+}
+
+// change replaces the TXT set at name, currently current, with values, in
+// one atomic change. The deletion names the current set exactly, TTL
+// included, as the API requires.
+func (g *google) change(ctx context.Context, zone, name string, current googleRRSet, values []string) error {
 	var body struct {
 		Additions []googleRRSet `json:"additions"`
 		Deletions []googleRRSet `json:"deletions"`
 	}
-	if len(current) > 0 {
-		body.Deletions = []googleRRSet{rrset(name, current)}
+	if len(current.RRDatas) > 0 {
+		body.Deletions = []googleRRSet{current}
 	}
 	if len(values) > 0 {
 		body.Additions = []googleRRSet{rrset(name, values)}

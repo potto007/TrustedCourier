@@ -46,7 +46,7 @@ func TestWaitPropagatedReturnsOnceTheResolversAnswer(t *testing.T) {
 		ns.AddDNSTXTRecord("_acme-challenge.example.test", "wanted")
 	}()
 	start := time.Now()
-	if err := WaitPropagated(context.Background(), cfg, "_acme-challenge.example.test", "wanted"); err != nil {
+	if err := WaitPropagated(context.Background(), cfg, []Record{{Name: "_acme-challenge.example.test", Value: "wanted"}}); err != nil {
 		t.Fatalf("WaitPropagated: %v", err)
 	}
 	if time.Since(start) < 150*time.Millisecond {
@@ -60,8 +60,8 @@ func TestWaitPropagatedGivesUpAfterTheTimeout(t *testing.T) {
 	t.Cleanup(func() { propagationPoll = 2 * time.Second })
 	ns.AddDNSTXTRecord("_acme-challenge.example.test", "other")
 	cfg := config.DNS{Resolvers: []string{addr}, PropagationTimeout: 300 * time.Millisecond}
-	err := WaitPropagated(context.Background(), cfg, "_acme-challenge.example.test", "wanted")
-	if err == nil || !strings.Contains(err.Error(), addr) || !strings.Contains(err.Error(), "_acme-challenge.example.test") {
+	err := WaitPropagated(context.Background(), cfg, []Record{{Name: "_acme-challenge.example.test", Value: "wanted"}})
+	if err == nil || !strings.Contains(err.Error(), "_acme-challenge.example.test on "+addr) {
 		t.Fatalf("WaitPropagated = %v, want a timeout naming the record and the resolver", err)
 	}
 }

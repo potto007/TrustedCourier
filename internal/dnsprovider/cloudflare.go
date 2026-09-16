@@ -25,7 +25,7 @@ type cloudflare struct {
 
 func newCloudflare(cfg config.DNS, creds Credentials, client *http.Client) *cloudflare {
 	a := newAPI(cfg, client)
-	return &cloudflare{api: a, base: a.endpoint(DefaultCloudflareEndpoint), token: slices.Clone(creds["api_token"])}
+	return &cloudflare{api: a, base: a.endpoint(DefaultCloudflareEndpoint), token: bytes.TrimSpace(slices.Clone(creds["api_token"]))}
 }
 
 func (c *cloudflare) Close() { clear(c.token) }
@@ -85,10 +85,7 @@ func (c *cloudflare) Cleanup(ctx context.Context, name, value string) error {
 
 // zone finds the id of the zone that holds name.
 func (c *cloudflare) zone(ctx context.Context, name string) (string, error) {
-	if id, _, ok := c.zones.get(name); ok {
-		return id, nil
-	}
-	id, zone, err := findZone(ctx, c.cfg, name, func(ctx context.Context, zone string) (string, bool, error) {
+	id, _, err := c.zones.find(ctx, c.cfg, name, func(ctx context.Context, zone string) (string, bool, error) {
 		req, err := c.request(http.MethodGet, "/zones", url.Values{"name": {zone}, "per_page": {"1"}}, nil)
 		if err != nil {
 			return "", false, err
@@ -109,11 +106,7 @@ func (c *cloudflare) zone(ctx context.Context, name string) (string, error) {
 		}
 		return "", false, nil
 	})
-	if err != nil {
-		return "", err
-	}
-	c.zones.put(name, id, zone)
-	return id, nil
+	return id, err
 }
 
 // records lists the TXT records at name in the zone.

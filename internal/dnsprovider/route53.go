@@ -62,14 +62,14 @@ func (r *route53) Present(ctx context.Context, name, value string) error {
 	if err != nil {
 		return err
 	}
-	current, err := r.values(ctx, zoneID, name)
+	current, _, err := r.values(ctx, zoneID, name)
 	if err != nil {
 		return err
 	}
 	if slices.Contains(current, value) {
 		return nil
 	}
-	return r.change(ctx, zoneID, "UPSERT", name, withValue(current, value))
+	return r.change(ctx, zoneID, "UPSERT", name, TTL, withValue(current, value))
 }
 
 func (r *route53) Cleanup(ctx context.Context, name, value string) error {
@@ -77,7 +77,7 @@ func (r *route53) Cleanup(ctx context.Context, name, value string) error {
 	if err != nil {
 		return err
 	}
-	current, err := r.values(ctx, zoneID, name)
+	current, ttl, err := r.values(ctx, zoneID, name)
 	if err != nil {
 		return err
 	}
@@ -85,18 +85,15 @@ func (r *route53) Cleanup(ctx context.Context, name, value string) error {
 		return nil
 	}
 	if remaining := withoutValue(current, value); len(remaining) > 0 {
-		return r.change(ctx, zoneID, "UPSERT", name, remaining)
+		return r.change(ctx, zoneID, "UPSERT", name, ttl, remaining)
 	}
-	// A DELETE must name the set's current values exactly.
-	return r.change(ctx, zoneID, "DELETE", name, current)
+	// A DELETE must name the set's current values and TTL exactly.
+	return r.change(ctx, zoneID, "DELETE", name, ttl, current)
 }
 
 // zone finds the hosted zone id of the zone that holds name.
 func (r *route53) zone(ctx context.Context, name string) (string, error) {
-	if id, _, ok := r.zones.get(name); ok {
-		return id, nil
-	}
-	id, zone, err := findZone(ctx, r.cfg, name, func(ctx context.Context, zone string) (string, bool, error) {
+	id, _, err := r.zones.find(ctx, r.cfg, name, func(ctx context.Context, zone string) (string, bool, error) {
 		req, err := r.request(http.MethodGet, "/hostedzonesbyname", url.Values{"dnsname": {fqdn(zone)}, "maxitems": {"10"}}, nil)
 		if err != nil {
 			return "", false, err
@@ -128,39 +125,36 @@ func (r *route53) zone(ctx context.Context, name string) (string, error) {
 		}
 		return found, found != "", nil
 	})
-	if err != nil {
-		return "", err
-	}
-	r.zones.put(name, id, zone)
-	return id, nil
+	return id, err
 }
 
-// values lists the TXT values at name in the zone, unquoted.
-func (r *route53) values(ctx context.Context, zoneID, name string) ([]string, error) {
+// values lists the TXT values at name in the zone, unquoted, and the set's
+// TTL.
+func (r *route53) values(ctx context.Context, zoneID, name string) (values []string, ttl int, err error) {
 	req, err := r.request(http.MethodGet, "/hostedzone/"+url.PathEscape(zoneID)+"/rrset", url.Values{"name": {fqdn(name)}, "type": {"TXT"}, "maxitems": {"1"}}, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var resp struct {
 		Sets []route53RecordSet `xml:"ResourceRecordSets>ResourceRecordSet"`
 	}
 	if err := r.do(ctx, req, &resp); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	var values []string
 	for _, s := range resp.Sets {
 		if strings.EqualFold(s.Name, fqdn(name)) && s.Type == "TXT" {
+			ttl = s.TTL
 			for _, v := range s.Values {
 				values = append(values, unquote(v))
 			}
 		}
 	}
-	return values, nil
+	return values, ttl, nil
 }
 
-// change submits one change to name's TXT set with values.
-func (r *route53) change(ctx context.Context, zoneID, action, name string, values []string) error {
-	set := route53RecordSet{Name: fqdn(name), Type: "TXT", TTL: TTL}
+// change submits one change to name's TXT set with values and ttl.
+func (r *route53) change(ctx context.Context, zoneID, action, name string, ttl int, values []string) error {
+	set := route53RecordSet{Name: fqdn(name), Type: "TXT", TTL: ttl}
 	for _, v := range values {
 		set.Values = append(set.Values, quote(v))
 	}

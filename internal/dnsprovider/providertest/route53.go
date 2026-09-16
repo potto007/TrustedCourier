@@ -162,7 +162,8 @@ func (f *Route53) handle(w http.ResponseWriter, r *http.Request, body []byte) {
 				current := f.Records.TXT(name)
 				slices.Sort(current)
 				slices.Sort(values)
-				if !slices.Equal(current, values) {
+				// A DELETE must match the set exactly, TTL included.
+				if !slices.Equal(current, values) || c.Set.TTL != 60 {
 					route53Error(w, http.StatusBadRequest, "InvalidChangeBatch", "Tried to delete resource record set ["+c.Set.Name+"] but the values provided do not match the current values")
 					return
 				}

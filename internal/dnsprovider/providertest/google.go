@@ -179,7 +179,8 @@ func (f *Google) handle(w http.ResponseWriter, r *http.Request) {
 			values := unquoteAll(d.RRDatas)
 			slices.Sort(current)
 			slices.Sort(values)
-			if d.Type != "TXT" || len(current) == 0 || !slices.Equal(current, values) {
+			// A deletion must match the set exactly, TTL included.
+			if d.Type != "TXT" || d.TTL != 60 || len(current) == 0 || !slices.Equal(current, values) {
 				googleError(w, http.StatusNotFound, "NOT_FOUND", "The resource 'entity.change.deletions["+d.Name+"][TXT]' does not match.")
 				return
 			}

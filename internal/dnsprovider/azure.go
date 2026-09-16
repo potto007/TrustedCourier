@@ -28,6 +28,9 @@ type azure struct {
 	secret          []byte
 	token           []byte
 	zones           zoneCache
+	// names are the zones in the resource group, listed once per order;
+	// nil until listed.
+	names []string
 }
 
 func newAzure(cfg config.DNS, creds Credentials, client *http.Client) *azure {
@@ -94,24 +97,21 @@ func (z *azure) Cleanup(ctx context.Context, name, value string) error {
 // zone finds the zone in the resource group that holds name, and name's
 // label relative to it.
 func (z *azure) zone(ctx context.Context, name string) (zone, relative string, err error) {
-	zone, _, ok := z.zones.get(name)
-	if !ok {
-		var names []string
-		if z.cfg.Zone == "" {
-			if names, err = z.listZones(ctx); err != nil {
-				return "", "", err
-			}
+	zone, _, err = z.zones.find(ctx, z.cfg, name, func(ctx context.Context, candidate string) (string, bool, error) {
+		if z.cfg.Zone != "" {
+			return candidate, true, nil
 		}
-		zone, _, err = findZone(ctx, z.cfg, name, func(_ context.Context, candidate string) (string, bool, error) {
-			if z.cfg.Zone != "" {
-				return candidate, true, nil
+		if z.names == nil {
+			names, err := z.listZones(ctx)
+			if err != nil {
+				return "", false, err
 			}
-			return candidate, slices.Contains(names, candidate), nil
-		})
-		if err != nil {
-			return "", "", err
+			z.names = names
 		}
-		z.zones.put(name, zone, zone)
+		return candidate, slices.Contains(z.names, candidate), nil
+	})
+	if err != nil {
+		return "", "", err
 	}
 	relative = strings.TrimSuffix(strings.TrimSuffix(name, "."+zone), zone)
 	if relative == "" {
@@ -122,7 +122,7 @@ func (z *azure) zone(ctx context.Context, name string) (zone, relative string, e
 
 // listZones lists the zone names in the resource group.
 func (z *azure) listZones(ctx context.Context) ([]string, error) {
-	var names []string
+	names := []string{}
 	next := z.base + z.groupPath() + "/providers/Microsoft.Network/dnsZones?api-version=" + azureDNSAPIVersion
 	for next != "" {
 		req, err := z.request(ctx, http.MethodGet, next, nil)
