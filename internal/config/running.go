@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"maps"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,8 +72,7 @@ func restartKeys(old, cfg *Config) []string {
 	if old.DataDir != cfg.DataDir {
 		keys = append(keys, "data_dir")
 	}
-	if old.Admin.Socket != cfg.Admin.Socket ||
-		!slices.Equal(slices.Sorted(slices.Values(old.Admin.AllowedUIDs)), slices.Sorted(slices.Values(cfg.Admin.AllowedUIDs))) {
+	if !old.Admin.Equal(cfg.Admin) {
 		keys = append(keys, "admin")
 	}
 	if !old.AgentAPI.Equal(cfg.AgentAPI) {

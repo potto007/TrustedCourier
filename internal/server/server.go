@@ -66,13 +66,27 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	if cfg.AgentAPI.Served() {
 		var tlsConfig *tls.Config
 		if cfg.AgentAPI.TLS != nil {
-			certs = certmanager.New(log)
+			certs = certmanager.New(log, "the Agent API")
 			tlsConfig = certs.TLSConfig()
 		}
 		if agentLn, err = agentapi.Listen(cfg.AgentAPI, tlsConfig); err != nil {
 			return err
 		}
 		defer func() { _ = agentLn.Close() }()
+	}
+	// The remote admin listener serves the Agent API's certificate when it
+	// names the same Courier Keys, so an ACME renewal covers both; otherwise
+	// its own Operator-supplied pair.
+	var remoteLn net.Listener
+	adminCerts := certs
+	if cfg.Admin.Listen != "" {
+		if !cfg.SharesAgentCertificate() {
+			adminCerts = certmanager.New(log, "the remote admin listener")
+		}
+		if remoteLn, err = admin.ListenTLS(cfg.Admin.Listen, adminCerts, cfg.Admin.TLS.ClientCAs); err != nil {
+			return err
+		}
+		defer func() { _ = remoteLn.Close() }()
 	}
 	// HTTP-01 validations arrive over plain HTTP on their own listener.
 	var http01Ln net.Listener
@@ -128,25 +142,19 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 				Key:         agentTLS.Key,
 			})
 		} else {
-			certs.Start(func(ctx context.Context) (*secret.Secret, *secret.Secret, error) {
-				certificate, err := secrets.CourierKey(ctx, agentTLS.Certificate)
-				if err != nil {
-					return nil, nil, fmt.Errorf("fetch the TLS certificate: %w", err)
-				}
-				key, err := secrets.CourierKey(ctx, agentTLS.Key)
-				if err != nil {
-					return certificate, nil, fmt.Errorf("fetch the TLS key: %w", err)
-				}
-				return certificate, key, nil
-			})
+			certs.Start(operatorPair(secrets, agentTLS.Certificate, agentTLS.Key))
 		}
 		defer certs.Close()
+	}
+	if adminCerts != nil && adminCerts != certs {
+		adminCerts.Start(operatorPair(secrets, cfg.Admin.TLS.Certificate, cfg.Admin.TLS.Key))
+		defer adminCerts.Close()
 	}
 
 	// When either API stops, stop the other.
 	serveCtx, stopServing := context.WithCancel(ctx)
 	defer stopServing()
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
 	serving := 1
 	agent := admin.AgentAPI{Socket: cfg.AgentAPI.Socket}
 	if certs != nil {
@@ -177,10 +185,18 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		}
 		agent.URL = scheme + boundAddress(cfg.AgentAPI.Listen, agentLn.Addr())
 	}
-	go func() {
-		errc <- admin.NewServer(svc, plugins, auditLog, running, agent, log).Serve(serveCtx, ln)
-	}()
+	var remoteCertificate admin.CertificateStatus
+	if remoteLn != nil {
+		remoteCertificate = certificateStatus{adminCerts}
+	}
+	adminSrv := admin.NewServer(svc, plugins, auditLog, running, agent, remoteCertificate, log)
+	go func() { errc <- adminSrv.Serve(serveCtx, ln) }()
 	log.Info("admin API listening", "socket", cfg.Admin.Socket)
+	if remoteLn != nil {
+		serving++
+		go func() { errc <- adminSrv.ServeTLS(serveCtx, remoteLn) }()
+		log.Info("remote admin API listening", "url", "https://"+boundAddress(cfg.Admin.Listen, remoteLn.Addr()))
+	}
 	if agentLn != nil {
 		serving++
 		agentSrv := agentapi.NewServer(svc, secrets, auditLog, running, log)
@@ -199,6 +215,22 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		stopServing()
 	}
 	return firstErr
+}
+
+// operatorPair fetches an Operator-supplied certificate and key from their
+// Backend.
+func operatorPair(secrets *resolver.Resolver, certificate, key config.CourierKey) certmanager.Fetch {
+	return func(ctx context.Context) (*secret.Secret, *secret.Secret, error) {
+		cert, err := secrets.CourierKey(ctx, certificate)
+		if err != nil {
+			return nil, nil, fmt.Errorf("fetch the TLS certificate: %w", err)
+		}
+		k, err := secrets.CourierKey(ctx, key)
+		if err != nil {
+			return cert, nil, fmt.Errorf("fetch the TLS key: %w", err)
+		}
+		return cert, k, nil
+	}
 }
 
 // agentACME returns the Agent API's ACME config, or nil without one.

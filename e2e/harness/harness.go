@@ -561,8 +561,32 @@ var (
 	agentAPIURL       = regexp.MustCompile(`msg="Agent API listening" url=(\S+)`)
 	agentAPISocket    = regexp.MustCompile(`msg="Agent API listening" socket=(\S+)`)
 	signingKeyReady   = regexp.MustCompile(`msg="audit signing key loaded"`)
-	certificateLoaded = regexp.MustCompile(`msg="TLS certificate loaded"`)
+	certificateLoaded = regexp.MustCompile(`msg="TLS certificate loaded" listener="the Agent API"`)
+	adminCertLoaded   = regexp.MustCompile(`msg="TLS certificate loaded" listener="the remote admin listener"`)
+	remoteAdminURL    = regexp.MustCompile(`msg="remote admin API listening" url=(\S+)`)
 )
+
+// AdminURL waits for the server to log the remote admin listener's URL and
+// to load its TLS certificate (its own, or the Agent API's when shared), and
+// returns the URL, such as https://127.0.0.1:41235.
+func (s *Server) AdminURL(shared bool) string {
+	s.in.t.Helper()
+	loaded := adminCertLoaded
+	if shared {
+		loaded = certificateLoaded
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		stderr := s.Stderr()
+		if m := remoteAdminURL.FindStringSubmatch(stderr); m != nil && loaded.MatchString(stderr) {
+			return m[1]
+		}
+		if time.Now().After(deadline) {
+			s.in.t.Fatalf("the remote admin listener never started serving; stderr:\n%s", stderr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
 
 // AgentURL waits for the server to log the Agent API's URL and to load the
 // audit signing key and, when the URL is https, the TLS certificate, so it

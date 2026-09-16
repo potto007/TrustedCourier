@@ -24,8 +24,25 @@ type Certificate struct {
 	// KeyPEM is the leaf's private key as PKCS #8 PEM. It is a Secret value:
 	// it must never appear in TrustedCourier's output.
 	KeyPEM string
+	// CAPEM is the CA's certificate alone, as a client_ca file would hold it.
+	CAPEM string
 	// Pool trusts the CA.
 	Pool *x509.CertPool
+
+	ca    *x509.Certificate
+	caKey *ecdsa.PrivateKey
+	in    *Installation
+}
+
+// ClientCertificate is a test-only client certificate an Operator might
+// present to the remote admin listener.
+type ClientCertificate struct {
+	// CertificatePEM is the leaf alone.
+	CertificatePEM string
+	// KeyPEM is the leaf's private key as PKCS #8 PEM.
+	KeyPEM string
+	// TLS is the pair as a TLS client presents it.
+	TLS tls.Certificate
 }
 
 // IssueCertificate issues a certificate for hosts (IP addresses or DNS
@@ -86,16 +103,58 @@ func (in *Installation) IssueCertificate(validFor time.Duration, hosts ...string
 	}
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
+	caPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))
 	c := &Certificate{
-		CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})) +
-			string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})),
-		KeyPEM: string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})),
-		Pool:   pool,
+		CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})) + caPEM,
+		KeyPEM:         string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})),
+		CAPEM:          caPEM,
+		Pool:           pool,
+		ca:             ca,
+		caKey:          caKey,
+		in:             in,
 	}
 	in.mu.Lock()
 	in.secretValues = append(in.secretValues, c.KeyPEM)
 	in.mu.Unlock()
 	return c
+}
+
+// IssueClient issues a client certificate for name, signed by the
+// certificate's CA, valid for a day. The key is recorded as a Secret value
+// that must not appear in TrustedCourier's output.
+func (c *Certificate) IssueClient(name string) *ClientCertificate {
+	c.in.t.Helper()
+	now := time.Now()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		c.in.t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: name},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, c.ca, &key.PublicKey, c.caKey)
+	if err != nil {
+		c.in.t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		c.in.t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		c.in.t.Fatal(err)
+	}
+	c.in.mu.Lock()
+	c.in.secretValues = append(c.in.secretValues, string(keyPEM))
+	c.in.mu.Unlock()
+	return &ClientCertificate{CertificatePEM: string(certPEM), KeyPEM: string(keyPEM), TLS: pair}
 }
 
 // Client returns an HTTP client that trusts the certificate's CA and speaks

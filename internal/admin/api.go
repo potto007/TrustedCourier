@@ -46,6 +46,10 @@ type Status struct {
 	// TLSCertificate is the Agent API's certificate state, or nil when the
 	// Agent API does not serve TLS.
 	TLSCertificate *TLSCertificateStatus `json:"tls_certificate,omitempty"`
+	// RemoteAdminTLSCertificate is the remote admin listener's certificate
+	// state, or nil when the listener is off. The same state as
+	// TLSCertificate when the listener shares the Agent API's certificate.
+	RemoteAdminTLSCertificate *TLSCertificateStatus `json:"remote_admin_tls_certificate,omitempty"`
 }
 
 // TLSCertificateStatus is whether the Agent API's TLS certificate is loaded.

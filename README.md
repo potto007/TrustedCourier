@@ -56,6 +56,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Signed audit checkpoints | done |
 | ACME with TLS-ALPN-01 and HTTP-01, certificates as Courier Keys | done |
 | ACME DNS-01 with built-in DNS providers | done |
+| Remote admin listener with mutual TLS | done |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
 An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied or ACME certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
@@ -437,6 +438,39 @@ agent_api:
 
 The socket is connectable by every local user, as a loopback port is; Agent Tokens do the authenticating. `tc env` needs `agent_api.listen`, since a base URL cannot name a socket.
 
+### Remote administration
+
+The admin API lives on a unix socket, unreachable from the network. To administer from another machine, enable the remote admin listener. It is off by default, and when on it takes two factors: a client certificate signed by a CA you name, checked in the TLS handshake before any request is read, and the Operator Credential on every request ([ADR-0026](docs/decisions/0026-remote-admin-listener-mutual-tls.md)).
+
+```yaml
+admin:
+  socket: /run/trustedcourier/admin.sock
+  listen: 0.0.0.0:8300
+  tls:
+    certificate:
+      backend: openbao
+      location: secret/data/trustedcourier#tls-certificate
+    key:
+      backend: openbao
+      location: secret/data/trustedcourier#tls-key
+    client_ca: /etc/trustedcourier/operators-ca.pem
+```
+
+The listener's own certificate and key are Courier Keys in a Backend, like the Agent API's. Naming the same locations as `agent_api.tls` serves one certificate on both listeners, so an ACME renewal covers both; naming others serves an Operator-supplied pair that a restart picks up. Until the pair is loaded from its Backend, no handshake completes. `client_ca` is a file: it holds only public CA certificates, and every client certificate must chain to one of them. Issue Operator client certificates from a CA of your own, such as one made with `step` or `openssl`, with the client authentication extended key usage; revocation is by rotating `client_ca` and restarting.
+
+Point `tc` at the listener with `TC_ADMIN_URL`, and give it the client certificate and key as PEM files:
+
+```sh
+export TC_ADMIN_URL=https://courier.example.com:8300
+export TC_ADMIN_CLIENT_CERT=~/.config/trustedcourier/operator.pem
+export TC_ADMIN_CLIENT_KEY=~/.config/trustedcourier/operator-key.pem
+export TC_OPERATOR_CREDENTIAL=tcoc_...
+
+tc status
+```
+
+`TC_ADMIN_CA_BUNDLE` names a CA file when the listener's certificate is not signed by a system root. The socket keeps working beside the listener, and `tc` uses it whenever `TC_ADMIN_URL` is unset.
+
 ### Audit
 
 Every Delivery attempt made with a valid Agent Token, allowed or denied, produces one Audit Record. That includes Deliveries that failed or were cut off, and 400s for a dot segment or a protocol upgrade. A 401 produces none. The server stores each record in SQLite and writes it to stdout as one JSON line, ready for Loki or a SIEM:
@@ -514,6 +548,9 @@ tc plugin sha256 <path>
 | --- | --- |
 | `TC_ADMIN_SOCKET` | Admin socket path. Defaults to `/run/trustedcourier/admin.sock`. |
 | `TC_OPERATOR_CREDENTIAL` | The Operator Credential. Every `token` command, `env`, `reload`, `status`, and `audit verify` require it. |
+| `TC_ADMIN_URL` | The [remote admin listener](#remote-administration), as `https://host:port`, used instead of the socket when set. |
+| `TC_ADMIN_CLIENT_CERT`, `TC_ADMIN_CLIENT_KEY` | PEM files holding the client certificate and its private key `tc` presents to `TC_ADMIN_URL`. Both are required with it. |
+| `TC_ADMIN_CA_BUNDLE` | PEM file of CA certificates that verify the listener's certificate. Defaults to the system roots. |
 
 Exit codes are 0 for success, 1 for a failed operation, and 2 for a malformed command line.
 
@@ -526,6 +563,10 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `data_dir` | yes | Directory for the SQLite database. Created with mode 0700. |
 | `admin.socket` | no | Admin socket path. Defaults to `/run/trustedcourier/admin.sock`. |
 | `admin.allowed_uids` | no | Local user IDs allowed to connect to the socket. Defaults to the server's own user. An empty list is an error, since nobody could administer the server. |
+| `admin.listen` | no | IP address and port for the [remote admin listener](#remote-administration), such as `0.0.0.0:8300`. Off when omitted. Needs `admin.tls`, and its own port apart from the Agent API and HTTP-01. |
+| `admin.tls.certificate.backend`, `.location` | with `admin.listen` | Where the listener's certificate chain lives, as PEM with the leaf first, in a Backend. Naming the Agent API's certificate and key shares them, ACME renewals included. No Secret Name may map to it. |
+| `admin.tls.key.backend`, `.location` | with `admin.listen` | Where the certificate's private key lives, as PKCS #8, PKCS #1, or SEC 1 PEM. No Secret Name may map to it. |
+| `admin.tls.client_ca` | with `admin.listen` | PEM file of CA certificates that Operator client certificates must chain to. A connection without one is refused at the TLS layer. |
 | `policies` | no | Map of Policy name to Policy. |
 | `policies.<name>.secrets` | yes | List of `{name, delivery}` entries, one per Secret Name. |
 | `policies.<name>.secrets[].delivery` | yes | One or both of `proxy` and `reveal`. |
@@ -599,6 +640,7 @@ Policies, Secret Names, Upstreams, Injection Templates, and Presets take effect 
 - Credentials carry prefixes (`tcoc_` for the Operator Credential, `tcat_` for Agent Tokens) so secret scanners can spot a leak.
 - The data directory is 0700 and the database files are 0600. The server tightens them again at every start, in case a backup restore loosened them.
 - The admin socket checks the connecting process's UID against `admin.allowed_uids` before it looks at the Operator Credential. The socket file is owner-only unless other users are allowed.
+- The remote admin listener is off by default. When enabled, every connection must present a client certificate chaining to `admin.tls.client_ca` or the TLS handshake fails, and every request must then carry the Operator Credential ([ADR-0026](docs/decisions/0026-remote-admin-listener-mutual-tls.md)).
 - A second server pointed at a live socket refuses to start. A stale socket left by a crash is replaced.
 - The Agent API serves plain HTTP only on loopback or a unix socket. Anywhere else it serves TLS from a certificate and key held in a Backend, never on disk, and completes no handshake until they are loaded ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). With ACME, the account key and the issued pair are written to the Backend, and nothing is ordered from the CA while the Backend cannot store them ([ADR-0024](docs/decisions/0024-acme-issuance-and-renewal.md)). With DNS-01, the DNS provider credentials are read from the Backend for each order and wiped after it, and the validation records are removed however the order ends ([ADR-0025](docs/decisions/0025-acme-dns-01-and-dns-providers.md)).
 - Revoking an Agent Token twice succeeds and keeps the first revocation time.

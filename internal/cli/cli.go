@@ -3,6 +3,8 @@ package cli
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -38,6 +40,10 @@ const usage = `Usage:
 Environment:
   TC_ADMIN_SOCKET         admin socket path (default ` + config.DefaultAdminSocket + `)
   TC_OPERATOR_CREDENTIAL  Operator Credential for admin commands
+  TC_ADMIN_URL            remote admin listener, https://host:port, instead of the socket
+  TC_ADMIN_CLIENT_CERT    client certificate PEM file for TC_ADMIN_URL
+  TC_ADMIN_CLIENT_KEY     its private key PEM file
+  TC_ADMIN_CA_BUNDLE      CA PEM file that verifies TC_ADMIN_URL (default: system roots)
 `
 
 // errUsage reports a command line the user must fix.
@@ -129,16 +135,44 @@ func serverRun(args []string, stdout, stderr io.Writer) error {
 	return server.Run(ctx, *configPath, stdout, stderr)
 }
 
+// adminClient returns a client for the admin API: the remote admin listener
+// when TC_ADMIN_URL is set, otherwise the admin socket.
 func adminClient() (*admin.Client, error) {
 	credential := os.Getenv("TC_OPERATOR_CREDENTIAL")
 	if credential == "" {
 		return nil, errors.New("TC_OPERATOR_CREDENTIAL is not set; admin commands require the Operator Credential")
+	}
+	if remote := os.Getenv("TC_ADMIN_URL"); remote != "" {
+		return remoteAdminClient(remote, credential)
 	}
 	socket := os.Getenv("TC_ADMIN_SOCKET")
 	if socket == "" {
 		socket = config.DefaultAdminSocket
 	}
 	return admin.NewClient(socket, credential), nil
+}
+
+func remoteAdminClient(remote, credential string) (*admin.Client, error) {
+	certFile, keyFile := os.Getenv("TC_ADMIN_CLIENT_CERT"), os.Getenv("TC_ADMIN_CLIENT_KEY")
+	switch {
+	case certFile == "" && keyFile == "":
+		return nil, errors.New("TC_ADMIN_URL is set but TC_ADMIN_CLIENT_CERT and TC_ADMIN_CLIENT_KEY are not; the remote admin listener requires a client certificate")
+	case certFile == "":
+		return nil, errors.New("TC_ADMIN_CLIENT_KEY is set but TC_ADMIN_CLIENT_CERT is not")
+	case keyFile == "":
+		return nil, errors.New("TC_ADMIN_CLIENT_CERT is set but TC_ADMIN_CLIENT_KEY is not")
+	}
+	client, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load the client certificate from TC_ADMIN_CLIENT_CERT and TC_ADMIN_CLIENT_KEY: %w", err)
+	}
+	var rootCAs *x509.CertPool
+	if bundle := os.Getenv("TC_ADMIN_CA_BUNDLE"); bundle != "" {
+		if rootCAs, err = config.LoadCABundle(bundle); err != nil {
+			return nil, fmt.Errorf("TC_ADMIN_CA_BUNDLE: %w", err)
+		}
+	}
+	return admin.NewRemoteClient(remote, client, rootCAs, credential)
 }
 
 // stringList is a repeatable string flag.
@@ -358,6 +392,20 @@ func status(args []string, stdout io.Writer) error {
 			_, err = fmt.Fprintln(stdout, line)
 		} else {
 			_, err = fmt.Fprintf(stdout, "TLS certificate: not loaded (%s); the Agent API completes no TLS handshake until it is\n", cert.Detail)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if cert := st.RemoteAdminTLSCertificate; cert != nil {
+		if cert.Loaded {
+			line := "Remote admin TLS certificate: loaded"
+			if cert.NotAfter != "" {
+				line += " (expires " + cert.NotAfter + ")"
+			}
+			_, err = fmt.Fprintln(stdout, line)
+		} else {
+			_, err = fmt.Fprintf(stdout, "Remote admin TLS certificate: not loaded (%s); the remote admin listener completes no TLS handshake until it is\n", cert.Detail)
 		}
 		if err != nil {
 			return err

@@ -97,10 +97,10 @@ type Status struct {
 }
 
 // New returns a Manager with no certificate loaded.
-func New(log *slog.Logger) *Manager {
+func New(log *slog.Logger, listener string) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		log:    log,
+		log:    log.With("listener", listener),
 		alpn:   map[string]*tls.Certificate{},
 		http01: map[string]string{},
 		ctx:    ctx,
@@ -150,16 +150,23 @@ func (m *Manager) TLSConfig() *tls.Config {
 				}
 				return nil, errNoChallenge
 			}
-			c := m.cert.Load()
-			if c == nil {
-				return nil, errNotLoaded
-			}
-			if err := expired(c.Leaf, time.Now()); err != nil {
-				return nil, err
-			}
-			return c, nil
+			return m.Certificate()
 		},
 	}
+}
+
+// Certificate returns the loaded certificate for a TLS handshake, or an
+// error that fails the handshake while none is loaded or the loaded one has
+// expired.
+func (m *Manager) Certificate() (*tls.Certificate, error) {
+	c := m.cert.Load()
+	if c == nil {
+		return nil, errNotLoaded
+	}
+	if err := expired(c.Leaf, time.Now()); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // HTTP01Handler serves pending HTTP-01 challenge responses under HTTP01Path
@@ -264,7 +271,7 @@ func (m *Manager) load(ctx context.Context, fetch Fetch) {
 			return
 		}
 		m.setDetail(err.Error())
-		m.log.Warn("TLS certificate not loaded; the Agent API completes no TLS handshake until it is", "error", err, "retry_in", retry)
+		m.log.Warn("TLS certificate not loaded; no TLS handshake completes on it until it is", "error", err, "retry_in", retry)
 		select {
 		case <-ctx.Done():
 			return
@@ -290,7 +297,7 @@ func (m *Manager) runACME(ctx context.Context, a ACME) {
 			return
 		}
 		m.setDetail(err.Error())
-		m.log.Warn("TLS certificate not loaded; the Agent API completes no TLS handshake until it is", "error", err, "retry_in", retry)
+		m.log.Warn("TLS certificate not loaded; no TLS handshake completes on it until it is", "error", err, "retry_in", retry)
 		select {
 		case <-ctx.Done():
 			return
@@ -340,7 +347,7 @@ func (m *Manager) runACME(ctx context.Context, a ACME) {
 			}
 			if current == nil {
 				m.setDetail(err.Error())
-				m.log.Warn("TLS certificate not obtained; the Agent API completes no TLS handshake until it is", "error", err, "retry_in", backoff)
+				m.log.Warn("TLS certificate not obtained; no TLS handshake completes on it until it is", "error", err, "retry_in", backoff)
 			} else {
 				m.mu.Lock()
 				m.renewalErr = err.Error()
