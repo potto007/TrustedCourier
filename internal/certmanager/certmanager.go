@@ -150,16 +150,23 @@ func (m *Manager) TLSConfig() *tls.Config {
 				}
 				return nil, errNoChallenge
 			}
-			c := m.cert.Load()
-			if c == nil {
-				return nil, errNotLoaded
-			}
-			if err := expired(c.Leaf, time.Now()); err != nil {
-				return nil, err
-			}
-			return c, nil
+			return m.Certificate()
 		},
 	}
+}
+
+// Certificate returns the loaded certificate for a TLS handshake, or an
+// error that fails the handshake while none is loaded or the loaded one has
+// expired.
+func (m *Manager) Certificate() (*tls.Certificate, error) {
+	c := m.cert.Load()
+	if c == nil {
+		return nil, errNotLoaded
+	}
+	if err := expired(c.Leaf, time.Now()); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // HTTP01Handler serves pending HTTP-01 challenge responses under HTTP01Path

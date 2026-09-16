@@ -2,6 +2,8 @@ package admin
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,6 +42,32 @@ func Listen(socket string, allowedUIDs []int) (net.Listener, error) {
 	return unixsocket.Listen(socket, dirMode, sockMode, "admin socket")
 }
 
+// Certificates supplies the remote admin listener's server certificate for
+// each handshake. The certificate manager is one.
+type Certificates interface {
+	Certificate() (*tls.Certificate, error)
+}
+
+// ListenTLS binds the remote admin listener on the IP address and port
+// listen. Every handshake requires a client certificate chaining to
+// clientCAs, so a connection without one never reaches the admin API, and
+// fails while no server certificate is loaded.
+func ListenTLS(listen string, certs Certificates, clientCAs *x509.CertPool) (net.Listener, error) {
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		return nil, fmt.Errorf("listen on the remote admin address: %w", err)
+	}
+	return tls.NewListener(ln, &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		ClientCAs:  clientCAs,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return certs.Certificate()
+		},
+	}), nil
+}
+
 // Server serves the admin API.
 type Server struct {
 	access  *access.Service
@@ -71,8 +99,36 @@ func NewServer(svc *access.Service, plugins *pluginhost.Host, auditLog *audit.Lo
 	return &Server{access: svc, plugins: plugins, audit: auditLog, cfg: cfg, agent: agent, log: log}
 }
 
-// Serve serves the admin API on ln until ctx is done.
+// Serve serves the admin API on the unix socket listener ln until ctx is
+// done. Each connection's local user is checked before the Operator
+// Credential.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	srv := &http.Server{
+		Handler:           s.requirePeer(s.requireOperator(s.mux())),
+		ReadHeaderTimeout: 10 * time.Second,
+		ConnContext:       withPeer,
+		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
+	}
+	return httpserve.Serve(ctx, srv, ln)
+}
+
+// ServeTLS serves the admin API on the remote admin listener ln, from
+// ListenTLS, until ctx is done. The listener admits only clients presenting
+// a trusted certificate; each request is then checked for one again, then
+// for the Operator Credential. Failed handshakes are logged at Debug: any
+// remote can fail one per connection.
+func (s *Server) ServeTLS(ctx context.Context, ln net.Listener) error {
+	srv := &http.Server{
+		Handler:           s.requireClientCertificate(s.requireOperator(s.mux())),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    64 << 10,
+		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelDebug),
+	}
+	return httpserve.Serve(ctx, srv, ln)
+}
+
+func (s *Server) mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/agent-tokens", s.listAgentTokens)
 	mux.HandleFunc("POST /v1/agent-tokens", s.issueAgentToken)
@@ -81,14 +137,21 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	mux.HandleFunc("POST /v1/audit/verify", s.verifyAudit)
 	mux.HandleFunc("GET /v1/secret-names/{name}/env", s.secretNameEnv)
 	mux.HandleFunc("POST /v1/config/reload", s.reloadConfig)
+	return mux
+}
 
-	srv := &http.Server{
-		Handler:           s.requirePeer(s.requireOperator(mux)),
-		ReadHeaderTimeout: 10 * time.Second,
-		ConnContext:       withPeer,
-		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
-	}
-	return httpserve.Serve(ctx, srv, ln)
+// requireClientCertificate refuses a request whose connection did not
+// verify a client certificate. The listener already requires one, so this
+// guards against the handler ever being served another way.
+func (s *Server) requireClientCertificate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 {
+			s.log.Warn("remote admin request refused: no verified client certificate", "remote", r.RemoteAddr)
+			writeError(w, http.StatusForbidden, "remote admin API: a client certificate is required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type peerKey struct{}

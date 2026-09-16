@@ -347,6 +347,49 @@ type Admin struct {
 	Socket string
 	// AllowedUIDs are the local users allowed to connect to Socket.
 	AllowedUIDs []int
+	// Listen is the IP address and port of the remote admin listener, or
+	// empty for none. It serves TLS from TLS and admits only clients
+	// presenting a certificate TLS.ClientCAs signed.
+	Listen string
+	// TLS is what the remote admin listener serves and admits. Set exactly
+	// when Listen is.
+	TLS *AdminTLS
+}
+
+// Equal reports whether a and b configure the same admin API.
+func (a Admin) Equal(b Admin) bool {
+	return a.Socket == b.Socket && a.Listen == b.Listen &&
+		slices.Equal(slices.Sorted(slices.Values(a.AllowedUIDs)), slices.Sorted(slices.Values(b.AllowedUIDs))) &&
+		(a.TLS == nil) == (b.TLS == nil) && (a.TLS == nil || a.TLS.Equal(*b.TLS))
+}
+
+// AdminTLS is where the remote admin listener's certificate and key live,
+// as Courier Keys like the Agent API's (ADR-0023), and which CA signs the
+// client certificates it admits.
+type AdminTLS struct {
+	// Certificate holds the certificate chain as PEM, leaf first. It may be
+	// the Agent API's certificate, in which case the listener shares it.
+	Certificate CourierKey
+	// Key holds the leaf's private key as PEM.
+	Key CourierKey
+	// ClientCA is the path of the PEM file of CA certificates that client
+	// certificates must chain to.
+	ClientCA string
+	// ClientCAs is ClientCA loaded.
+	ClientCAs *x509.CertPool
+}
+
+// Equal reports whether a and b configure the same TLS.
+func (a AdminTLS) Equal(b AdminTLS) bool {
+	return a.Certificate == b.Certificate && a.Key == b.Key &&
+		a.ClientCA == b.ClientCA && a.ClientCAs.Equal(b.ClientCAs)
+}
+
+// SharesAgentCertificate reports whether the remote admin listener serves
+// the Agent API's certificate and key.
+func (c *Config) SharesAgentCertificate() bool {
+	return c.Admin.TLS != nil && c.AgentAPI.TLS != nil &&
+		c.Admin.TLS.Certificate == c.AgentAPI.TLS.Certificate && c.Admin.TLS.Key == c.AgentAPI.TLS.Key
 }
 
 // Policy states which Secret Names an Agent Token may use and how.
@@ -496,8 +539,16 @@ type fileBackendPlugin struct {
 }
 
 type fileAdmin struct {
-	Socket      string `yaml:"socket"`
-	AllowedUIDs *[]int `yaml:"allowed_uids"` // nil when omitted
+	Socket      string        `yaml:"socket"`
+	AllowedUIDs *[]int        `yaml:"allowed_uids"` // nil when omitted
+	Listen      string        `yaml:"listen"`
+	TLS         *fileAdminTLS `yaml:"tls"`
+}
+
+type fileAdminTLS struct {
+	Certificate *fileCourierKey `yaml:"certificate"`
+	Key         *fileCourierKey `yaml:"key"`
+	ClientCA    string          `yaml:"client_ca"`
 }
 
 type filePolicy struct {
@@ -604,6 +655,9 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 			}
 		}
 	}
+	if err := raw.Admin.validateListener(cfg, baseDir); err != nil {
+		return nil, err
+	}
 	if err := raw.AgentAPI.validate(cfg, baseDir); err != nil {
 		return nil, err
 	}
@@ -613,8 +667,46 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 	return cfg, nil
 }
 
-// validate sets cfg.AgentAPI. It needs cfg's admin socket, Backend Plugins,
-// and Secret Names already validated.
+// validateListener sets cfg.Admin.Listen and cfg.Admin.TLS. It needs cfg's
+// Backend Plugins and Secret Names already validated.
+func (a fileAdmin) validateListener(cfg *Config, baseDir string) error {
+	switch {
+	case a.Listen == "" && a.TLS == nil:
+		return nil
+	case a.Listen == "":
+		return errors.New("admin.tls needs admin.listen: the admin socket serves plain HTTP to local users")
+	case a.TLS == nil:
+		return fmt.Errorf("admin.listen %q is a network listener, so admin.tls is required: remote administration takes a client certificate and the Operator Credential", a.Listen)
+	}
+	if _, err := netip.ParseAddrPort(a.Listen); err != nil {
+		return fmt.Errorf("admin.listen %q must be an IP address and port, such as 0.0.0.0:8300", a.Listen)
+	}
+	cert, err := a.TLS.Certificate.validateCourierKey("admin.tls.certificate", "the remote admin listener's TLS certificate", cfg)
+	if err != nil {
+		return err
+	}
+	key, err := a.TLS.Key.validateCourierKey("admin.tls.key", "the remote admin listener's TLS key", cfg)
+	if err != nil {
+		return err
+	}
+	if cert == key {
+		return errors.New("admin.tls.certificate and admin.tls.key name the same location; each Courier Key needs its own")
+	}
+	if a.TLS.ClientCA == "" {
+		return errors.New("admin.tls.client_ca is required: the PEM file of CA certificates that Operator client certificates must chain to")
+	}
+	clientCA := resolve(baseDir, a.TLS.ClientCA)
+	pool, err := loadCABundle(clientCA)
+	if err != nil {
+		return fmt.Errorf("admin.tls.client_ca: %w", err)
+	}
+	cfg.Admin.Listen = a.Listen
+	cfg.Admin.TLS = &AdminTLS{Certificate: cert, Key: key, ClientCA: clientCA, ClientCAs: pool}
+	return nil
+}
+
+// validate sets cfg.AgentAPI. It needs cfg's admin socket and listener,
+// Backend Plugins, and Secret Names already validated.
 func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 	switch {
 	case a.Listen != "" && a.Socket != "":
@@ -631,6 +723,9 @@ func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 		// sockets (ADR-0006).
 		if a.TLS == nil && !addr.Addr().Unmap().IsLoopback() {
 			return fmt.Errorf("agent_api.listen %q is not a loopback address, so agent_api.tls is required: Agent Tokens and Reveal Deliveries never cross a network in plaintext", a.Listen)
+		}
+		if sameBind(a.Listen, cfg.Admin.Listen) {
+			return fmt.Errorf("agent_api.listen %q is the remote admin listener's address (admin.listen); give the Agent API its own", a.Listen)
 		}
 		cfg.AgentAPI.Listen = a.Listen
 	}
@@ -693,7 +788,8 @@ func sameBind(a, b string) bool {
 	if errX != nil || errY != nil {
 		return a == b
 	}
-	return x.Port() == y.Port() &&
+	// Port 0 asks the kernel for a free port, so it never collides.
+	return x.Port() == y.Port() && x.Port() != 0 &&
 		(x.Addr().IsUnspecified() || y.Addr().IsUnspecified() || x.Addr().Unmap() == y.Addr().Unmap())
 }
 
@@ -755,6 +851,9 @@ func (a fileACME) validate(cfg *Config, baseDir, listen string) (ACME, error) {
 		}
 		if sameBind(out.HTTPListen, listen) {
 			return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen %q is the Agent API's own address; HTTP-01 is validated over plain HTTP on a different port", out.HTTPListen)
+		}
+		if sameBind(out.HTTPListen, cfg.Admin.Listen) {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen %q is the remote admin listener's address (admin.listen); HTTP-01 needs its own port", out.HTTPListen)
 		}
 	case a.HTTPListen != "":
 		return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen is only for challenge %s", ChallengeHTTP01)

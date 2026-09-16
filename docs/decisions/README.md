@@ -29,3 +29,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0023](0023-agent-listener-tls-and-unix-socket.md) | The Agent listener serves TLS from Courier Keys, or plain HTTP on loopback or a unix socket | accepted |
 | [0024](0024-acme-issuance-and-renewal.md) | ACME issues into the TLS Courier Keys, validates on the Agent listener, and renews at two thirds of the lifetime | accepted |
 | [0025](0025-acme-dns-01-and-dns-providers.md) | DNS-01 sets records through built-in providers spoken with the standard library, with credentials as Courier Keys per field | accepted |
+| [0026](0026-remote-admin-listener-mutual-tls.md) | The remote admin listener requires a client certificate in the handshake and the Operator Credential on every request | accepted |

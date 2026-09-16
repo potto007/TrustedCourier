@@ -3,17 +3,21 @@ package admin
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
-// Client calls the admin API over its unix socket.
+// Client calls the admin API over its unix socket or its remote listener.
 type Client struct {
+	base       string
 	credential string
 	http       *http.Client
 }
@@ -23,6 +27,7 @@ type Client struct {
 func NewClient(socket, credential string) *Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	return &Client{
+		base:       "http://trustedcourier",
 		credential: credential,
 		http: &http.Client{
 			Timeout: 30 * time.Second,
@@ -33,6 +38,34 @@ func NewClient(socket, credential string) *Client {
 			},
 		},
 	}
+}
+
+// NewRemoteClient returns a Client for the remote admin listener at baseURL,
+// an https URL such as https://courier.example.com:8300, presenting the
+// client certificate and trusting rootCAs (nil for the system roots), that
+// authenticates with credential.
+func NewRemoteClient(baseURL string, client tls.Certificate, rootCAs *x509.CertPool, credential string) (*Client, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("remote admin URL %q must be https://host:port", baseURL)
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/")
+	return &Client{
+		base:       u.String(),
+		credential: credential,
+		http: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					MinVersion:   tls.VersionTLS12,
+					Certificates: []tls.Certificate{client},
+					RootCAs:      rootCAs,
+				},
+				ForceAttemptHTTP2: true,
+				DialContext:       (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+			},
+		},
+	}, nil
 }
 
 // ListAgentTokens lists every Agent Token.
@@ -94,7 +127,7 @@ func (c *Client) RevokeAgentToken(ctx context.Context, id string) error {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, out any) error {
-	req, err := http.NewRequestWithContext(ctx, method, "http://trustedcourier"+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return err
 	}
