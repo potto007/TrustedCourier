@@ -7,6 +7,8 @@
 //	func main() { plugin.Serve(&myBackend{}) }
 //
 // TrustedCourier launches the binary out of process (ADR-0004); Serve
-// handles go-plugin, gRPC, and the handshake. Validate a plugin before
-// releasing it with the conformance package.
+// handles go-plugin, gRPC, the handshake, process hardening, and the FIPS
+// 140-3 report a core in FIPS mode requires (ADR-0027). Build release
+// binaries with GOFIPS140=certified, as the core is. Validate a plugin
+// before releasing it with the conformance package.
 package plugin

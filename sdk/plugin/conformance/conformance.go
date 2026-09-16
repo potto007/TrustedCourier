@@ -9,13 +9,16 @@
 //		})
 //	}
 //
-// The kit is a skeleton: it covers the handshake, capabilities, health, get,
-// list, and Courier Key write.
+// The kit is a skeleton: it covers the handshake, capabilities, the FIPS
+// 140-3 report, health, get, list, and Courier Key write. Run it a second
+// time with GODEBUG=fips140=on to check the plugin follows the core into
+// FIPS mode.
 package conformance
 
 import (
 	"bytes"
 	"context"
+	"crypto/fips140"
 	"errors"
 	"os"
 	"os/exec"
@@ -63,6 +66,18 @@ func Run(t *testing.T, binary string, f Fixture) {
 		t.Fatalf("launch plugin: %v", err)
 	}
 	t.Cleanup(c.Kill)
+
+	// The kit process's mode reaches the plugin through GODEBUG, as the
+	// core's does, so a plugin built on the SDK reports the kit's mode.
+	t.Run("FIPS140", func(t *testing.T) {
+		st := c.FIPS140()
+		if st.Version == "" {
+			t.Error("plugin reports no FIPS 140-3 module version; build it on the current SDK")
+		}
+		if fips140.Enabled() && !st.Enabled {
+			t.Error("kit runs in FIPS 140-3 mode but the plugin does not; a core in FIPS mode refuses it")
+		}
+	})
 
 	t.Run("Health", func(t *testing.T) {
 		if _, err := c.Health(ctx(t)); err != nil {

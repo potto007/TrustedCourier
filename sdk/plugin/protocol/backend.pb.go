@@ -62,11 +62,21 @@ func (*CapabilitiesRequest) Descriptor() ([]byte, []int) {
 	return file_backend_proto_rawDescGZIP(), []int{0}
 }
 
+// CapabilitiesResponse is the plugin's first answer after the go-plugin
+// handshake, so it also carries the process properties the core checks
+// before it trusts the plugin with Secrets.
 type CapabilitiesResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	CourierKeyWrite bool                   `protobuf:"varint,1,opt,name=courier_key_write,json=courierKeyWrite,proto3" json:"courier_key_write,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// fips140_enabled reports whether the plugin process runs in FIPS 140-3
+	// mode. The core refuses a plugin that does not when it is in FIPS mode
+	// itself.
+	Fips140Enabled bool `protobuf:"varint,2,opt,name=fips140_enabled,json=fips140Enabled,proto3" json:"fips140_enabled,omitempty"`
+	// fips140_version is the Go FIPS 140-3 module version the plugin was built
+	// with ("latest" for an unvalidated in-tree module).
+	Fips140Version string `protobuf:"bytes,3,opt,name=fips140_version,json=fips140Version,proto3" json:"fips140_version,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CapabilitiesResponse) Reset() {
@@ -104,6 +114,20 @@ func (x *CapabilitiesResponse) GetCourierKeyWrite() bool {
 		return x.CourierKeyWrite
 	}
 	return false
+}
+
+func (x *CapabilitiesResponse) GetFips140Enabled() bool {
+	if x != nil {
+		return x.Fips140Enabled
+	}
+	return false
+}
+
+func (x *CapabilitiesResponse) GetFips140Version() string {
+	if x != nil {
+		return x.Fips140Version
+	}
+	return ""
 }
 
 type HealthRequest struct {
@@ -463,9 +487,11 @@ var File_backend_proto protoreflect.FileDescriptor
 const file_backend_proto_rawDesc = "" +
 	"\n" +
 	"\rbackend.proto\x12\x19trustedcourier.backend.v1\"\x15\n" +
-	"\x13CapabilitiesRequest\"B\n" +
+	"\x13CapabilitiesRequest\"\x94\x01\n" +
 	"\x14CapabilitiesResponse\x12*\n" +
-	"\x11courier_key_write\x18\x01 \x01(\bR\x0fcourierKeyWrite\"\x0f\n" +
+	"\x11courier_key_write\x18\x01 \x01(\bR\x0fcourierKeyWrite\x12'\n" +
+	"\x0ffips140_enabled\x18\x02 \x01(\bR\x0efips140Enabled\x12'\n" +
+	"\x0ffips140_version\x18\x03 \x01(\tR\x0efips140Version\"\x0f\n" +
 	"\rHealthRequest\"B\n" +
 	"\x0eHealthResponse\x12\x18\n" +
 	"\ahealthy\x18\x01 \x01(\bR\ahealthy\x12\x16\n" +

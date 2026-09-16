@@ -21,8 +21,18 @@ service Backend {
 
 message CapabilitiesRequest {}
 
+// CapabilitiesResponse is the plugin's first answer after the go-plugin
+// handshake, so it also carries the process properties the core checks
+// before it trusts the plugin with Secrets.
 message CapabilitiesResponse {
   bool courier_key_write = 1;
+  // fips140_enabled reports whether the plugin process runs in FIPS 140-3
+  // mode. The core refuses a plugin that does not when it is in FIPS mode
+  // itself.
+  bool fips140_enabled = 2;
+  // fips140_version is the Go FIPS 140-3 module version the plugin was built
+  // with ("latest" for an unvalidated in-tree module).
+  string fips140_version = 3;
 }
 
 message HealthRequest {}

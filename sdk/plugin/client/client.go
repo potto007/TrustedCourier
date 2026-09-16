@@ -33,6 +33,17 @@ type Client struct {
 	process *goplugin.Client
 	rpc     protocol.BackendClient
 	caps    plugin.Capabilities
+	fips    FIPS140
+}
+
+// FIPS140 is a Backend Plugin's FIPS 140-3 state, reported with its
+// capabilities at start.
+type FIPS140 struct {
+	// Enabled reports whether the plugin process runs in FIPS 140-3 mode.
+	Enabled bool
+	// Version is the Go FIPS 140-3 module the plugin was built with, such as
+	// "v1.0.0", or "latest" for an unvalidated in-tree module.
+	Version string
 }
 
 // Start launches cmd, which must not be started, performs the handshake,
@@ -86,11 +97,19 @@ func dispense(process *goplugin.Client) (*Client, error) {
 		return nil, callError("Capabilities", err)
 	}
 	c.caps = plugin.Capabilities{CourierKeyWrite: resp.GetCourierKeyWrite()}
+	if err := contract.Detail(resp.GetFips140Version()); err != nil {
+		return nil, malformed("Capabilities", fmt.Errorf("fips140_version: %w", err))
+	}
+	c.fips = FIPS140{Enabled: resp.GetFips140Enabled(), Version: resp.GetFips140Version()}
 	return c, nil
 }
 
 // Capabilities returns the capabilities the plugin reported at start.
 func (c *Client) Capabilities() plugin.Capabilities { return c.caps }
+
+// FIPS140 returns the FIPS 140-3 state the plugin reported at start. A
+// plugin built on an SDK from before the field reports it disabled.
+func (c *Client) FIPS140() FIPS140 { return c.fips }
 
 // Get returns the value at location. It returns an error wrapping
 // plugin.ErrNotFound when the Backend holds nothing there.
