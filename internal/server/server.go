@@ -8,13 +8,17 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"time"
 
 	"github.com/potto007/TrustedCourier/internal/access"
+	"github.com/potto007/TrustedCourier/internal/acmecert"
 	"github.com/potto007/TrustedCourier/internal/admin"
 	"github.com/potto007/TrustedCourier/internal/agentapi"
 	"github.com/potto007/TrustedCourier/internal/audit"
 	"github.com/potto007/TrustedCourier/internal/certmanager"
 	"github.com/potto007/TrustedCourier/internal/config"
+	"github.com/potto007/TrustedCourier/internal/httpserve"
 	"github.com/potto007/TrustedCourier/internal/pluginhost"
 	"github.com/potto007/TrustedCourier/internal/resolver"
 	"github.com/potto007/TrustedCourier/internal/secret"
@@ -70,6 +74,14 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		}
 		defer func() { _ = agentLn.Close() }()
 	}
+	// HTTP-01 validations arrive over plain HTTP on their own listener.
+	var http01Ln net.Listener
+	if acme := agentACME(cfg); acme != nil && acme.Challenge == config.ChallengeHTTP01 {
+		if http01Ln, err = net.Listen("tcp", acme.HTTPListen); err != nil {
+			return fmt.Errorf("listen on the ACME HTTP-01 address: %w", err)
+		}
+		defer func() { _ = http01Ln.Close() }()
+	}
 
 	running := config.NewRunning(cfg)
 	svc := access.New(db, running)
@@ -107,17 +119,27 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	// loaded from its Backend (ADR-0001).
 	if certs != nil {
 		agentTLS := *cfg.AgentAPI.TLS
-		certs.Start(func(ctx context.Context) (*secret.Secret, *secret.Secret, error) {
-			certificate, err := secrets.CourierKey(ctx, agentTLS.Certificate)
-			if err != nil {
-				return nil, nil, fmt.Errorf("fetch the TLS certificate: %w", err)
-			}
-			key, err := secrets.CourierKey(ctx, agentTLS.Key)
-			if err != nil {
-				return certificate, nil, fmt.Errorf("fetch the TLS key: %w", err)
-			}
-			return certificate, key, nil
-		})
+		if agentTLS.ACME != nil {
+			certs.StartACME(certmanager.ACME{
+				Issuer:      acmecert.New(*agentTLS.ACME, secrets, log),
+				Keys:        secrets,
+				Domains:     agentTLS.ACME.Domains,
+				Certificate: agentTLS.Certificate,
+				Key:         agentTLS.Key,
+			})
+		} else {
+			certs.Start(func(ctx context.Context) (*secret.Secret, *secret.Secret, error) {
+				certificate, err := secrets.CourierKey(ctx, agentTLS.Certificate)
+				if err != nil {
+					return nil, nil, fmt.Errorf("fetch the TLS certificate: %w", err)
+				}
+				key, err := secrets.CourierKey(ctx, agentTLS.Key)
+				if err != nil {
+					return certificate, nil, fmt.Errorf("fetch the TLS key: %w", err)
+				}
+				return certificate, key, nil
+			})
+		}
 		defer certs.Close()
 	}
 
@@ -128,7 +150,25 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 	serving := 1
 	agent := admin.AgentAPI{Socket: cfg.AgentAPI.Socket}
 	if certs != nil {
-		agent.Certificate = certs
+		agent.Certificate = certificateStatus{certs}
+	}
+	// The HTTP-01 listener matters for seconds per renewal, so its failure
+	// is logged and never stops the APIs.
+	if http01Ln != nil {
+		http01Srv := &http.Server{
+			Handler:           certs.HTTP01Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       time.Minute,
+			MaxHeaderBytes:    64 << 10,
+			ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelDebug),
+		}
+		go func() {
+			if err := httpserve.Serve(serveCtx, http01Srv, http01Ln); err != nil {
+				log.Error("ACME HTTP-01 challenge listener stopped; HTTP-01 validations fail until a restart", "error", err)
+			}
+		}()
+		log.Info("ACME HTTP-01 challenge listener listening", "address", boundAddress(agentACME(cfg).HTTPListen, http01Ln.Addr()))
 	}
 	if agentLn != nil && cfg.AgentAPI.Socket == "" {
 		scheme := "http://"
@@ -159,6 +199,30 @@ func Run(ctx context.Context, configPath string, stdout, stderr io.Writer) error
 		stopServing()
 	}
 	return firstErr
+}
+
+// agentACME returns the Agent API's ACME config, or nil without one.
+func agentACME(cfg *config.Config) *config.ACME {
+	if cfg.AgentAPI.TLS == nil {
+		return nil
+	}
+	return cfg.AgentAPI.TLS.ACME
+}
+
+// certificateStatus reports the certificate manager's state to the admin
+// API.
+type certificateStatus struct{ certs *certmanager.Manager }
+
+func (c certificateStatus) Status() admin.TLSCertificateStatus {
+	s := c.certs.Status()
+	out := admin.TLSCertificateStatus{Loaded: s.Loaded, Detail: s.Detail, RenewalError: s.RenewalError}
+	if !s.NotAfter.IsZero() {
+		out.NotAfter = s.NotAfter.UTC().Format(time.RFC3339)
+	}
+	if !s.RenewAt.IsZero() {
+		out.RenewAt = s.RenewAt.UTC().Format(time.RFC3339)
+	}
+	return out
 }
 
 // boundAddress is the configured listen address with the port actually

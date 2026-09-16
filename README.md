@@ -2,7 +2,7 @@
 
 TrustedCourier is a self-hosted secrets broker for AI agents. An Agent calls one API, and TrustedCourier uses the Secret on the Agent's behalf, pulling it from whichever secret store the Operator runs. The goal is that an Agent can call OpenAI or GitHub with a real key without the key ever entering the model's context, its traces, or a prompt-injected tool call.
 
-> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, and Proxy and Reveal Delivery on loopback, with Redaction and hash-chained Audit Records under signed checkpoints, work today. A real Backend and automatic certificates do not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
+> **Status: early development.** Operator bootstrap, Agent Tokens, the Backend Plugin seam, Proxy and Reveal Delivery over TLS with Operator-supplied or ACME certificates, Redaction, and hash-chained Audit Records under signed checkpoints work today. A real Backend does not exist yet. See [what works today](#what-works-today) and the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1).
 
 ## Why
 
@@ -54,10 +54,11 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Method and path limits in Policies | done |
 | Hash-chained Audit Records, `tc audit verify` | done |
 | Signed audit checkpoints | done |
-| ACME | [#14](https://github.com/potto007/TrustedCourier/issues/14), [#15](https://github.com/potto007/TrustedCourier/issues/15) |
+| ACME with TLS-ALPN-01 and HTTP-01, certificates as Courier Keys | done |
+| ACME DNS-01 with built-in DNS providers | [#15](https://github.com/potto007/TrustedCourier/issues/15) |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
-An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
+An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied or ACME certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
 
 ## Quickstart
 
@@ -180,7 +181,7 @@ BACKEND PLUGIN  STATE    HEALTH   CAPABILITIES       RESTARTS  DETAIL
 openbao         running  healthy  courier-key-write  0         ...
 
 Audit signing key: loaded
-TLS certificate: loaded
+TLS certificate: loaded (expires 2026-12-14T00:00:00Z, renews 2026-11-14T00:00:00Z)
 ```
 
 ### Proxy Delivery
@@ -380,7 +381,33 @@ agent_api:
       location: secret/data/trustedcourier#tls-key
 ```
 
-The certificate location holds the PEM chain, leaf first; the key location holds the leaf's private key as PEM. Both are Courier Keys: they live in the Backend, never on TrustedCourier's disk, and no Secret Name may map to the key's location. The listener binds at startup, but no TLS handshake completes until the pair is loaded from the Backend; the server retries every few seconds, and `tc status` reports `TLS certificate: not loaded` with the reason, including an expired certificate or a key that does not match. HTTP/2 is negotiated by ALPN. Rotating the pair in the Backend takes a restart ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). Automatic certificates via ACME are [#14](https://github.com/potto007/TrustedCourier/issues/14).
+The certificate location holds the PEM chain, leaf first; the key location holds the leaf's private key as PEM. Both are Courier Keys: they live in the Backend, never on TrustedCourier's disk, and no Secret Name may map to the key's location. The listener binds at startup, but no TLS handshake completes until the pair is loaded from the Backend; the server retries every few seconds, and `tc status` reports `TLS certificate: not loaded` with the reason, including an expired certificate or a key that does not match. HTTP/2 is negotiated by ALPN. Rotating an Operator-supplied pair in the Backend takes a restart ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)).
+
+#### Automatic certificates with ACME
+
+Add `acme` under `agent_api.tls` and TrustedCourier obtains the pair itself, stores it at the `certificate` and `key` locations, and renews it at two thirds of its lifetime. The default directory is Let's Encrypt, the default challenge is TLS-ALPN-01, which is validated on the Agent API listener itself, so it must be reachable on port 443 of every name in `domains`:
+
+```yaml
+agent_api:
+  listen: 0.0.0.0:443
+  tls:
+    certificate:
+      backend: openbao
+      location: secret/data/trustedcourier#tls-certificate
+    key:
+      backend: openbao
+      location: secret/data/trustedcourier#tls-key
+    acme:
+      domains: [tc.example.com]
+      contact: ops@example.com
+      account_key:
+        backend: openbao
+        location: secret/data/trustedcourier#acme-account-key
+```
+
+`challenge: http-01` validates over plain HTTP instead, on a separate listener that serves nothing but challenge responses, `http_listen` (default `0.0.0.0:80`). Wildcards need DNS-01, which is [#15](https://github.com/potto007/TrustedCourier/issues/15). For an internal CA such as step-ca, set `directory` to its URL, `ca_bundle` to the PEM file that verifies it, and, where the CA hands out External Account Binding credentials, `external_account_binding.key_id` with the base64url MAC key stored in a Backend as `hmac_key`.
+
+The account key, the certificate, and its key are all Courier Keys, so the Backend must have the `courier-key-write` capability; with a read-only Backend, `tc status` reports why no certificate is loaded and nothing is ordered. Supply the pair yourself instead. A restart reuses the stored pair, so nothing is re-issued against a CA's rate limits. Until the first certificate is obtained, and while a renewal keeps failing, `tc status` shows the CA's reason; the server retries from 30 seconds up to hourly, and keeps serving the loaded certificate until it expires ([ADR-0024](docs/decisions/0024-acme-issuance-and-renewal.md)).
 
 Agents on the same host can use a unix socket instead, which needs no certificate:
 
@@ -507,6 +534,15 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `agent_api.socket` | no | Unix socket path for the Agent API, serving plain HTTP. Connectable by every local user, as a loopback port is; Agent Tokens authenticate Agents. |
 | `agent_api.tls.certificate.backend`, `.location` | for TLS | Where the Operator-supplied certificate chain lives, as PEM with the leaf first, in a Backend ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). Needs `agent_api.listen`. No Secret Name may map to it. |
 | `agent_api.tls.key.backend`, `.location` | for TLS | Where the certificate's private key lives, as PKCS #8, PKCS #1, or SEC 1 PEM. No Secret Name may map to it. |
+| `agent_api.tls.acme.domains` | for ACME | DNS names the certificate is issued for, the first as its subject. No wildcards or IP addresses. |
+| `agent_api.tls.acme.account_key.backend`, `.location` | for ACME | Where the ACME account key lives; generated and stored there on first use. No Secret Name may map to it. |
+| `agent_api.tls.acme.directory` | no | ACME directory `https` URL. Defaults to Let's Encrypt. |
+| `agent_api.tls.acme.contact` | no | Email address registered with the account. |
+| `agent_api.tls.acme.challenge` | no | `tls-alpn-01` (default), validated on the Agent API listener, or `http-01`, validated on `http_listen`. |
+| `agent_api.tls.acme.http_listen` | with `http-01` | IP address and port of the plain HTTP challenge listener. Defaults to `0.0.0.0:80`. Must differ from `agent_api.listen`. |
+| `agent_api.tls.acme.ca_bundle` | no | PEM file of CA certificates that replace the system roots for the ACME directory. |
+| `agent_api.tls.acme.external_account_binding.key_id` | no | External Account Binding key identifier the CA issued. Needs `hmac_key`. |
+| `agent_api.tls.acme.external_account_binding.hmac_key.backend`, `.location` | with `key_id` | Where the base64url MAC key the CA issued lives. No Secret Name may map to it. |
 | `audit.signing_key.backend` | with `agent_api` | The `backend_plugins` entry that holds the audit signing key. |
 | `audit.signing_key.location` | with `agent_api` | The key's location in that Backend: an Ed25519 private key as PKCS #8 PEM. No Secret Name may map to it. |
 | `audit.checkpoints.records` | no | Sign a checkpoint once this many Audit Records follow the last one. At least 1; defaults to 1000. |
@@ -535,7 +571,7 @@ Policies, Secret Names, Upstreams, Injection Templates, and Presets take effect 
 - The data directory is 0700 and the database files are 0600. The server tightens them again at every start, in case a backup restore loosened them.
 - The admin socket checks the connecting process's UID against `admin.allowed_uids` before it looks at the Operator Credential. The socket file is owner-only unless other users are allowed.
 - A second server pointed at a live socket refuses to start. A stale socket left by a crash is replaced.
-- The Agent API serves plain HTTP only on loopback or a unix socket. Anywhere else it serves TLS from an Operator-supplied certificate and key held in a Backend, never on disk, and completes no handshake until they are loaded ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)).
+- The Agent API serves plain HTTP only on loopback or a unix socket. Anywhere else it serves TLS from a certificate and key held in a Backend, never on disk, and completes no handshake until they are loaded ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). With ACME, the account key and the issued pair are written to the Backend, and nothing is ordered from the CA while the Backend cannot store them ([ADR-0024](docs/decisions/0024-acme-issuance-and-renewal.md)).
 - Revoking an Agent Token twice succeeds and keeps the first revocation time.
 - A Backend Plugin binary whose SHA-256 differs from the pinned hash stops the server at boot and is never relaunched after boot. On Linux the server executes the file descriptor it hashed, so swapping the binary after the check does not work ([ADR-0011](docs/decisions/0011-backend-plugin-host-and-protocol.md)).
 - Backend Plugins run as a separate OS user that cannot read the config file or own the data directory, with an empty environment apart from `GODEBUG`. Core and plugin talk over go-plugin's automatic mutual TLS.

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -93,16 +94,81 @@ func (a AgentAPI) Served() bool { return a.Listen != "" || a.Socket != "" }
 // Equal reports whether a and b configure the same listener.
 func (a AgentAPI) Equal(b AgentAPI) bool {
 	return a.Listen == b.Listen && a.Socket == b.Socket &&
-		(a.TLS == nil) == (b.TLS == nil) && (a.TLS == nil || *a.TLS == *b.TLS)
+		(a.TLS == nil) == (b.TLS == nil) && (a.TLS == nil || a.TLS.Equal(*b.TLS))
 }
 
-// AgentTLS is where the Agent API's Operator-supplied certificate and key
-// live: Courier Keys in a Backend, never on TrustedCourier's disk (ADR-0001).
+// AgentTLS is where the Agent API's certificate and key live: Courier Keys
+// in a Backend, never on TrustedCourier's disk (ADR-0001). Either the
+// Operator put them there, or ACME writes them there.
 type AgentTLS struct {
 	// Certificate holds the certificate chain as PEM, leaf first.
 	Certificate CourierKey
 	// Key holds the leaf's private key as PEM.
 	Key CourierKey
+	// ACME, when set, obtains and renews the pair from an ACME directory
+	// (ADR-0006). Nil serves an Operator-supplied pair.
+	ACME *ACME
+}
+
+// Equal reports whether a and b configure the same TLS.
+func (a AgentTLS) Equal(b AgentTLS) bool {
+	return a.Certificate == b.Certificate && a.Key == b.Key &&
+		(a.ACME == nil) == (b.ACME == nil) && (a.ACME == nil || a.ACME.Equal(*b.ACME))
+}
+
+// ACME challenge types.
+const (
+	ChallengeTLSALPN01 = "tls-alpn-01"
+	ChallengeHTTP01    = "http-01"
+)
+
+// ACME defaults.
+const (
+	DefaultACMEDirectory  = "https://acme-v02.api.letsencrypt.org/directory"
+	DefaultACMEHTTPListen = "0.0.0.0:80"
+)
+
+// ACME configures automatic certificates for the Agent API.
+type ACME struct {
+	// Directory is the ACME directory URL.
+	Directory string
+	// Domains are the DNS names the certificate covers, lowercase, the
+	// first being the subject. No wildcards: TLS-ALPN-01 and HTTP-01 cannot
+	// validate them.
+	Domains []string
+	// Contact is the account contact as a URL, such as mailto:ops@example.com,
+	// or empty.
+	Contact string
+	// Challenge is ChallengeTLSALPN01 or ChallengeHTTP01.
+	Challenge string
+	// HTTPListen is the address the HTTP-01 challenge listener binds. Empty
+	// unless Challenge is ChallengeHTTP01.
+	HTTPListen string
+	// CABundle is the path of the PEM file that verifies the directory's
+	// certificate, or empty for the system roots.
+	CABundle string
+	// RootCAs verify the directory's certificate. Nil means the system roots.
+	RootCAs *x509.CertPool
+	// AccountKey is where the ACME account key lives.
+	AccountKey CourierKey
+	// EAB is the External Account Binding the directory requires, or nil.
+	EAB *ExternalAccountBinding
+}
+
+// ExternalAccountBinding binds a new ACME account to an account at the CA.
+type ExternalAccountBinding struct {
+	// KeyID is the key identifier the CA issued.
+	KeyID string
+	// HMACKey is where the base64url MAC key the CA issued lives.
+	HMACKey CourierKey
+}
+
+// Equal reports whether a and b configure the same ACME.
+func (a ACME) Equal(b ACME) bool {
+	return a.Directory == b.Directory && slices.Equal(a.Domains, b.Domains) &&
+		a.Contact == b.Contact && a.Challenge == b.Challenge && a.HTTPListen == b.HTTPListen &&
+		a.CABundle == b.CABundle && a.RootCAs.Equal(b.RootCAs) && a.AccountKey == b.AccountKey &&
+		(a.EAB == nil) == (b.EAB == nil) && (a.EAB == nil || *a.EAB == *b.EAB)
 }
 
 // MaxCacheTTL is the longest a Secret Name may cache its Secret: the cache
@@ -278,6 +344,23 @@ type fileAgentAPI struct {
 type fileAgentTLS struct {
 	Certificate *fileCourierKey `yaml:"certificate"`
 	Key         *fileCourierKey `yaml:"key"`
+	ACME        *fileACME       `yaml:"acme"`
+}
+
+type fileACME struct {
+	Directory  string          `yaml:"directory"`
+	Domains    []string        `yaml:"domains"`
+	Contact    string          `yaml:"contact"`
+	Challenge  string          `yaml:"challenge"`
+	HTTPListen string          `yaml:"http_listen"`
+	CABundle   string          `yaml:"ca_bundle"`
+	AccountKey *fileCourierKey `yaml:"account_key"`
+	EAB        *fileEAB        `yaml:"external_account_binding"`
+}
+
+type fileEAB struct {
+	KeyID   string          `yaml:"key_id"`
+	HMACKey *fileCourierKey `yaml:"hmac_key"`
 }
 
 type fileSecretName struct {
@@ -476,8 +559,146 @@ func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 			return err
 		}
 		cfg.AgentAPI.TLS = &AgentTLS{Certificate: cert, Key: key}
+		keys := []namedCourierKey{{"agent_api.tls.certificate", cert}, {"agent_api.tls.key", key}}
+		if a.TLS.ACME != nil {
+			acme, err := a.TLS.ACME.validate(cfg, baseDir, a.Listen)
+			if err != nil {
+				return err
+			}
+			cfg.AgentAPI.TLS.ACME = &acme
+			keys = append(keys, namedCourierKey{"agent_api.tls.acme.account_key", acme.AccountKey})
+			if acme.EAB != nil {
+				keys = append(keys, namedCourierKey{"agent_api.tls.acme.external_account_binding.hmac_key", acme.EAB.HMACKey})
+			}
+		}
+		// ACME writes the certificate and key locations, so each Courier
+		// Key needs its own.
+		for i, k := range keys {
+			for _, other := range keys[:i] {
+				if k.key == other.key {
+					return fmt.Errorf("%s and %s name the same location; each Courier Key needs its own", other.name, k.name)
+				}
+			}
+		}
 	}
 	return nil
+}
+
+type namedCourierKey struct {
+	name string
+	key  CourierKey
+}
+
+// sameBind reports whether two IP address and port strings would bind the
+// same socket: the same port, on the same address or a wildcard.
+func sameBind(a, b string) bool {
+	x, errX := netip.ParseAddrPort(a)
+	y, errY := netip.ParseAddrPort(b)
+	if errX != nil || errY != nil {
+		return a == b
+	}
+	return x.Port() == y.Port() &&
+		(x.Addr().IsUnspecified() || y.Addr().IsUnspecified() || x.Addr().Unmap() == y.Addr().Unmap())
+}
+
+// domainPattern is a DNS name ACME can issue for: lowercase labels of
+// letters, digits, and hyphens, at least two of them.
+var domainPattern = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func (a fileACME) validate(cfg *Config, baseDir, listen string) (ACME, error) {
+	out := ACME{Directory: DefaultACMEDirectory, Challenge: ChallengeTLSALPN01}
+	if len(a.Domains) == 0 {
+		return ACME{}, errors.New("agent_api.tls.acme.domains is required: the DNS names the certificate is issued for")
+	}
+	for _, d := range a.Domains {
+		domain := strings.ToLower(strings.TrimSuffix(d, "."))
+		switch {
+		case strings.HasPrefix(domain, "*."):
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.domains: %q is a wildcard, which TLS-ALPN-01 and HTTP-01 cannot validate", d)
+		case net.ParseIP(domain) != nil || !domainPattern.MatchString(domain) ||
+			(!strings.Contains(domain, ".") && domain != "localhost"):
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.domains: %q is not a DNS name", d)
+		}
+		if slices.Contains(out.Domains, domain) {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.domains lists %q more than once", d)
+		}
+		out.Domains = append(out.Domains, domain)
+	}
+	if a.Directory != "" {
+		u, err := url.Parse(a.Directory)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.directory %q must be an https URL; omit it for Let's Encrypt", a.Directory)
+		}
+		out.Directory = a.Directory
+	}
+	if a.Contact != "" {
+		contact := a.Contact
+		if !strings.Contains(contact, ":") {
+			contact = "mailto:" + contact
+		}
+		if u, err := url.Parse(contact); err != nil || u.Scheme != "mailto" || u.Opaque == "" || !strings.Contains(u.Opaque, "@") {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.contact %q must be an email address", a.Contact)
+		}
+		out.Contact = contact
+	}
+	if a.Challenge != "" {
+		if a.Challenge != ChallengeTLSALPN01 && a.Challenge != ChallengeHTTP01 {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.challenge %q is not a challenge type (want %s or %s)", a.Challenge, ChallengeTLSALPN01, ChallengeHTTP01)
+		}
+		out.Challenge = a.Challenge
+	}
+	switch {
+	case out.Challenge == ChallengeHTTP01:
+		out.HTTPListen = DefaultACMEHTTPListen
+		if a.HTTPListen != "" {
+			if _, err := netip.ParseAddrPort(a.HTTPListen); err != nil {
+				return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen %q must be an IP address and port, such as 0.0.0.0:80", a.HTTPListen)
+			}
+			out.HTTPListen = a.HTTPListen
+		}
+		if sameBind(out.HTTPListen, listen) {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen %q is the Agent API's own address; HTTP-01 is validated over plain HTTP on a different port", out.HTTPListen)
+		}
+	case a.HTTPListen != "":
+		return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen is only for challenge %s; %s is validated on the Agent API listener itself", ChallengeHTTP01, ChallengeTLSALPN01)
+	}
+	if a.CABundle != "" {
+		out.CABundle = resolve(baseDir, a.CABundle)
+		pool, err := loadCABundle(out.CABundle)
+		if err != nil {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.ca_bundle: %w", err)
+		}
+		out.RootCAs = pool
+	}
+	accountKey, err := a.AccountKey.validateCourierKey("agent_api.tls.acme.account_key", "the ACME account key", cfg)
+	if err != nil {
+		return ACME{}, err
+	}
+	out.AccountKey = accountKey
+	if a.EAB != nil {
+		if a.EAB.KeyID == "" {
+			return ACME{}, errors.New("agent_api.tls.acme.external_account_binding.key_id is required")
+		}
+		hmacKey, err := a.EAB.HMACKey.validateCourierKey("agent_api.tls.acme.external_account_binding.hmac_key", "the ACME External Account Binding key", cfg)
+		if err != nil {
+			return ACME{}, err
+		}
+		out.EAB = &ExternalAccountBinding{KeyID: a.EAB.KeyID, HMACKey: hmacKey}
+	}
+	return out, nil
+}
+
+// loadCABundle reads the CA certificates in the PEM file at path.
+func loadCABundle(path string) (*x509.CertPool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("%s holds no certificates", path)
+	}
+	return pool, nil
 }
 
 // validate sets cfg.Audit. It needs cfg's Backend Plugins, Secret Names, and
@@ -748,15 +969,11 @@ func (u fileUpstream) validate(name, baseDir string) (Upstream, error) {
 		BasePath: strings.TrimRight(parsed.EscapedPath(), "/"),
 	}
 	if u.CABundle != "" {
-		path := resolve(baseDir, u.CABundle)
-		data, err := os.ReadFile(path)
+		pool, err := loadCABundle(resolve(baseDir, u.CABundle))
 		if err != nil {
 			return Upstream{}, fmt.Errorf("Upstream %q: ca_bundle: %w", name, err)
 		}
-		out.RootCAs = x509.NewCertPool()
-		if !out.RootCAs.AppendCertsFromPEM(data) {
-			return Upstream{}, fmt.Errorf("Upstream %q: ca_bundle %s holds no certificates", name, path)
-		}
+		out.RootCAs = pool
 	}
 	return out, nil
 }
