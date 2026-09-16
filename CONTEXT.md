@@ -39,7 +39,7 @@ A sensitive value, such as an API key or database credential, held in a Backend 
 _Avoid_: Credential, key
 
 **Courier Key**:
-Key material TrustedCourier itself needs to operate, such as its TLS private key, ACME account key, and audit signing key. Held in a Backend like a Secret, but never delivered to Agents.
+Key material TrustedCourier itself needs to operate, such as its TLS private key, ACME account key, DNS provider credentials, and audit signing key. Held in a Backend like a Secret, but never delivered to Agents.
 _Avoid_: System key, internal secret, operational key
 
 **Secret Name**:
