@@ -1,6 +1,7 @@
 // Package acmecert obtains certificates from an ACME directory (ADR-0006)
-// with the TLS-ALPN-01 or HTTP-01 challenge. The account key is a Courier
-// Key in a Backend (ADR-0001); the certificate manager owns what is issued.
+// with the TLS-ALPN-01, HTTP-01, or DNS-01 challenge. The account key and
+// the DNS provider's credentials are Courier Keys in a Backend (ADR-0001);
+// the certificate manager owns what is issued.
 //
 // The ACME client is golang.org/x/crypto/acme, which signs and hashes with
 // the standard library only, so FIPS mode covers it.
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/potto007/TrustedCourier/internal/config"
+	"github.com/potto007/TrustedCourier/internal/dnsprovider"
 	"github.com/potto007/TrustedCourier/internal/pemkey"
 	"github.com/potto007/TrustedCourier/internal/secret"
 	"github.com/potto007/TrustedCourier/sdk/plugin"
@@ -64,9 +66,19 @@ const (
 	// obtainTimeout bounds one attempt at obtaining a certificate, all
 	// validations included.
 	obtainTimeout = 5 * time.Minute
-	// requestTimeout bounds one HTTP request to the directory.
+	// dnsObtainTimeout is obtainTimeout for DNS-01, whose records take
+	// minutes to propagate at some providers.
+	dnsObtainTimeout = 15 * time.Minute
+	// cleanupTimeout bounds removing the DNS-01 records once the order is
+	// done, however it ended.
+	cleanupTimeout = time.Minute
+	// requestTimeout bounds one HTTP request to the directory or a DNS
+	// provider.
 	requestTimeout = 30 * time.Second
 )
+
+// dns01Prefix is the label DNS-01 validation looks under.
+const dns01Prefix = "_acme-challenge."
 
 // Issuer obtains certificates as an ACME config directs.
 type Issuer struct {
@@ -105,7 +117,11 @@ func (i *Issuer) CheckWritable(certificate, key config.CourierKey) error {
 // Obtain obtains a certificate for the configured domains, registering the
 // account on first use. solver answers the validations.
 func (i *Issuer) Obtain(ctx context.Context, solver Solver) (*Issued, error) {
-	ctx, cancel := context.WithTimeout(ctx, obtainTimeout)
+	timeout := obtainTimeout
+	if i.cfg.Challenge == config.ChallengeDNS01 {
+		timeout = dnsObtainTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	client, err := i.client(ctx)
 	if err != nil {
@@ -115,10 +131,17 @@ func (i *Issuer) Obtain(ctx context.Context, solver Solver) (*Issued, error) {
 	if err != nil {
 		return nil, fmt.Errorf("order a certificate from %s: %w", i.cfg.Directory, err)
 	}
-	for _, authzURL := range order.AuthzURLs {
-		if err := i.authorize(ctx, client, solver, authzURL); err != nil {
-			return nil, err
+	if i.cfg.Challenge == config.ChallengeDNS01 {
+		err = i.authorizeByDNS(ctx, client, order.AuthzURLs)
+	} else {
+		for _, authzURL := range order.AuthzURLs {
+			if err = i.authorize(ctx, client, solver, authzURL); err != nil {
+				break
+			}
 		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	if _, err := client.WaitOrder(ctx, order.URI); err != nil {
 		return nil, fmt.Errorf("wait for the order to be ready: %w", err)
@@ -224,6 +247,120 @@ func (i *Issuer) authorize(ctx context.Context, client *acme.Client, solver Solv
 		return fmt.Errorf("validate %s by %s: %w", domain, i.cfg.Challenge, err)
 	}
 	return nil
+}
+
+// dnsChallenge is a DNS-01 challenge with its record set at the provider.
+type dnsChallenge struct {
+	domain    string
+	authzURL  string
+	challenge *acme.Challenge
+	name      string // the TXT record's name
+	value     string // the TXT record's value
+}
+
+// authorizeByDNS completes the authorizations at authzURLs with DNS-01:
+// every record is set first, then waited for, then validation is asked
+// for, so one propagation wait covers the whole order. The records are
+// removed however the order ends.
+func (i *Issuer) authorizeByDNS(ctx context.Context, client *acme.Client, authzURLs []string) (err error) {
+	provider, err := i.dnsProvider(ctx)
+	if err != nil {
+		return err
+	}
+	defer provider.Close()
+	var pending []dnsChallenge
+	defer func() {
+		// Cleanup outlives a cancelled or timed-out order, briefly.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		for _, c := range pending {
+			if cleanupErr := provider.Cleanup(cleanupCtx, c.name, c.value); cleanupErr != nil {
+				i.log.Warn("DNS-01 record not removed; remove it yourself", "record", c.name, "error", cleanupErr)
+			}
+		}
+	}()
+	for _, authzURL := range authzURLs {
+		authz, err := client.GetAuthorization(ctx, authzURL)
+		if err != nil {
+			return fmt.Errorf("fetch an authorization: %w", err)
+		}
+		if authz.Status == acme.StatusValid {
+			continue
+		}
+		domain := authz.Identifier.Value
+		idx := slices.IndexFunc(authz.Challenges, func(c *acme.Challenge) bool { return c.Type == config.ChallengeDNS01 })
+		if idx < 0 {
+			return fmt.Errorf("%s offers no %s challenge for %s", i.cfg.Directory, config.ChallengeDNS01, domain)
+		}
+		value, err := client.DNS01ChallengeRecord(authz.Challenges[idx].Token)
+		if err != nil {
+			return err
+		}
+		c := dnsChallenge{domain: domain, authzURL: authz.URI, challenge: authz.Challenges[idx], name: dns01Prefix + domain, value: value}
+		if err := provider.Present(ctx, c.name, c.value); err != nil {
+			return fmt.Errorf("set the DNS-01 record for %s: %w", domain, err)
+		}
+		pending = append(pending, c)
+		i.log.Info("DNS-01 record set", "record", c.name, "provider", i.cfg.DNS.Provider)
+	}
+	for _, c := range pending {
+		if err := dnsprovider.WaitPropagated(ctx, *i.cfg.DNS, c.name, c.value); err != nil {
+			return fmt.Errorf("validate %s by %s: %w", c.domain, config.ChallengeDNS01, err)
+		}
+	}
+	for _, c := range pending {
+		if _, err := client.Accept(ctx, c.challenge); err != nil {
+			return fmt.Errorf("accept the %s challenge for %s: %w", config.ChallengeDNS01, c.domain, err)
+		}
+	}
+	for _, c := range pending {
+		if _, err := client.WaitAuthorization(ctx, c.authzURL); err != nil {
+			return fmt.Errorf("validate %s by %s: %w", c.domain, config.ChallengeDNS01, err)
+		}
+	}
+	return nil
+}
+
+// dnsProvider builds the DNS provider from its credentials in the Backend.
+// The caller closes it once the order is done, which wipes them.
+func (i *Issuer) dnsProvider(ctx context.Context) (dnsprovider.Provider, error) {
+	cfg := *i.cfg.DNS
+	creds := dnsprovider.Credentials{}
+	defer func() {
+		for _, c := range creds {
+			clear(c)
+		}
+	}()
+	for field, key := range cfg.Credentials {
+		value, err := i.courierKeyBytes(ctx, key, "the "+cfg.Provider+" DNS credential "+field)
+		if err != nil {
+			return nil, err
+		}
+		creds[field] = value
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: cfg.RootCAs}
+	client := &http.Client{Transport: transport, Timeout: requestTimeout}
+	provider, err := dnsprovider.New(cfg, creds, client)
+	if err != nil {
+		return nil, err
+	}
+	return provider, nil
+}
+
+// courierKeyBytes fetches the Courier Key at key, described as what, as
+// bytes the caller wipes.
+func (i *Issuer) courierKeyBytes(ctx context.Context, key config.CourierKey, what string) ([]byte, error) {
+	stored, err := i.keys.CourierKey(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", what, err)
+	}
+	defer stored.Release()
+	var buf bytes.Buffer
+	if _, err := stored.WriteTo(&buf); err != nil {
+		return nil, fmt.Errorf("read %s: %w", what, err)
+	}
+	return buf.Bytes(), nil
 }
 
 // client returns an ACME client for the account key, registering the

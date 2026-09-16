@@ -2,6 +2,8 @@ package dnsprovider
 
 import (
 	"context"
+	"io"
+	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -23,7 +25,7 @@ func startNameServer(t *testing.T) (*challtestsrv.ChallSrv, string) {
 	port := pc.LocalAddr().(*net.UDPAddr).Port
 	_ = pc.Close()
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	srv, err := challtestsrv.New(challtestsrv.Config{DNSAddrs: []string{addr}})
+	srv, err := challtestsrv.New(challtestsrv.Config{DNSAddrs: []string{addr}, Log: log.New(io.Discard, "", 0)})
 	if err != nil {
 		t.Fatal(err)
 	}

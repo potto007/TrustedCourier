@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -75,11 +76,11 @@ func agentURLOn(url string) string {
 }
 
 // servedCertificate completes a TLS handshake with the Agent API at url as a
-// client for acmeDomain and returns the leaf it served.
-func servedCertificate(t *testing.T, pebble *harness.Pebble, url string) *x509.Certificate {
+// client for serverName and returns the leaf it served.
+func servedCertificate(t *testing.T, pebble *harness.Pebble, url, serverName string) *x509.Certificate {
 	t.Helper()
 	addr := strings.TrimPrefix(url, "https://")
-	conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pebble.Roots, ServerName: acmeDomain})
+	conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pebble.Roots, ServerName: serverName})
 	if err != nil {
 		t.Fatalf("TLS handshake with %s: %v", addr, err)
 	}
@@ -90,12 +91,12 @@ func servedCertificate(t *testing.T, pebble *harness.Pebble, url string) *x509.C
 // waitForCertificate waits until the Agent API at url serves a certificate
 // Pebble issued that differs from previous (which may be nil), and returns
 // it.
-func waitForCertificate(t *testing.T, pebble *harness.Pebble, url string, previous *x509.Certificate, within time.Duration) *x509.Certificate {
+func waitForCertificate(t *testing.T, pebble *harness.Pebble, url, serverName string, previous *x509.Certificate, within time.Duration) *x509.Certificate {
 	t.Helper()
 	deadline := time.Now().Add(within)
 	for {
 		addr := strings.TrimPrefix(url, "https://")
-		conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pebble.Roots, ServerName: acmeDomain})
+		conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pebble.Roots, ServerName: serverName})
 		if err == nil {
 			leaf := conn.ConnectionState().PeerCertificates[0]
 			_ = conn.Close()
@@ -110,16 +111,19 @@ func waitForCertificate(t *testing.T, pebble *harness.Pebble, url string, previo
 	}
 }
 
-func assertACMECertificate(t *testing.T, tc *harness.Installation, srv *harness.Server, pebble *harness.Pebble, pluginPath string) *x509.Certificate {
+// assertACMECertificate checks that the Agent API serves a certificate from
+// Pebble naming domains, that a Reveal Delivery works over it as a client
+// for serverName, and that the pair and the account key are in the Backend.
+func assertACMECertificate(t *testing.T, tc *harness.Installation, srv *harness.Server, pebble *harness.Pebble, pluginPath, serverName string, domains ...string) *x509.Certificate {
 	t.Helper()
 	url := agentURLOn(srv.AgentURL())
-	leaf := servedCertificate(t, pebble, url)
-	if len(leaf.DNSNames) != 1 || leaf.DNSNames[0] != acmeDomain {
-		t.Errorf("the certificate names %v, want [%s]", leaf.DNSNames, acmeDomain)
+	leaf := servedCertificate(t, pebble, url, serverName)
+	if !slices.Equal(leaf.DNSNames, domains) {
+		t.Errorf("the certificate names %v, want %v", leaf.DNSNames, domains)
 	}
 	waitForPlugin(t, srv, "fake", running)
 	token := issueAgentToken(t, srv, "github-reveal", "1h").Token
-	client := pebble.Client(acmeDomain)
+	client := pebble.Client(serverName)
 	defer client.CloseIdleConnections()
 	got, resp := revealWith(t, client, url, token, "github")
 	if got.Status != http.StatusOK || got.Body != "test-value-2" {
@@ -154,7 +158,7 @@ func TestACMEObtainsACertificateByTLSALPN01(t *testing.T) {
 	port := harness.FreePort(t)
 	pebble := tc.StartPebble(harness.PebbleOptions{TLSPort: port})
 	srv, path := startACME(t, tc, harness.FakePlugin, acmeConfig(port, pebble, ""), nil)
-	first := assertACMECertificate(t, tc, srv, pebble, path)
+	first := assertACMECertificate(t, tc, srv, pebble, path, acmeDomain, acmeDomain)
 	if !strings.Contains(srv.Stderr(), "TLS certificate obtained") {
 		t.Errorf("server log does not record obtaining the certificate:\n%s", srv.Stderr())
 	}
@@ -164,7 +168,7 @@ func TestACMEObtainsACertificateByTLSALPN01(t *testing.T) {
 	srv.Stop()
 	srv = tc.Start(strings.Replace(harness.BaseConfig, "{{.Fake.Path}}", path, 1) + acmeConfig(port, pebble, "") + auditConfig)
 	url := agentURLOn(srv.AgentURL())
-	if again := servedCertificate(t, pebble, url); again.SerialNumber.Cmp(first.SerialNumber) != 0 {
+	if again := servedCertificate(t, pebble, url, acmeDomain); again.SerialNumber.Cmp(first.SerialNumber) != 0 {
 		t.Errorf("after a restart the Agent API serves serial %s, want the stored %s", again.SerialNumber, first.SerialNumber)
 	}
 	if strings.Contains(srv.Stderr(), "TLS certificate obtained") {
@@ -179,7 +183,7 @@ func TestACMEObtainsACertificateByHTTP01(t *testing.T) {
 	pebble := tc.StartPebble(harness.PebbleOptions{HTTPPort: httpPort})
 	extra := "      challenge: http-01\n      http_listen: \"0.0.0.0:" + strconv.Itoa(httpPort) + "\"\n"
 	srv, path := startACME(t, tc, harness.FakePlugin, acmeConfig(port, pebble, extra), nil)
-	assertACMECertificate(t, tc, srv, pebble, path)
+	assertACMECertificate(t, tc, srv, pebble, path, acmeDomain, acmeDomain)
 
 	// The HTTP-01 listener serves nothing but challenges.
 	plain := &http.Client{Timeout: 5 * time.Second}
@@ -199,12 +203,12 @@ func TestACMERenewsBeforeExpiry(t *testing.T) {
 	port := harness.FreePort(t)
 	pebble := tc.StartPebble(harness.PebbleOptions{TLSPort: port, Validity: 24 * time.Second})
 	srv, path := startACME(t, tc, harness.FakePlugin, acmeConfig(port, pebble, ""), nil)
-	first := assertACMECertificate(t, tc, srv, pebble, path)
+	first := assertACMECertificate(t, tc, srv, pebble, path, acmeDomain, acmeDomain)
 	url := agentURLOn(srv.AgentURL())
 
 	// Renewal happens at two thirds of the lifetime, while the first
 	// certificate is still valid, and the Backend holds the new one.
-	renewed := waitForCertificate(t, pebble, url, first, 40*time.Second)
+	renewed := waitForCertificate(t, pebble, url, acmeDomain, first, 40*time.Second)
 	if !time.Now().Before(first.NotAfter) {
 		t.Errorf("the certificate was renewed at %s, after it expired at %s", time.Now().UTC().Format(time.RFC3339), first.NotAfter.UTC().Format(time.RFC3339))
 	}
@@ -246,7 +250,7 @@ func TestACMEWithExternalAccountBinding(t *testing.T) {
 	pebble := tc.StartPebble(harness.PebbleOptions{TLSPort: port, EAB: map[string]string{keyID: macKey}})
 	extra := "      external_account_binding:\n        key_id: " + keyID + "\n        hmac_key:\n          backend: fake\n          location: " + acmeEABKeyLocation + "\n"
 	srv, path := startACME(t, tc, harness.FakePlugin, acmeConfig(port, pebble, extra), map[string]string{acmeEABKeyLocation: macKey})
-	assertACMECertificate(t, tc, srv, pebble, path)
+	assertACMECertificate(t, tc, srv, pebble, path, acmeDomain, acmeDomain)
 	if strings.Contains(srv.Stderr(), macKey) {
 		t.Error("the External Account Binding key appears in the server log")
 	}

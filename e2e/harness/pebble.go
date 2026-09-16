@@ -46,6 +46,9 @@ type PebbleOptions struct {
 	// EAB, when set, requires External Account Binding with one of these
 	// key IDs and base64url MAC keys.
 	EAB map[string]string
+	// Resolver is the name server, as IP address and port, Pebble resolves
+	// through, such as a NameServer's Addr. Empty uses the system resolver.
+	Resolver string
 }
 
 var pebbleEnvOnce sync.Once
@@ -74,7 +77,7 @@ func (in *Installation) StartPebble(opts PebbleOptions) *Pebble {
 	}
 	store := db.NewMemoryStore()
 	certAuthority := ca.New(logger, store, "", "ecdsa", 0, 1, profiles)
-	validator := va.New(logger, opts.HTTPPort, opts.TLSPort, false, "", store)
+	validator := va.New(logger, opts.HTTPPort, opts.TLSPort, false, opts.Resolver, store)
 	for id, key := range opts.EAB {
 		if err := store.AddExternalAccountKeyByID(id, key); err != nil {
 			in.t.Fatal(err)
