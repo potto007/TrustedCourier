@@ -78,6 +78,7 @@ func buildAndRun(m *testing.M, dir string) (int, error) {
 		{&ReadOnlyPlugin, "readonly", "-X main.mode=readonly"},
 		{&CrashingPlugin, "crashing", "-X main.mode=crash"},
 		{&MalformedPlugin, "malformed", "-X main.mode=malformed"},
+		{&NoFIPSPlugin, "nofips", "-X main.mode=nofips"},
 	} {
 		var err error
 		if *p.bin, err = buildPlugin(filepath.Join(root, "sdk", "plugin"), filepath.Join(dir, p.name), p.flags); err != nil {
@@ -100,8 +101,9 @@ type PluginBinary struct {
 // UnhealthyPlugin reports "Backend sealed" alongside that detail;
 // ReadOnlyPlugin cannot store Courier Keys; CrashingPlugin exits before the
 // handshake; MalformedPlugin breaks the protocol contract in every response
-// and writes a forged log line.
-var FakePlugin, ReplacementPlugin, UnhealthyPlugin, ReadOnlyPlugin, CrashingPlugin, MalformedPlugin PluginBinary
+// and writes a forged log line; NoFIPSPlugin reports itself outside FIPS
+// 140-3 mode whatever mode it runs in.
+var FakePlugin, ReplacementPlugin, UnhealthyPlugin, ReadOnlyPlugin, CrashingPlugin, MalformedPlugin, NoFIPSPlugin PluginBinary
 
 func buildPlugin(sdkDir, out, ldflags string) (PluginBinary, error) {
 	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", out, "./internal/fakebackend")
@@ -137,7 +139,11 @@ type Installation struct {
 	Socket  string
 	// ConfigMode is the file mode the config file is written with.
 	ConfigMode os.FileMode
-	dir        string
+	// Env is added to every server process's environment, after the
+	// settings inherited from the test run, so a test can force a runtime
+	// mode such as GODEBUG=fips140=on.
+	Env []string
+	dir string
 
 	// upstream is the fake Upstream BaseConfig pins its Secret Names to, once
 	// started.
@@ -217,6 +223,7 @@ type ConfigVars struct {
 	ReadOnly  PluginBinary
 	Crashing  PluginBinary
 	Malformed PluginBinary
+	NoFIPS    PluginBinary
 
 	in *Installation
 }
@@ -385,6 +392,7 @@ func (in *Installation) writeConfig(tmpl string) string {
 		ReadOnly:  ReadOnlyPlugin,
 		Crashing:  CrashingPlugin,
 		Malformed: MalformedPlugin,
+		NoFIPS:    NoFIPSPlugin,
 		in:        in,
 	}
 	if err := parsed.Execute(&buf, vars); err != nil {
@@ -502,7 +510,7 @@ func (in *Installation) launch(configTemplate string) *Server {
 	s.cmd = exec.Command(tcBinary, "server", "run", "--config", path)
 	s.cmd.Stdout = stdout
 	s.cmd.Stderr = stderr
-	s.cmd.Env = childEnv("HOME=" + in.dir)
+	s.cmd.Env = childEnv(append([]string{"HOME=" + in.dir}, in.Env...)...)
 	if err := s.cmd.Start(); err != nil {
 		in.t.Fatalf("start TrustedCourier: %v", err)
 	}
@@ -513,6 +521,9 @@ func (in *Installation) launch(configTemplate string) *Server {
 	in.t.Cleanup(s.Stop)
 	return s
 }
+
+// PID returns the server process's ID.
+func (s *Server) PID() int { return s.cmd.Process.Pid }
 
 // Stop sends SIGTERM, waits for the process to exit, and fails the test if it
 // did not exit cleanly. It is safe to call more than once.
