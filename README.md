@@ -50,7 +50,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Proxy Delivery with header, query, and basic auth Injection Templates, OpenAPI spec for the Agent API | done |
 | Presets for OpenAI, Anthropic, and GitHub, `tc env` | done |
 | Redaction | done |
-| OpenBao Backend Plugin, full conformance kit | [#18](https://github.com/potto007/TrustedCourier/issues/18) |
+| OpenBao Backend Plugin, full conformance kit | done |
 | Method and path limits in Policies | done |
 | Hash-chained Audit Records, `tc audit verify` | done |
 | Signed audit checkpoints | done |
@@ -59,13 +59,13 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Remote admin listener with mutual TLS | done |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
-An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied or ACME certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
+An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied or ACME certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. Secrets and Courier Keys live in OpenBao through the bundled [OpenBao Backend Plugin](#the-openbao-backend-plugin); `tc init` and the compose file that set OpenBao up wait on [#19](https://github.com/potto007/TrustedCourier/issues/19).
 
 ## Quickstart
 
 You need Go 1.26.5 or newer, on Linux or macOS. The admin socket reads the connecting user's credentials from the kernel, and on other platforms it refuses every connection.
 
-Build the CLI, and the fake Backend Plugin the tests use. It stands in until the OpenBao Backend Plugin lands ([#18](https://github.com/potto007/TrustedCourier/issues/18)) and holds made-up Secrets at `kv/openai` and `kv/github`.
+Build the CLI, and the fake Backend Plugin the tests use. It needs no OpenBao and holds made-up Secrets at `kv/openai` and `kv/github`; the [OpenBao Backend Plugin](#the-openbao-backend-plugin) replaces it for a real deployment.
 
 ```sh
 go build -o tc ./cmd/tc
@@ -173,7 +173,51 @@ backend_plugins:
     user: trustedcourier-plugin
 ```
 
-The plugin user must differ from the server's user and must not be able to read the config file, so a server that runs plugins starts as root. For development, `insecure_share_core_user: true` in place of `user` runs the plugin as the server's own user and logs a warning.
+The plugin user must differ from the server's user and must not be able to read the config file, so a server that runs plugins starts as root. For development, `insecure_share_core_user: true` in place of `user` runs the plugin as the server's own user and logs a warning. A plugin's own settings, such as its Backend's address, go under `env`; the plugin gets nothing else from its environment. Write your own Backend Plugin with the [plugin SDK and conformance kit](docs/backend-plugins.md).
+
+#### The OpenBao Backend Plugin
+
+The bundled plugin serves Secrets from OpenBao's KV secrets engine and stores Courier Keys there ([ADR-0008](docs/decisions/0008-bundled-openbao-static-seal.md), [ADR-0028](docs/decisions/0028-openbao-plugin-locations-env-and-kit-contract.md)). Build it and pin it like any other:
+
+```sh
+go -C plugins/openbao build -o ../../openbao-plugin .
+./tc plugin sha256 openbao-plugin
+```
+
+```yaml
+backend_plugins:
+  openbao:
+    path: /opt/trustedcourier/plugins/openbao
+    sha256: 3f7a...
+    user: trustedcourier-plugin
+    env:
+      BAO_ADDR: https://openbao.internal:8200
+      BAO_TOKEN_FILE: /etc/trustedcourier/openbao-token
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `BAO_ADDR` | OpenBao's URL: scheme, host, and port. Required. TLS is verified against the system roots; there is no skip-verify. |
+| `BAO_TOKEN_FILE` | A file holding the token, readable by the plugin's user and no one else. |
+| `BAO_TOKEN` | The token itself, for development. One of the two is required. |
+| `BAO_CACERT` | A PEM file of CA certificates to verify OpenBao's certificate with, in place of the system roots. |
+| `BAO_NAMESPACE` | The OpenBao namespace the locations are under. |
+
+A location is `<path>#<field>`: the API path of a KV record and a field in it. On a KV v2 mount, the default `secret/`, that is `secret/data/openai#key`, the path `bao kv get -mount=secret openai` reads; on a KV v1 mount it is `kv/openai#key`. The field must be a non-empty string. A Courier Key write sets one field and keeps the record's others, check-and-set on KV v2, so a certificate, its key, and the audit signing key can share a record:
+
+```sh
+bao kv put -mount=secret openai key=sk-...
+bao kv put -mount=secret trustedcourier audit-signing-key=@audit-signing-key.pem
+```
+
+Issue the plugin a token from a policy that covers only what it needs; the plugin does not renew it, so make it periodic or long-lived. `tc status` shows the OpenBao version and, when the token has a TTL, when it expires, and reports the plugin unhealthy while OpenBao is sealed, the token is invalid, or it expires within the hour:
+
+```hcl
+path "secret/data/*"     { capabilities = ["read", "create", "update"] }
+path "secret/metadata/*" { capabilities = ["list", "read"] }
+```
+
+`create` and `update` are needed only where TrustedCourier stores Courier Keys. `list` on `metadata` serves the plugin's `List`, which the conformance kit exercises and the server does not call today.
 
 `tc status` shows the server's [FIPS 140-3 mode](#fips-140-3-mode), each plugin's state, health, and capabilities, whether the [audit signing key](#audit) is loaded, and, when the Agent API serves TLS, whether its [certificate](#tls-on-the-agent-api) is:
 
@@ -193,7 +237,7 @@ TLS certificate: loaded (expires 2026-12-14T00:00:00Z, renews 2026-11-14T00:00:0
 
 TrustedCourier uses Go's cryptographic module, so FIPS 140-3 mode is a runtime switch on the standard binary ([ADR-0003](docs/decisions/0003-go-over-rust-core.md)): set `GODEBUG=fips140=on` in the server's environment, or `GODEBUG=fips140=only` to make any use of a non-approved algorithm a panic rather than a fallback. The mode is off unless set, in every build: release and CI binaries are built with `GOFIPS140=certified`, which links the validated module, and `tc` pins its own default to off where Go's would be on. A plain `go build` links the in-tree copy of the module, reported as module `latest`, which is the same code without the validation. `tc status` shows both the mode and the module.
 
-Every process that touches Secrets is inside the boundary ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)). The server spells its mode out in each Backend Plugin's `GODEBUG`, whether the mode came from the environment or from the build's default; a plugin built on the SDK reports its mode right after the handshake; and a server refuses to run a plugin that reports a weaker mode than its own (`off` under `on`, or anything but `only` under `only`). Such a plugin shows as `refused` in `tc status` with the remedy, is not relaunched until the server restarts, and the other plugins keep serving. The [conformance kit](#repository-layout) checks a plugin follows the kit's mode.
+Every process that touches Secrets is inside the boundary ([ADR-0027](docs/decisions/0027-fips-mode-plugin-parity-and-process-hardening.md)). The server spells its mode out in each Backend Plugin's `GODEBUG`, whether the mode came from the environment or from the build's default; a plugin built on the SDK reports its mode right after the handshake; and a server refuses to run a plugin that reports a weaker mode than its own (`off` under `on`, or anything but `only` under `only`). Such a plugin shows as `refused` in `tc status` with the remedy, is not relaunched until the server restarts, and the other plugins keep serving. The [conformance kit](docs/backend-plugins.md#the-conformance-kit) checks a plugin follows the kit's mode, and follows `on` and `only` when launched in them.
 
 ### Proxy Delivery
 
@@ -687,7 +731,8 @@ The repository holds three Go modules. The plugin SDK is versioned on its own (`
 | `e2e` | Black-box tests that build `tc` and drive a real server through its config, socket, CLI, and Agent API, against a fake TLS Upstream. |
 | `docs/api` | OpenAPI spec for the Agent API. |
 | `sdk/plugin` | Plugin SDK module: the `Backend` interface and `Serve` for Plugin Authors, the wire protocol (`protocol`), the validating client (`client`), the conformance kit (`conformance`), and the fake Backend Plugin used by tests. |
-| `plugins/openbao` | OpenBao Backend Plugin module. A placeholder until [#18](https://github.com/potto007/TrustedCourier/issues/18). |
+| `plugins/openbao` | OpenBao Backend Plugin module, on the SDK and the standard library, with its conformance test against a dev-mode OpenBao container. |
+| `docs/backend-plugins.md` | The Plugin Author guide: the SDK, the contract, and the conformance kit. |
 
 ## Development
 
@@ -708,6 +753,8 @@ go run ./scripts/testprogress -log /tmp/tc-tests.log -label "TrustedCourier test
 CI builds with `GOFIPS140=certified`, the validated FIPS 140-3 module, and runs every module twice, once with `GODEBUG=fips140=off` and once with `fips140=on`. Set both the same way to reproduce a CI leg locally; `fips140=only` also passes and catches any non-approved algorithm as a panic. The race detector is required, not optional ([ADR-0003](docs/decisions/0003-go-over-rust-core.md) relies on it).
 
 `TestBackendPluginRunsAsSeparateUser` needs a root server to switch the plugin's user and skips otherwise. CI runs it, with the separate-user refusal tests, a second time under `sudo`.
+
+The OpenBao plugin's conformance test starts a dev-mode `openbao/openbao` container with `docker` and skips without it; set `TC_OPENBAO_ADDR` and `TC_OPENBAO_TOKEN` (a root token) to run it against an OpenBao of your own instead. CI sets `TC_REQUIRE_OPENBAO=1`, which turns the skip into a failure.
 
 The plugin protocol's Go code is generated. After editing `sdk/plugin/protocol/backend.proto`, run `buf generate` in that directory with `protoc-gen-go` and `protoc-gen-go-grpc` on `PATH`.
 
