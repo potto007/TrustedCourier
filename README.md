@@ -55,7 +55,7 @@ These are settled and recorded as ADRs in [`docs/decisions/`](docs/decisions/REA
 | Hash-chained Audit Records, `tc audit verify` | done |
 | Signed audit checkpoints | done |
 | ACME with TLS-ALPN-01 and HTTP-01, certificates as Courier Keys | done |
-| ACME DNS-01 with built-in DNS providers | [#15](https://github.com/potto007/TrustedCourier/issues/15) |
+| ACME DNS-01 with built-in DNS providers | done |
 | `tc init` and docker compose | [#19](https://github.com/potto007/TrustedCourier/issues/19) |
 
 An Agent can call a pinned Upstream through TrustedCourier with its Agent Token in place of the API key, over TLS with an Operator-supplied or ACME certificate or plain HTTP on loopback or a unix socket, and can ask for a Secret by Secret Name where a Policy allows Reveal Delivery. The only Backend Plugin so far is the fake one the tests use, so a real deployment waits on [#18](https://github.com/potto007/TrustedCourier/issues/18).
@@ -405,7 +405,26 @@ agent_api:
         location: secret/data/trustedcourier#acme-account-key
 ```
 
-`challenge: http-01` validates over plain HTTP instead, on a separate listener that serves nothing but challenge responses, `http_listen` (default `0.0.0.0:80`). Wildcards need DNS-01, which is [#15](https://github.com/potto007/TrustedCourier/issues/15). For an internal CA such as step-ca, set `directory` to its URL, `ca_bundle` to the PEM file that verifies it, and, where the CA hands out External Account Binding credentials, `external_account_binding.key_id` with the base64url MAC key stored in a Backend as `hmac_key`.
+`challenge: http-01` validates over plain HTTP instead, on a separate listener that serves nothing but challenge responses, `http_listen` (default `0.0.0.0:80`). For an internal CA such as step-ca, set `directory` to its URL, `ca_bundle` to the PEM file that verifies it, and, where the CA hands out External Account Binding credentials, `external_account_binding.key_id` with the base64url MAC key stored in a Backend as `hmac_key`.
+
+`challenge: dns-01` validates by a TXT record instead, so it works on a private network where the CA cannot reach the Agent API, and it is the only challenge that validates a wildcard. TrustedCourier sets the record itself through one of the built-in DNS providers, `cloudflare`, `route53`, `azure`, or `google`, with credentials that are Courier Keys in a Backend, never values in the config:
+
+```yaml
+    acme:
+      domains: ['*.example.com', example.com]
+      challenge: dns-01
+      dns:
+        provider: cloudflare
+        credentials:
+          api_token:
+            backend: openbao
+            location: secret/data/trustedcourier#cloudflare-token
+      account_key:
+        backend: openbao
+        location: secret/data/trustedcourier#acme-account-key
+```
+
+Each provider takes its own credential fields: `api_token` for Cloudflare (a token with Zone:Read and DNS:Edit on the zone); `access_key_id` and `secret_access_key` for Route 53 (allowed `route53:ListHostedZonesByName`, `route53:ListResourceRecordSets`, and `route53:ChangeResourceRecordSets`); `client_secret` for Azure DNS, with `tenant_id`, `client_id`, `subscription_id`, and `resource_group` beside `provider` (the service principal needs DNS Zone Contributor on the zone); and `service_account_key`, the JSON key file, for Google Cloud DNS (the account needs DNS Administrator, and `project` overrides the key's project). The credentials are fetched from the Backend for each order and wiped after it. The zone that holds each name is found at the provider, or `zone` names it. Before validation is requested, the record is looked up on the zone's authoritative name servers, or on `resolvers`, until it appears or `propagation_timeout` (default `2m`) passes; the records are removed once the order is done. `endpoint` (and, for Azure, `authority`) point a sovereign cloud or a test at another API URL, verified with `ca_bundle` ([ADR-0025](docs/decisions/0025-acme-dns-01-and-dns-providers.md)).
 
 The account key, the certificate, and its key are all Courier Keys, so the Backend must have the `courier-key-write` capability; with a read-only Backend, `tc status` reports why no certificate is loaded and nothing is ordered. Supply the pair yourself instead. A restart reuses the stored pair, so nothing is re-issued against a CA's rate limits. Until the first certificate is obtained, and while a renewal keeps failing, `tc status` shows the CA's reason; the server retries from 30 seconds up to hourly, and keeps serving the loaded certificate until it expires ([ADR-0024](docs/decisions/0024-acme-issuance-and-renewal.md)).
 
@@ -534,12 +553,22 @@ The config is a single YAML document. Decoding is strict ([ADR-0010](docs/decisi
 | `agent_api.socket` | no | Unix socket path for the Agent API, serving plain HTTP. Connectable by every local user, as a loopback port is; Agent Tokens authenticate Agents. |
 | `agent_api.tls.certificate.backend`, `.location` | for TLS | Where the Operator-supplied certificate chain lives, as PEM with the leaf first, in a Backend ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). Needs `agent_api.listen`. No Secret Name may map to it. |
 | `agent_api.tls.key.backend`, `.location` | for TLS | Where the certificate's private key lives, as PKCS #8, PKCS #1, or SEC 1 PEM. No Secret Name may map to it. |
-| `agent_api.tls.acme.domains` | for ACME | DNS names the certificate is issued for, the first as its subject. No wildcards or IP addresses. |
+| `agent_api.tls.acme.domains` | for ACME | DNS names the certificate is issued for, the first as its subject. No IP addresses. A wildcard such as `*.example.com` needs `challenge: dns-01`. |
 | `agent_api.tls.acme.account_key.backend`, `.location` | for ACME | Where the ACME account key lives; generated and stored there on first use. No Secret Name may map to it. |
 | `agent_api.tls.acme.directory` | no | ACME directory `https` URL. Defaults to Let's Encrypt. |
 | `agent_api.tls.acme.contact` | no | Email address registered with the account. |
-| `agent_api.tls.acme.challenge` | no | `tls-alpn-01` (default), validated on the Agent API listener, or `http-01`, validated on `http_listen`. |
+| `agent_api.tls.acme.challenge` | no | `tls-alpn-01` (default), validated on the Agent API listener; `http-01`, validated on `http_listen`; or `dns-01`, validated by a TXT record set through `dns`. |
 | `agent_api.tls.acme.http_listen` | with `http-01` | IP address and port of the plain HTTP challenge listener. Defaults to `0.0.0.0:80`. Must differ from `agent_api.listen`. |
+| `agent_api.tls.acme.dns.provider` | with `dns-01` | The DNS provider that sets the records: `cloudflare`, `route53`, `azure`, or `google`. |
+| `agent_api.tls.acme.dns.credentials.<field>.backend`, `.location` | with `dns-01` | Where each of the provider's credentials lives: `api_token` for `cloudflare`; `access_key_id` and `secret_access_key` for `route53`; `client_secret` for `azure`; `service_account_key` (the JSON key file) for `google`. Courier Keys: no Secret Name may map to them. |
+| `agent_api.tls.acme.dns.zone` | no | The zone the records go in. Must hold every domain. Omit it to find the zone at the provider. |
+| `agent_api.tls.acme.dns.resolvers` | no | IP addresses, with an optional port (default 53), the record is looked up on before validation is requested. Omit them to use the zone's authoritative name servers. |
+| `agent_api.tls.acme.dns.propagation_timeout` | no | How long the record may take to appear, as a Go duration from `1s` to `30m`. Defaults to `2m`. |
+| `agent_api.tls.acme.dns.endpoint` | no | `https` URL that replaces the provider's API, for a sovereign cloud or a test. |
+| `agent_api.tls.acme.dns.ca_bundle` | no | PEM file of CA certificates that replace the system roots for the provider's API and token endpoint. |
+| `agent_api.tls.acme.dns.tenant_id`, `.client_id`, `.subscription_id`, `.resource_group` | for `azure` | The service principal and the resource group that holds the zone. |
+| `agent_api.tls.acme.dns.authority` | no, `azure` only | `https` URL that replaces `https://login.microsoftonline.com`. |
+| `agent_api.tls.acme.dns.project` | no, `google` only | The project that holds the zone. Defaults to the service account key's. |
 | `agent_api.tls.acme.ca_bundle` | no | PEM file of CA certificates that replace the system roots for the ACME directory. |
 | `agent_api.tls.acme.external_account_binding.key_id` | no | External Account Binding key identifier the CA issued. Needs `hmac_key`. |
 | `agent_api.tls.acme.external_account_binding.hmac_key.backend`, `.location` | with `key_id` | Where the base64url MAC key the CA issued lives. No Secret Name may map to it. |
@@ -571,7 +600,7 @@ Policies, Secret Names, Upstreams, Injection Templates, and Presets take effect 
 - The data directory is 0700 and the database files are 0600. The server tightens them again at every start, in case a backup restore loosened them.
 - The admin socket checks the connecting process's UID against `admin.allowed_uids` before it looks at the Operator Credential. The socket file is owner-only unless other users are allowed.
 - A second server pointed at a live socket refuses to start. A stale socket left by a crash is replaced.
-- The Agent API serves plain HTTP only on loopback or a unix socket. Anywhere else it serves TLS from a certificate and key held in a Backend, never on disk, and completes no handshake until they are loaded ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). With ACME, the account key and the issued pair are written to the Backend, and nothing is ordered from the CA while the Backend cannot store them ([ADR-0024](docs/decisions/0024-acme-issuance-and-renewal.md)).
+- The Agent API serves plain HTTP only on loopback or a unix socket. Anywhere else it serves TLS from a certificate and key held in a Backend, never on disk, and completes no handshake until they are loaded ([ADR-0023](docs/decisions/0023-agent-listener-tls-and-unix-socket.md)). With ACME, the account key and the issued pair are written to the Backend, and nothing is ordered from the CA while the Backend cannot store them ([ADR-0024](docs/decisions/0024-acme-issuance-and-renewal.md)). With DNS-01, the DNS provider credentials are read from the Backend for each order and wiped after it, and the validation records are removed however the order ends ([ADR-0025](docs/decisions/0025-acme-dns-01-and-dns-providers.md)).
 - Revoking an Agent Token twice succeeds and keeps the first revocation time.
 - A Backend Plugin binary whose SHA-256 differs from the pinned hash stops the server at boot and is never relaunched after boot. On Linux the server executes the file descriptor it hashed, so swapping the binary after the check does not work ([ADR-0011](docs/decisions/0011-backend-plugin-host-and-protocol.md)).
 - Backend Plugins run as a separate OS user that cannot read the config file or own the data directory, with an empty environment apart from `GODEBUG`. Core and plugin talk over go-plugin's automatic mutual TLS.

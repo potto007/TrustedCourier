@@ -120,6 +120,7 @@ func (a AgentTLS) Equal(b AgentTLS) bool {
 const (
 	ChallengeTLSALPN01 = "tls-alpn-01"
 	ChallengeHTTP01    = "http-01"
+	ChallengeDNS01     = "dns-01"
 )
 
 // ACME defaults.
@@ -133,17 +134,20 @@ type ACME struct {
 	// Directory is the ACME directory URL.
 	Directory string
 	// Domains are the DNS names the certificate covers, lowercase, the
-	// first being the subject. No wildcards: TLS-ALPN-01 and HTTP-01 cannot
-	// validate them.
+	// first being the subject. A wildcard such as *.example.com needs
+	// ChallengeDNS01; TLS-ALPN-01 and HTTP-01 cannot validate one.
 	Domains []string
 	// Contact is the account contact as a URL, such as mailto:ops@example.com,
 	// or empty.
 	Contact string
-	// Challenge is ChallengeTLSALPN01 or ChallengeHTTP01.
+	// Challenge is ChallengeTLSALPN01, ChallengeHTTP01, or ChallengeDNS01.
 	Challenge string
 	// HTTPListen is the address the HTTP-01 challenge listener binds. Empty
 	// unless Challenge is ChallengeHTTP01.
 	HTTPListen string
+	// DNS is the DNS provider DNS-01 validation records are set with. Set
+	// exactly when Challenge is ChallengeDNS01.
+	DNS *DNS
 	// CABundle is the path of the PEM file that verifies the directory's
 	// certificate, or empty for the system roots.
 	CABundle string
@@ -168,7 +172,77 @@ func (a ACME) Equal(b ACME) bool {
 	return a.Directory == b.Directory && slices.Equal(a.Domains, b.Domains) &&
 		a.Contact == b.Contact && a.Challenge == b.Challenge && a.HTTPListen == b.HTTPListen &&
 		a.CABundle == b.CABundle && a.RootCAs.Equal(b.RootCAs) && a.AccountKey == b.AccountKey &&
-		(a.EAB == nil) == (b.EAB == nil) && (a.EAB == nil || *a.EAB == *b.EAB)
+		(a.EAB == nil) == (b.EAB == nil) && (a.EAB == nil || *a.EAB == *b.EAB) &&
+		(a.DNS == nil) == (b.DNS == nil) && (a.DNS == nil || a.DNS.Equal(*b.DNS))
+}
+
+// DNS providers DNS-01 can set records with (ADR-0006).
+const (
+	DNSProviderCloudflare = "cloudflare"
+	DNSProviderRoute53    = "route53"
+	DNSProviderAzure      = "azure"
+	DNSProviderGoogle     = "google"
+)
+
+// DNSProviders lists the built-in DNS providers and the credential fields
+// each needs, every one a Courier Key in a Backend.
+var DNSProviders = map[string][]string{
+	DNSProviderCloudflare: {"api_token"},
+	DNSProviderRoute53:    {"access_key_id", "secret_access_key"},
+	DNSProviderAzure:      {"client_secret"},
+	DNSProviderGoogle:     {"service_account_key"},
+}
+
+// DefaultDNSPropagationTimeout is how long a DNS-01 record may take to
+// appear on the name servers before the order fails.
+const DefaultDNSPropagationTimeout = 2 * time.Minute
+
+// DNS configures the DNS provider DNS-01 validation sets records with. The
+// provider's credentials are Courier Keys: fetched from a Backend for each
+// order, never values in the config.
+type DNS struct {
+	// Provider is one of the DNSProviders keys.
+	Provider string
+	// Credentials holds the provider's credential fields, as DNSProviders
+	// lists them for Provider.
+	Credentials map[string]CourierKey
+	// Zone is the DNS zone the records go in, lowercase, or empty to find
+	// the zone that holds each name at the provider.
+	Zone string
+	// Endpoint replaces the provider's API URL, for a sovereign cloud or a
+	// test, or is empty.
+	Endpoint string
+	// Authority replaces Azure's token endpoint, https://login.microsoftonline.com,
+	// or is empty. Only for DNSProviderAzure.
+	Authority string
+	// CABundle is the path of the PEM file that verifies the provider's
+	// certificates, or empty for the system roots.
+	CABundle string
+	// RootCAs verify the provider's certificates. Nil means the system roots.
+	RootCAs *x509.CertPool
+	// Resolvers are the name servers, as IP address and port, the record is
+	// checked on before validation is requested. Empty checks the zone's
+	// authoritative name servers.
+	Resolvers []string
+	// PropagationTimeout is how long the record may take to appear.
+	PropagationTimeout time.Duration
+	// TenantID, ClientID, SubscriptionID, and ResourceGroup locate the
+	// zone at Azure. Only for DNSProviderAzure.
+	TenantID, ClientID, SubscriptionID, ResourceGroup string
+	// Project is the Google Cloud project that holds the zone, or empty for
+	// the service account key's project. Only for DNSProviderGoogle.
+	Project string
+}
+
+// Equal reports whether d and e configure the same DNS provider.
+func (d DNS) Equal(e DNS) bool {
+	return d.Provider == e.Provider && maps.Equal(d.Credentials, e.Credentials) &&
+		d.Zone == e.Zone && d.Endpoint == e.Endpoint && d.Authority == e.Authority &&
+		d.CABundle == e.CABundle && d.RootCAs.Equal(e.RootCAs) &&
+		slices.Equal(d.Resolvers, e.Resolvers) && d.PropagationTimeout == e.PropagationTimeout &&
+		d.TenantID == e.TenantID && d.ClientID == e.ClientID &&
+		d.SubscriptionID == e.SubscriptionID && d.ResourceGroup == e.ResourceGroup &&
+		d.Project == e.Project
 }
 
 // MaxCacheTTL is the longest a Secret Name may cache its Secret: the cache
@@ -353,9 +427,26 @@ type fileACME struct {
 	Contact    string          `yaml:"contact"`
 	Challenge  string          `yaml:"challenge"`
 	HTTPListen string          `yaml:"http_listen"`
+	DNS        *fileDNS        `yaml:"dns"`
 	CABundle   string          `yaml:"ca_bundle"`
 	AccountKey *fileCourierKey `yaml:"account_key"`
 	EAB        *fileEAB        `yaml:"external_account_binding"`
+}
+
+type fileDNS struct {
+	Provider           string                     `yaml:"provider"`
+	Credentials        map[string]*fileCourierKey `yaml:"credentials"`
+	Zone               string                     `yaml:"zone"`
+	Endpoint           string                     `yaml:"endpoint"`
+	Authority          string                     `yaml:"authority"`
+	CABundle           string                     `yaml:"ca_bundle"`
+	Resolvers          []string                   `yaml:"resolvers"`
+	PropagationTimeout string                     `yaml:"propagation_timeout"`
+	TenantID           string                     `yaml:"tenant_id"`
+	ClientID           string                     `yaml:"client_id"`
+	SubscriptionID     string                     `yaml:"subscription_id"`
+	ResourceGroup      string                     `yaml:"resource_group"`
+	Project            string                     `yaml:"project"`
 }
 
 type fileEAB struct {
@@ -570,6 +661,11 @@ func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 			if acme.EAB != nil {
 				keys = append(keys, namedCourierKey{"agent_api.tls.acme.external_account_binding.hmac_key", acme.EAB.HMACKey})
 			}
+			if acme.DNS != nil {
+				for _, field := range slices.Sorted(maps.Keys(acme.DNS.Credentials)) {
+					keys = append(keys, namedCourierKey{"agent_api.tls.acme.dns.credentials." + field, acme.DNS.Credentials[field]})
+				}
+			}
 		}
 		// ACME writes the certificate and key locations, so each Courier
 		// Key needs its own.
@@ -610,13 +706,20 @@ func (a fileACME) validate(cfg *Config, baseDir, listen string) (ACME, error) {
 	if len(a.Domains) == 0 {
 		return ACME{}, errors.New("agent_api.tls.acme.domains is required: the DNS names the certificate is issued for")
 	}
+	if a.Challenge != "" {
+		if !slices.Contains([]string{ChallengeTLSALPN01, ChallengeHTTP01, ChallengeDNS01}, a.Challenge) {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.challenge %q is not a challenge type (want %s, %s, or %s)", a.Challenge, ChallengeTLSALPN01, ChallengeHTTP01, ChallengeDNS01)
+		}
+		out.Challenge = a.Challenge
+	}
 	for _, d := range a.Domains {
 		domain := strings.ToLower(strings.TrimSuffix(d, "."))
+		name, wildcard := strings.CutPrefix(domain, "*.")
 		switch {
-		case strings.HasPrefix(domain, "*."):
-			return ACME{}, fmt.Errorf("agent_api.tls.acme.domains: %q is a wildcard, which TLS-ALPN-01 and HTTP-01 cannot validate", d)
-		case net.ParseIP(domain) != nil || !domainPattern.MatchString(domain) ||
-			(!strings.Contains(domain, ".") && domain != "localhost"):
+		case wildcard && out.Challenge != ChallengeDNS01:
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.domains: %q is a wildcard, which only %s can validate; set challenge: %s", d, ChallengeDNS01, ChallengeDNS01)
+		case net.ParseIP(name) != nil || !domainPattern.MatchString(name) ||
+			(!strings.Contains(name, ".") && (name != "localhost" || wildcard)):
 			return ACME{}, fmt.Errorf("agent_api.tls.acme.domains: %q is not a DNS name", d)
 		}
 		if slices.Contains(out.Domains, domain) {
@@ -641,12 +744,6 @@ func (a fileACME) validate(cfg *Config, baseDir, listen string) (ACME, error) {
 		}
 		out.Contact = contact
 	}
-	if a.Challenge != "" {
-		if a.Challenge != ChallengeTLSALPN01 && a.Challenge != ChallengeHTTP01 {
-			return ACME{}, fmt.Errorf("agent_api.tls.acme.challenge %q is not a challenge type (want %s or %s)", a.Challenge, ChallengeTLSALPN01, ChallengeHTTP01)
-		}
-		out.Challenge = a.Challenge
-	}
 	switch {
 	case out.Challenge == ChallengeHTTP01:
 		out.HTTPListen = DefaultACMEHTTPListen
@@ -660,7 +757,20 @@ func (a fileACME) validate(cfg *Config, baseDir, listen string) (ACME, error) {
 			return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen %q is the Agent API's own address; HTTP-01 is validated over plain HTTP on a different port", out.HTTPListen)
 		}
 	case a.HTTPListen != "":
-		return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen is only for challenge %s; %s is validated on the Agent API listener itself", ChallengeHTTP01, ChallengeTLSALPN01)
+		return ACME{}, fmt.Errorf("agent_api.tls.acme.http_listen is only for challenge %s", ChallengeHTTP01)
+	}
+	switch {
+	case out.Challenge == ChallengeDNS01:
+		if a.DNS == nil {
+			return ACME{}, fmt.Errorf("agent_api.tls.acme.dns is required for challenge %s: the DNS provider that sets the validation records", ChallengeDNS01)
+		}
+		dns, err := a.DNS.validate(cfg, baseDir, out.Domains)
+		if err != nil {
+			return ACME{}, err
+		}
+		out.DNS = &dns
+	case a.DNS != nil:
+		return ACME{}, fmt.Errorf("agent_api.tls.acme.dns is only for challenge %s", ChallengeDNS01)
 	}
 	if a.CABundle != "" {
 		out.CABundle = resolve(baseDir, a.CABundle)
@@ -685,6 +795,109 @@ func (a fileACME) validate(cfg *Config, baseDir, listen string) (ACME, error) {
 		}
 		out.EAB = &ExternalAccountBinding{KeyID: a.EAB.KeyID, HMACKey: hmacKey}
 	}
+	return out, nil
+}
+
+// dnsProviderSettings are the config keys each DNS provider takes beside
+// the common ones, and whether each is required.
+var dnsProviderSettings = map[string]map[string]bool{
+	DNSProviderCloudflare: {},
+	DNSProviderRoute53:    {},
+	DNSProviderAzure:      {"tenant_id": true, "client_id": true, "subscription_id": true, "resource_group": true, "authority": false},
+	DNSProviderGoogle:     {"project": false},
+}
+
+func (d fileDNS) validate(cfg *Config, baseDir string, domains []string) (DNS, error) {
+	const prefix = "agent_api.tls.acme.dns"
+	providers := strings.Join(slices.Sorted(maps.Keys(DNSProviders)), ", ")
+	if d.Provider == "" {
+		return DNS{}, fmt.Errorf("%s.provider is required: one of %s", prefix, providers)
+	}
+	fields, ok := DNSProviders[d.Provider]
+	if !ok {
+		return DNS{}, fmt.Errorf("%s.provider %q is not a built-in DNS provider (want one of %s)", prefix, d.Provider, providers)
+	}
+	out := DNS{Provider: d.Provider, Credentials: map[string]CourierKey{}, PropagationTimeout: DefaultDNSPropagationTimeout}
+	for _, field := range slices.Sorted(maps.Keys(d.Credentials)) {
+		if !slices.Contains(fields, field) {
+			return DNS{}, fmt.Errorf("%s.credentials.%s is not a credential of %s (want %s)", prefix, field, d.Provider, strings.Join(fields, ", "))
+		}
+	}
+	for _, field := range fields {
+		key, err := d.Credentials[field].validateCourierKey(prefix+".credentials."+field, "the "+d.Provider+" DNS credential "+field, cfg)
+		if err != nil {
+			return DNS{}, err
+		}
+		out.Credentials[field] = key
+	}
+	if d.Zone != "" {
+		zone := strings.ToLower(strings.TrimSuffix(d.Zone, "."))
+		if !domainPattern.MatchString(zone) || !strings.Contains(zone, ".") {
+			return DNS{}, fmt.Errorf("%s.zone %q is not a DNS zone name", prefix, d.Zone)
+		}
+		for _, domain := range domains {
+			if name := strings.TrimPrefix(domain, "*."); name != zone && !strings.HasSuffix(name, "."+zone) {
+				return DNS{}, fmt.Errorf("%s.zone %q does not hold %s", prefix, d.Zone, domain)
+			}
+		}
+		out.Zone = zone
+	}
+	for _, u := range []struct{ key, value string }{{"endpoint", d.Endpoint}, {"authority", d.Authority}} {
+		if u.value == "" {
+			continue
+		}
+		parsed, err := url.Parse(u.value)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+			return DNS{}, fmt.Errorf("%s.%s %q must be an https URL without query, fragment, or user information", prefix, u.key, u.value)
+		}
+	}
+	out.Endpoint = strings.TrimSuffix(d.Endpoint, "/")
+	out.Authority = strings.TrimSuffix(d.Authority, "/")
+	if d.CABundle != "" {
+		out.CABundle = resolve(baseDir, d.CABundle)
+		pool, err := loadCABundle(out.CABundle)
+		if err != nil {
+			return DNS{}, fmt.Errorf("%s.ca_bundle: %w", prefix, err)
+		}
+		out.RootCAs = pool
+	}
+	for _, r := range d.Resolvers {
+		addrPort, err := netip.ParseAddrPort(r)
+		if err != nil {
+			addr, err := netip.ParseAddr(r)
+			if err != nil {
+				return DNS{}, fmt.Errorf("%s.resolvers: %q must be an IP address with an optional port, such as 192.0.2.53 or 192.0.2.53:5353", prefix, r)
+			}
+			addrPort = netip.AddrPortFrom(addr, 53)
+		}
+		out.Resolvers = append(out.Resolvers, addrPort.String())
+	}
+	if d.PropagationTimeout != "" {
+		t, err := time.ParseDuration(d.PropagationTimeout)
+		switch {
+		case err != nil:
+			return DNS{}, fmt.Errorf("%s.propagation_timeout %q is not a duration such as 2m", prefix, d.PropagationTimeout)
+		case t < time.Second || t > 30*time.Minute:
+			return DNS{}, fmt.Errorf("%s.propagation_timeout %q must be from 1s to 30m", prefix, d.PropagationTimeout)
+		}
+		out.PropagationTimeout = t
+	}
+	settings := map[string]string{
+		"tenant_id": d.TenantID, "client_id": d.ClientID, "subscription_id": d.SubscriptionID,
+		"resource_group": d.ResourceGroup, "project": d.Project, "authority": d.Authority,
+	}
+	takes := dnsProviderSettings[d.Provider]
+	for _, key := range slices.Sorted(maps.Keys(settings)) {
+		required, ok := takes[key]
+		switch {
+		case !ok && settings[key] != "":
+			return DNS{}, fmt.Errorf("%s.%s is not a setting of %s", prefix, key, d.Provider)
+		case required && settings[key] == "":
+			return DNS{}, fmt.Errorf("%s.%s is required for %s", prefix, key, d.Provider)
+		}
+	}
+	out.TenantID, out.ClientID, out.SubscriptionID, out.ResourceGroup, out.Project =
+		d.TenantID, d.ClientID, d.SubscriptionID, d.ResourceGroup, d.Project
 	return out, nil
 }
 

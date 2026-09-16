@@ -16,7 +16,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-plugin v1.8.0 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
-	github.com/letsencrypt/challtestsrv v1.4.2 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/miekg/dns v1.1.62 // indirect
@@ -39,6 +38,7 @@ require (
 
 require (
 	github.com/hashicorp/go-hclog v1.6.3
+	github.com/letsencrypt/challtestsrv v1.4.2
 	github.com/letsencrypt/pebble/v2 v2.10.1
 	github.com/potto007/TrustedCourier/sdk/plugin v0.0.0
 	golang.org/x/crypto v0.55.0

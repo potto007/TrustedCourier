@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -75,11 +76,11 @@ func agentURLOn(url string) string {
 }
 
 // servedCertificate completes a TLS handshake with the Agent API at url as a
-// client for acmeDomain and returns the leaf it served.
-func servedCertificate(t *testing.T, pebble *harness.Pebble, url string) *x509.Certificate {
+// client for serverName and returns the leaf it served.
+func servedCertificate(t *testing.T, pebble *harness.Pebble, url, serverName string) *x509.Certificate {
 	t.Helper()
 	addr := strings.TrimPrefix(url, "https://")
-	conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pebble.Roots, ServerName: acmeDomain})
+	conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pebble.Roots, ServerName: serverName})
 	if err != nil {
 		t.Fatalf("TLS handshake with %s: %v", addr, err)
 	}
@@ -90,12 +91,12 @@ func servedCertificate(t *testing.T, pebble *harness.Pebble, url string) *x509.C
 // waitForCertificate waits until the Agent API at url serves a certificate
 // Pebble issued that differs from previous (which may be nil), and returns
 // it.
-func waitForCertificate(t *testing.T, pebble *harness.Pebble, url string, previous *x509.Certificate, within time.Duration) *x509.Certificate {
+func waitForCertificate(t *testing.T, pebble *harness.Pebble, url, serverName string, previous *x509.Certificate, within time.Duration) *x509.Certificate {
 	t.Helper()
 	deadline := time.Now().Add(within)
 	for {
 		addr := strings.TrimPrefix(url, "https://")
-		conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pebble.Roots, ServerName: acmeDomain})
+		conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pebble.Roots, ServerName: serverName})
 		if err == nil {
 			leaf := conn.ConnectionState().PeerCertificates[0]
 			_ = conn.Close()
@@ -110,16 +111,19 @@ func waitForCertificate(t *testing.T, pebble *harness.Pebble, url string, previo
 	}
 }
 
-func assertACMECertificate(t *testing.T, tc *harness.Installation, srv *harness.Server, pebble *harness.Pebble, pluginPath string) *x509.Certificate {
+// assertACMECertificate checks that the Agent API serves a certificate from
+// Pebble naming domains, that a Reveal Delivery works over it as a client
+// for serverName, and that the pair and the account key are in the Backend.
+func assertACMECertificate(t *testing.T, tc *harness.Installation, srv *harness.Server, pebble *harness.Pebble, pluginPath, serverName string, domains ...string) *x509.Certificate {
 	t.Helper()
 	url := agentURLOn(srv.AgentURL())
-	leaf := servedCertificate(t, pebble, url)
-	if len(leaf.DNSNames) != 1 || leaf.DNSNames[0] != acmeDomain {
-		t.Errorf("the certificate names %v, want [%s]", leaf.DNSNames, acmeDomain)
+	leaf := servedCertificate(t, pebble, url, serverName)
+	if !slices.Equal(leaf.DNSNames, domains) {
+		t.Errorf("the certificate names %v, want %v", leaf.DNSNames, domains)
 	}
 	waitForPlugin(t, srv, "fake", running)
 	token := issueAgentToken(t, srv, "github-reveal", "1h").Token
-	client := pebble.Client(acmeDomain)
+	client := pebble.Client(serverName)
 	defer client.CloseIdleConnections()
 	got, resp := revealWith(t, client, url, token, "github")
 	if got.Status != http.StatusOK || got.Body != "test-value-2" {
@@ -154,7 +158,7 @@ func TestACMEObtainsACertificateByTLSALPN01(t *testing.T) {
 	port := harness.FreePort(t)
 	pebble := tc.StartPebble(harness.PebbleOptions{TLSPort: port})
 	srv, path := startACME(t, tc, harness.FakePlugin, acmeConfig(port, pebble, ""), nil)
-	first := assertACMECertificate(t, tc, srv, pebble, path)
+	first := assertACMECertificate(t, tc, srv, pebble, path, acmeDomain, acmeDomain)
 	if !strings.Contains(srv.Stderr(), "TLS certificate obtained") {
 		t.Errorf("server log does not record obtaining the certificate:\n%s", srv.Stderr())
 	}
@@ -164,7 +168,7 @@ func TestACMEObtainsACertificateByTLSALPN01(t *testing.T) {
 	srv.Stop()
 	srv = tc.Start(strings.Replace(harness.BaseConfig, "{{.Fake.Path}}", path, 1) + acmeConfig(port, pebble, "") + auditConfig)
 	url := agentURLOn(srv.AgentURL())
-	if again := servedCertificate(t, pebble, url); again.SerialNumber.Cmp(first.SerialNumber) != 0 {
+	if again := servedCertificate(t, pebble, url, acmeDomain); again.SerialNumber.Cmp(first.SerialNumber) != 0 {
 		t.Errorf("after a restart the Agent API serves serial %s, want the stored %s", again.SerialNumber, first.SerialNumber)
 	}
 	if strings.Contains(srv.Stderr(), "TLS certificate obtained") {
@@ -179,7 +183,7 @@ func TestACMEObtainsACertificateByHTTP01(t *testing.T) {
 	pebble := tc.StartPebble(harness.PebbleOptions{HTTPPort: httpPort})
 	extra := "      challenge: http-01\n      http_listen: \"0.0.0.0:" + strconv.Itoa(httpPort) + "\"\n"
 	srv, path := startACME(t, tc, harness.FakePlugin, acmeConfig(port, pebble, extra), nil)
-	assertACMECertificate(t, tc, srv, pebble, path)
+	assertACMECertificate(t, tc, srv, pebble, path, acmeDomain, acmeDomain)
 
 	// The HTTP-01 listener serves nothing but challenges.
 	plain := &http.Client{Timeout: 5 * time.Second}
@@ -199,12 +203,12 @@ func TestACMERenewsBeforeExpiry(t *testing.T) {
 	port := harness.FreePort(t)
 	pebble := tc.StartPebble(harness.PebbleOptions{TLSPort: port, Validity: 24 * time.Second})
 	srv, path := startACME(t, tc, harness.FakePlugin, acmeConfig(port, pebble, ""), nil)
-	first := assertACMECertificate(t, tc, srv, pebble, path)
+	first := assertACMECertificate(t, tc, srv, pebble, path, acmeDomain, acmeDomain)
 	url := agentURLOn(srv.AgentURL())
 
 	// Renewal happens at two thirds of the lifetime, while the first
 	// certificate is still valid, and the Backend holds the new one.
-	renewed := waitForCertificate(t, pebble, url, first, 40*time.Second)
+	renewed := waitForCertificate(t, pebble, url, acmeDomain, first, 40*time.Second)
 	if !time.Now().Before(first.NotAfter) {
 		t.Errorf("the certificate was renewed at %s, after it expired at %s", time.Now().UTC().Format(time.RFC3339), first.NotAfter.UTC().Format(time.RFC3339))
 	}
@@ -246,7 +250,7 @@ func TestACMEWithExternalAccountBinding(t *testing.T) {
 	pebble := tc.StartPebble(harness.PebbleOptions{TLSPort: port, EAB: map[string]string{keyID: macKey}})
 	extra := "      external_account_binding:\n        key_id: " + keyID + "\n        hmac_key:\n          backend: fake\n          location: " + acmeEABKeyLocation + "\n"
 	srv, path := startACME(t, tc, harness.FakePlugin, acmeConfig(port, pebble, extra), map[string]string{acmeEABKeyLocation: macKey})
-	assertACMECertificate(t, tc, srv, pebble, path)
+	assertACMECertificate(t, tc, srv, pebble, path, acmeDomain, acmeDomain)
 	if strings.Contains(srv.Stderr(), macKey) {
 		t.Error("the External Account Binding key appears in the server log")
 	}
@@ -282,8 +286,20 @@ func TestACMEConfigIsValidated(t *testing.T) {
 		{"IP address domain", "      domains: [192.0.2.10]\n" + accountKey, "not a DNS name"},
 		{"no account key", "      domains: [example.com]\n", "agent_api.tls.acme.account_key: backend is required"},
 		{"plain HTTP directory", "      domains: [example.com]\n      directory: http://acme.example.com/dir\n" + accountKey, "https"},
-		{"unknown challenge", "      domains: [example.com]\n      challenge: dns-01\n" + accountKey, "challenge"},
+		{"unknown challenge", "      domains: [example.com]\n      challenge: dns-02\n" + accountKey, "challenge"},
 		{"http_listen without http-01", "      domains: [example.com]\n      http_listen: 0.0.0.0:80\n" + accountKey, "http_listen"},
+		{"dns-01 without dns", "      domains: [example.com]\n      challenge: dns-01\n" + accountKey, "agent_api.tls.acme.dns is required"},
+		{"dns without dns-01", "      domains: [example.com]\n      dns:\n        provider: cloudflare\n        credentials:\n          api_token: {backend: fake, location: courier/cf}\n" + accountKey, "agent_api.tls.acme.dns is only for challenge dns-01"},
+		{"unknown DNS provider", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: namecheap\n" + accountKey, "not a built-in DNS provider"},
+		{"missing DNS credential", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: route53\n        credentials:\n          access_key_id: {backend: fake, location: courier/aws-id}\n" + accountKey, "agent_api.tls.acme.dns.credentials.secret_access_key: backend is required"},
+		{"credential of another provider", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: cloudflare\n        credentials:\n          api_token: {backend: fake, location: courier/cf}\n          client_secret: {backend: fake, location: courier/az}\n" + accountKey, "client_secret is not a credential of cloudflare"},
+		{"setting of another provider", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: cloudflare\n        tenant_id: t\n        credentials:\n          api_token: {backend: fake, location: courier/cf}\n" + accountKey, "tenant_id is not a setting of cloudflare"},
+		{"Azure without its settings", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: azure\n        credentials:\n          client_secret: {backend: fake, location: courier/az}\n" + accountKey, "client_id is required for azure"},
+		{"zone that does not hold a domain", "      domains: [example.com, '*.example.org']\n      challenge: dns-01\n      dns:\n        provider: cloudflare\n        zone: example.com\n        credentials:\n          api_token: {backend: fake, location: courier/cf}\n" + accountKey, "zone \"example.com\" does not hold *.example.org"},
+		{"plain HTTP DNS endpoint", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: cloudflare\n        endpoint: http://127.0.0.1:8080\n        credentials:\n          api_token: {backend: fake, location: courier/cf}\n" + accountKey, "endpoint \"http://127.0.0.1:8080\" must be an https URL"},
+		{"DNS resolver that is a hostname", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: cloudflare\n        resolvers: [ns1.example.com]\n        credentials:\n          api_token: {backend: fake, location: courier/cf}\n" + accountKey, "resolvers: \"ns1.example.com\" must be an IP address"},
+		{"DNS credential at the certificate location", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: cloudflare\n        credentials:\n          api_token: {backend: fake, location: courier/tls-certificate}\n" + accountKey, "name the same location"},
+		{"Secret Name maps to a DNS credential", "      domains: [example.com]\n      challenge: dns-01\n      dns:\n        provider: cloudflare\n        credentials:\n          api_token: {backend: fake, location: courier/cf}\n" + accountKey + "secrets:\n  leak:\n    backend: fake\n    location: courier/cf\n", "Courier Key is never delivered to Agents"},
 		{"EAB without key", "      domains: [example.com]\n      external_account_binding:\n        key_id: kid\n" + accountKey, "external_account_binding.hmac_key"},
 		{"account key at the certificate location", "      domains: [example.com]\n      account_key:\n        backend: fake\n        location: courier/tls-certificate\n", "name the same location"},
 		{"http_listen on the Agent API port", "      domains: [example.com]\n      challenge: http-01\n      http_listen: \"[::]:8443\"\n" + accountKey, "http_listen"},
