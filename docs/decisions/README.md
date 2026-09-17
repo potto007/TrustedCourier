@@ -33,3 +33,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0027](0027-fips-mode-plugin-parity-and-process-hardening.md) | FIPS mode is reported in the plugin's Capabilities response, enforced by the Plugin Host, and the binaries link the validated module | accepted |
 | [0028](0028-openbao-plugin-locations-env-and-kit-contract.md) | The OpenBao plugin addresses KV fields, is configured by environment, and the conformance kit makes malformed Secrets the plugin's error | accepted |
 | [0029](0029-tc-init-seal-key-hand-off-and-bootstrap-order.md) | tc init writes the seal key OpenBao waits for, then finishes the bootstrap through the Backend Plugin | accepted |
+| [0030](0030-public-agent-url-for-tc-env.md) | tc env uses an explicit public Agent API origin when configured | accepted |

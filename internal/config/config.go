@@ -83,6 +83,9 @@ type AgentAPI struct {
 	Listen string
 	// Socket is the unix socket path to serve plain HTTP on.
 	Socket string
+	// PublicURL is the externally reachable origin used by tc env.
+	// Empty uses the actual listener address.
+	PublicURL string
 	// TLS holds the Courier Keys the listener serves TLS with. Nil serves
 	// plain HTTP, which validation allows only on loopback or a unix socket.
 	TLS *AgentTLS
@@ -93,7 +96,7 @@ func (a AgentAPI) Served() bool { return a.Listen != "" || a.Socket != "" }
 
 // Equal reports whether a and b configure the same listener.
 func (a AgentAPI) Equal(b AgentAPI) bool {
-	return a.Listen == b.Listen && a.Socket == b.Socket &&
+	return a.Listen == b.Listen && a.Socket == b.Socket && a.PublicURL == b.PublicURL &&
 		(a.TLS == nil) == (b.TLS == nil) && (a.TLS == nil || a.TLS.Equal(*b.TLS))
 }
 
@@ -462,9 +465,10 @@ type fileCheckpoints struct {
 }
 
 type fileAgentAPI struct {
-	Listen string        `yaml:"listen"`
-	Socket string        `yaml:"socket"`
-	TLS    *fileAgentTLS `yaml:"tls"`
+	Listen    string        `yaml:"listen"`
+	Socket    string        `yaml:"socket"`
+	PublicURL string        `yaml:"public_url"`
+	TLS       *fileAgentTLS `yaml:"tls"`
 }
 
 type fileAgentTLS struct {
@@ -726,6 +730,15 @@ func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 		return errors.New("set agent_api.listen or agent_api.socket, not both")
 	case a.TLS != nil && a.Listen == "":
 		return errors.New("agent_api.tls needs agent_api.listen: a unix socket serves plain HTTP")
+	case a.PublicURL != "" && a.Listen == "":
+		return errors.New("agent_api.public_url needs agent_api.listen")
+	}
+	if a.PublicURL != "" {
+		publicURL, err := validateAgentPublicURL(a.PublicURL)
+		if err != nil {
+			return err
+		}
+		cfg.AgentAPI.PublicURL = publicURL
 	}
 	if a.Listen != "" {
 		addr, err := netip.ParseAddrPort(a.Listen)

@@ -2,12 +2,81 @@ package e2e
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/potto007/TrustedCourier/e2e/harness"
 )
+
+func TestEnvUsesPublicURLWithWildcardListener(t *testing.T) {
+	tc := harness.New(t)
+	config := harness.BaseConfig + tlsAgentAPI("0.0.0.0:0") + auditConfig
+	config = strings.Replace(config, "agent_api:\n", "agent_api:\n  public_url: https://agents.example.test:9443/\n", 1)
+	srv := tc.Start(config)
+	if bound := srv.ListeningAgentURL(); !strings.HasPrefix(bound, "https://0.0.0.0:") || strings.HasSuffix(bound, ":9443") {
+		t.Fatalf("listener = %q, want wildcard binding on a different port", bound)
+	}
+	res := srv.TC("env", "openai")
+	want := "OPENAI_BASE_URL=https://agents.example.test:9443/proxy/openai/api\nOPENAI_API_KEY=<Agent Token>\n"
+	if res.ExitCode != 0 || res.Stdout != want {
+		t.Fatalf("tc env: exit %d\n%s%s\nwant:\n%s", res.ExitCode, res.Stdout, res.Stderr, want)
+	}
+	res = srv.TC("env", "openai", "--json")
+	var env map[string]string
+	if res.ExitCode != 0 || json.Unmarshal([]byte(res.Stdout), &env) != nil ||
+		env["OPENAI_BASE_URL"] != "https://agents.example.test:9443/proxy/openai/api" || env["OPENAI_API_KEY"] != "<Agent Token>" {
+		t.Fatalf("tc env --json: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+}
+
+func TestEnvAcceptsPublicURLOrigins(t *testing.T) {
+	for _, origin := range []string{
+		"https://agents.example.test", "https://[2001:db8::1]:8443",
+		"http://127.0.0.1:9000", "http://[::1]:9000", "http://[::ffff:127.0.0.1]:9000",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			tc := harness.New(t)
+			srv := tc.Start(harness.BaseConfig + fmt.Sprintf("\nagent_api:\n  listen: 127.0.0.1:0\n  public_url: %q\n", origin) + auditConfig)
+			res := srv.TC("env", "openai")
+			if res.ExitCode != 0 || !strings.Contains(res.Stdout, "OPENAI_BASE_URL="+origin+"/proxy/openai/api\n") {
+				t.Fatalf("tc env: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
+			}
+		})
+	}
+}
+
+func TestEnvPublicURLIsValidated(t *testing.T) {
+	for _, origin := range []string{
+		"agents.example.test", "//agents.example.test", "https:///", "ftp://agents.example.test",
+		"https:agents.example.test", "https://user:password@agents.example.test",
+		"https://agents.example.test/path", "https://agents.example.test/%2f",
+		"https://agents.example.test?query=1", "https://agents.example.test?",
+		"https://agents.example.test#fragment", "https://agents.example.test#",
+		"https://0.0.0.0", "https://[::]", "https://[::ffff:0.0.0.0]",
+		"https://*.example.test", "https://bad host", "https://-invalid.test", "https://[example.test]",
+		"https://[127.0.0.1]", "https://::1", "https://[fe80::1%25eth0]",
+		"https://agents.example.test:0", "https://agents.example.test:65536",
+		"https://agents.example.test:bad", "https://agents.example.test:",
+		"http://agents.example.test", "http://localhost", "http://192.0.2.1", "http://[2001:db8::1]",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			tc := harness.New(t)
+			code, stderr := tc.Refused(harness.BaseConfig + fmt.Sprintf("\nagent_api:\n  listen: 127.0.0.1:0\n  public_url: %q\n", origin) + auditConfig)
+			if code == 0 || !strings.Contains(stderr, "agent_api.public_url") {
+				t.Fatalf("public URL accepted or failed for another reason: exit %d\n%s", code, stderr)
+			}
+		})
+	}
+	for _, listener := range []string{"", "  socket: agent.sock\n"} {
+		tc := harness.New(t)
+		code, stderr := tc.Refused(harness.BaseConfig + "\nagent_api:\n" + listener + "  public_url: https://agents.example.test\n" + auditConfig)
+		if code == 0 || !strings.Contains(stderr, "agent_api.public_url needs agent_api.listen") {
+			t.Fatalf("public URL without TCP listener: exit %d\n%s", code, stderr)
+		}
+	}
+}
 
 // envSecretNames adds, to proxyConfig, a Secret Name for each kind of
 // Injection Template tc env handles differently, and one with two Upstreams.
