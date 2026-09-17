@@ -96,6 +96,7 @@ func TestReloadRefusesChangesThatNeedARestart(t *testing.T) {
 		{"admin socket", strings.Replace(proxyConfig, "  socket: {{.Socket}}", "  socket: "+tc.Dir()+"/other.sock", 1), "admin"},
 		{"allowed UIDs", strings.Replace(proxyConfig, "  socket: {{.Socket}}\n", "  socket: {{.Socket}}\n  allowed_uids: [{{.UID}}, 65534]\n", 1), "admin"},
 		{"Agent API address", strings.Replace(proxyConfig, "listen: 127.0.0.1:0", "listen: 127.0.0.1:1", 1), "agent_api"},
+		{"Agent API public URL", strings.Replace(proxyConfig, "listen: 127.0.0.1:0", "listen: 127.0.0.1:0\n  public_url: https://agents.example.test", 1), "agent_api"},
 		{"Backend Plugin", strings.Replace(proxyConfig, "    insecure_share_core_user: true\n", "    insecure_share_core_user: true\n  unhealthy:\n    path: {{.Unhealthy.Path}}\n    sha256: {{.Unhealthy.SHA256}}\n    insecure_share_core_user: true\n", 1), "backend_plugins"},
 		{"checkpoint cadence", proxyConfig + "  checkpoints:\n    records: 5\n", "audit"},
 	}

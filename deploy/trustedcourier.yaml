@@ -1,5 +1,5 @@
 # TrustedCourier with the bundled OpenBao, for deploy/compose.yaml. Fill in
-# the three CHANGE-ME values, then follow the steps in compose.yaml. Keep
+# the CHANGE-ME values, then follow the steps in compose.yaml. Keep
 # this file mode 600: the Backend Plugin's user must not be able to read it.
 data_dir: /var/lib/trustedcourier/data
 
@@ -8,6 +8,7 @@ admin:
 
 agent_api:
   listen: 0.0.0.0:8200
+  public_url: https://tc.example.com     # CHANGE-ME: URL Agents use; Compose publishes port 443
   tls:
     certificate:
       backend: openbao

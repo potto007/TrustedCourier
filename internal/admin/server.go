@@ -328,7 +328,12 @@ func listensOnUnspecified(agentURL string) bool {
 
 func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	sn, ok := s.cfg.Snapshot().Secrets[name]
+	cfg := s.cfg.Snapshot()
+	sn, ok := cfg.Secrets[name]
+	agentURL := s.agent.URL
+	if cfg.AgentAPI.PublicURL != "" {
+		agentURL = cfg.AgentAPI.PublicURL
+	}
 	switch {
 	case !ok:
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Secret Name %q is not defined", name))
@@ -342,8 +347,8 @@ func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 	case s.agent.URL == "":
 		writeError(w, http.StatusBadRequest, "the Agent API is not served; set agent_api.listen")
 		return
-	case listensOnUnspecified(s.agent.URL):
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("the Agent API listens on every interface (%s), so tc env cannot name the host Agents reach it at; substitute the host yourself in %s/proxy/%s/<upstream>", s.agent.URL, s.agent.URL, name))
+	case listensOnUnspecified(agentURL):
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("the Agent API listens on every interface (%s); set agent_api.public_url to the URL Agents reach it at", s.agent.URL))
 		return
 	}
 	upstream := r.URL.Query().Get("upstream")
@@ -363,7 +368,7 @@ func (s *Server) secretNameEnv(w http.ResponseWriter, r *http.Request) {
 		var value string
 		switch v.Source {
 		case config.EnvBaseURL:
-			value = s.agent.URL + "/proxy/" + name + "/" + upstream
+			value = agentURL + "/proxy/" + name + "/" + upstream
 		case config.EnvAgentToken:
 			value = AgentTokenPlaceholder
 		case config.EnvUsername:

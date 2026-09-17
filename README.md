@@ -155,6 +155,13 @@ Stop the server with Ctrl-C or SIGTERM.
 
 With no secret store of your own, [`deploy/compose.yaml`](deploy/compose.yaml) runs TrustedCourier and OpenBao together, and `tc init` sets OpenBao up ([ADR-0008](docs/decisions/0008-bundled-openbao-static-seal.md), [ADR-0029](docs/decisions/0029-tc-init-seal-key-hand-off-and-bootstrap-order.md)). From `deploy/`, with the Agent API's public name and your ACME contact filled into [`trustedcourier.yaml`](deploy/trustedcourier.yaml):
 
+Set `agent_api.public_url` to the URL Agents reach, such as `https://tc.example.com`,
+and use that hostname in `agent_api.tls.acme.domains`. Compose maps public port
+443 to container port 8200. If your deployment exposes a different public port,
+include it in `public_url`, for example `https://tc.example.com:8443`. ACME
+TLS-ALPN-01 validation still needs public port 443, or choose another supported
+challenge type.
+
 ```sh
 chmod 600 trustedcourier.yaml               # the plugin user must not read it
 docker compose build
@@ -423,6 +430,22 @@ OPENAI_API_KEY=<Agent Token>
 ```
 
 Replace `<Agent Token>` with a token from `tc token issue`; the server keeps only hashes, so it cannot print one. Presets name their SDK's variables. Other Secret Names get `<NAME>_BASE_URL` and `<NAME>_API_KEY`, or `<NAME>_USERNAME` and `<NAME>_PASSWORD` for basic auth, with the literal field filled in and left out when it is empty. Values are printed as is, without shell quoting. A Secret Name with several Upstreams needs `--upstream <name>`. `--json` prints an object of variable to value.
+
+For wildcard listeners or mapped public ports, set `agent_api.public_url` to
+the Agent API's external origin. For example, `https://tc.example.com:8443`
+makes `tc env openai` print
+`OPENAI_BASE_URL=https://tc.example.com:8443/proxy/openai/api`. In Compose, run:
+
+```sh
+docker compose exec -e TC_OPERATOR_CREDENTIAL=tcoc_... trustedcourier tc env openai
+```
+
+The URL must use HTTPS, except that literal loopback IPs may use HTTP. Credentials,
+paths beyond `/`, queries, fragments, and wildcard addresses are rejected. A final
+`/` is removed. The URL needs a TCP Agent listener and takes effect on restart.
+It changes the printed URL only; configure TLS and port forwarding separately.
+Without it, `tc env` uses the actual listener address, including its assigned
+port, and still rejects wildcard addresses and unix sockets.
 
 ### Reveal Delivery
 

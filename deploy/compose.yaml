@@ -1,7 +1,7 @@
 # TrustedCourier with the bundled OpenBao (ADR-0008). From this directory:
 #
 #   chmod 600 trustedcourier.yaml               # the plugin user must not read it
-#   # edit trustedcourier.yaml: your domain, ACME contact, Secret Names
+#   # edit trustedcourier.yaml: public_url, ACME domain/contact, Secret Names
 #   docker compose build
 #   docker compose run --rm trustedcourier tc plugin sha256 /usr/local/lib/trustedcourier/plugins/openbao
 #   # paste the hash into trustedcourier.yaml
@@ -49,7 +49,8 @@ services:
       - openbao
     ports:
       # The Agent API, over TLS with a certificate from ACME (TLS-ALPN-01
-      # arrives on 443).
+      # arrives on 443). agent_api.public_url uses this external port,
+      # not the container's port 8200.
       - "443:8200"
     volumes:
       - ./trustedcourier.yaml:/etc/trustedcourier/trustedcourier.yaml:ro
