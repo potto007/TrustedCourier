@@ -2,7 +2,7 @@
 
 This repository contains a public, experimental Claude Code CLI plugin and a `tc-claude-hook` adapter for Linux and WSL2. The hook translates documented `PreToolUse` Bash input into a `tc-exec` broker job, then replaces the Bash command with a dispatch command. It retains the other Bash fields and does not return a permission approval. The broker handles named HTTP requests through TrustedCourier Proxy Delivery when an Operator has separately enrolled a resource and Agent Token.
 
-**This is routing, not a protected Claude profile.** Claude Code hooks can fail open. The current broker confines jobs it receives, but no launcher confines the entire Claude Code process. A missing, disabled, malformed, or timed-out hook may let Bash run on the host; file tools, MCP servers, subagents, and computer tools do not pass through this hook. Interactive PTY/stdin continuation is not implemented. Do not use this development adapter as the boundary that keeps Secrets away from arbitrary agent tool code.
+**This is routing, not a protected Claude profile.** Claude Code hooks can fail open. The current broker confines jobs it receives, but no launcher confines the entire Claude Code process. A missing, disabled, malformed, or timed-out hook may let Bash run on the host; file tools, MCP servers, subagents, and computer tools do not pass through this hook. The adapter denies requested background Bash jobs; interactive PTY/stdin continuation is not implemented. Do not use this development adapter as the boundary that keeps Secrets away from arbitrary agent tool code.
 
 ## Build and inspect locally
 

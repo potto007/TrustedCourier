@@ -61,6 +61,18 @@ func run(stdin io.Reader, stdout io.Writer, getenv func(string) string, submitJo
 	if err := json.Unmarshal(event.ToolInput["command"], &command); err != nil || command == "" {
 		return errors.New("Bash command is missing")
 	}
+	var background bool
+	if raw, ok := event.ToolInput["run_in_background"]; ok {
+		if err := json.Unmarshal(raw, &background); err != nil {
+			return errors.New("invalid Bash background flag")
+		}
+	}
+	if background {
+		return json.NewEncoder(stdout).Encode(map[string]any{"hookSpecificOutput": map[string]any{
+			"hookEventName": "PreToolUse", "permissionDecision": "deny",
+			"permissionDecisionReason": "TrustedCourier broker does not support background Bash jobs",
+		}})
+	}
 	profile := getenv("TC_EXEC_CONFIG")
 	if !filepath.IsAbs(profile) {
 		return errors.New("TC_EXEC_CONFIG must be an absolute path in a protected launch")

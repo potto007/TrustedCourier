@@ -28,7 +28,7 @@ func TestRewritePreservesBashInputAndNormalPermission(t *testing.T) {
 		return ""
 	}
 	var output bytes.Buffer
-	event := `{"tool_name":"Bash","cwd":"/workspace","tool_input":{"command":"printf 'hello'\n","timeout":1234,"run_in_background":true,"description":"test"}}`
+	event := `{"tool_name":"Bash","cwd":"/workspace","tool_input":{"command":"printf 'hello'\n","timeout":1234,"run_in_background":false,"description":"test"}}`
 	err := run(strings.NewReader(event), &output, getenv, func(_ context.Context, socket, command, workdir string) (string, error) {
 		if socket != "/tmp/tc-test.sock" || command != "printf 'hello'\n" || workdir != "/workspace" {
 			t.Fatalf("unexpected request: %q %q %q", socket, command, workdir)
@@ -73,6 +73,17 @@ func TestNoRewriteOnInvalidInput(t *testing.T) {
 	})
 	if err == nil || output.Len() != 0 {
 		t.Fatalf("want error without rewrite: %v %s", err, output.String())
+	}
+}
+
+func TestBackgroundCallDeniedWithoutSubmit(t *testing.T) {
+	var output bytes.Buffer
+	err := run(strings.NewReader(`{"tool_name":"Bash","tool_input":{"command":"sleep 3","run_in_background":true}}`), &output, func(string) string { return "" }, func(context.Context, string, string, string) (string, error) {
+		t.Fatal("called submit")
+		return "", nil
+	})
+	if err != nil || !strings.Contains(output.String(), `"permissionDecision":"deny"`) {
+		t.Fatalf("want denial: %v %s", err, output.String())
 	}
 }
 
