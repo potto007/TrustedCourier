@@ -2,12 +2,14 @@
 
 ## Supported code
 
-TrustedCourier is in early development and has no tagged releases yet. We
-investigate suspected vulnerabilities in the current `main` branch. Include
-the commit or build you tested so we can identify the affected code.
+TrustedCourier is in early development. We investigate suspected vulnerabilities
+in the current `main` branch and the latest published release (starting with
+v0.1.0). Include the version and commit or build you tested so we can identify
+the affected code.
 
-There is no maintained release series or backport commitment. When releases
-exist, this section will identify which versions receive security fixes.
+Fixes land on `main` and are included in subsequent releases. Earlier releases
+are not maintained separately; there is no older-series backport commitment.
+Operators should update to the latest release when a security fix is published.
 
 ## Report a vulnerability privately
 

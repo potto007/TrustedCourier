@@ -23,6 +23,14 @@ set -- -trimpath -ldflags "-s -w" -buildvcs=false
 (cd "$src" && go build "$@" -o "$out/tc" ./cmd/tc)
 (cd "$src/plugins/openbao" && go build "$@" -o "$out/openbao-plugin" .)
 
-(cd "$out" && sha256sum tc openbao-plugin > SHA256SUMS)
+# macOS ships shasum instead of sha256sum.
+(
+  cd "$out"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum tc openbao-plugin
+  else
+    shasum -a 256 tc openbao-plugin
+  fi
+) > "$out/SHA256SUMS"
 echo "built into $out:"
 cat "$out/SHA256SUMS"
