@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/potto007/TrustedCourier/e2e/harness"
+	"github.com/potto007/TrustedCourier/internal/dnsprovider/providertest"
 )
 
 // The zone and names the DNS-01 tests issue for. Pebble resolves them
@@ -136,5 +137,41 @@ func TestACMEReportsRefusedDNSCredentials(t *testing.T) {
 	}
 	if left := ns.TXT("_acme-challenge." + dnsDomain); len(left) != 0 {
 		t.Errorf("DNS-01 records set with refused credentials: %v", left)
+	}
+}
+
+func TestACMECleansUpAfterDNSPropagationTimeout(t *testing.T) {
+	tc := harness.New(t)
+	ns := tc.StartNameServer()
+	// The provider accepts the records but never publishes them to DNS.
+	records := providertest.NewRecords(dnsZone, "other.test")
+	provider := tc.StartDNSProviders(records)[0]
+	pebble := tc.StartPebble(harness.PebbleOptions{Resolver: ns.Addr})
+	agentAPI, secrets := acmeDNSConfig(harness.FreePort(t), pebble, ns, provider, "["+dnsDomain+", courier.other.test]")
+	agentAPI = strings.Replace(agentAPI, "        resolvers:", "        propagation_timeout: 1s\n        resolvers:", 1)
+	srv, _ := startACME(t, tc, harness.FakePlugin, agentAPI, secrets)
+	srv.ListeningAgentURL()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		status := srv.TC("status").Stdout
+		if strings.Contains(status, "TLS certificate: not loaded (") && strings.Contains(status, "the TXT record did not appear within 1s") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tc status never reported propagation timeout:\n%s\nstderr:\n%s", status, srv.Stderr())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := strings.Count(srv.Stderr(), "DNS-01 record set"); n != 2 {
+		t.Fatalf("set %d DNS records before timeout, want 2:\n%s", n, srv.Stderr())
+	}
+	for _, domain := range []string{dnsDomain, "courier.other.test"} {
+		name := "_acme-challenge." + domain
+		if !strings.Contains(srv.Stderr(), name) {
+			t.Errorf("DNS record %s was never logged as set:\n%s", name, srv.Stderr())
+		}
+		if left := records.TXT(name); len(left) != 0 {
+			t.Errorf("DNS-01 records left after propagation timeout: %s: %v", name, left)
+		}
 	}
 }
