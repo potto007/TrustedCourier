@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+if [ -z "${TC_CLAUDE_HOOK_BINARY:-}" ] || [ ! -x "$TC_CLAUDE_HOOK_BINARY" ]; then
+  echo 'TrustedCourier: set TC_CLAUDE_HOOK_BINARY to the installed adapter binary' >&2
+  exit 1
+fi
+exec "$TC_CLAUDE_HOOK_BINARY"

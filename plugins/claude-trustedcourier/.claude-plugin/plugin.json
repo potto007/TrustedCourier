@@ -1,0 +1,7 @@
+{
+  "name": "trustedcourier",
+  "version": "0.1.0-dev",
+  "description": "Route Claude Code Bash work through a local TrustedCourier execution profile",
+  "author": { "name": "TrustedCourier contributors" },
+  "homepage": "https://github.com/potto007/TrustedCourier"
+}

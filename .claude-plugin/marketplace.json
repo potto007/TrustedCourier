@@ -1,0 +1,11 @@
+{
+  "name": "trustedcourier",
+  "owner": { "name": "TrustedCourier contributors" },
+  "plugins": [
+    {
+      "name": "trustedcourier",
+      "source": "./plugins/claude-trustedcourier",
+      "description": "Claude Code adapter for the local TrustedCourier execution profile"
+    }
+  ]
+}
