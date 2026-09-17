@@ -98,24 +98,44 @@ jobs:
           # The plugin's hash must agree with the same helper Operators use.
           test "$(./tc plugin sha256 ./openbao-plugin)" = "sha256: $(awk '/openbao-plugin$/ {print $1}' SHA256SUMS)"
           GODEBUG=fips140=on ./tc plugin sha256 ./openbao-plugin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.platform }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [validate, test, build]
+  assemble:
+    needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
+      - name: Assemble and verify complete asset set
+        run: |
+          cd dist
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 4
+          sha256sum ./*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-bundle
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [validate, test, assemble]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-bundle
+          path: dist
       - name: Create release and upload complete asset set
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,7 +144,7 @@ jobs:
         run: |
           cd dist
           test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 4
-          sha256sum ./*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
           # Never overwrite an existing release. A failed upload leaves a draft
           # for inspection; delete that draft before rerunning this job.
           args=(--draft --verify-tag --generate-notes --title "$VERSION")
