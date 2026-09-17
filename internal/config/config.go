@@ -674,6 +674,9 @@ func (raw fileConfig) validate(baseDir string) (*Config, error) {
 	if err := raw.Audit.validate(cfg); err != nil {
 		return nil, err
 	}
+	if err := cfg.validateCourierKeyLocations(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -755,13 +758,30 @@ func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 			return err
 		}
 		cfg.AgentAPI.TLS = &AgentTLS{Certificate: cert, Key: key}
-		keys := []namedCourierKey{{"agent_api.tls.certificate", cert}, {"agent_api.tls.key", key}}
 		if a.TLS.ACME != nil {
 			acme, err := a.TLS.ACME.validate(cfg, baseDir, a.Listen)
 			if err != nil {
 				return err
 			}
 			cfg.AgentAPI.TLS.ACME = &acme
+		}
+	}
+	return nil
+}
+
+type namedCourierKey struct {
+	name string
+	key  CourierKey
+}
+
+// validateCourierKeyLocations runs after all Courier Key references are
+// validated, including audit.signing_key. Comparing the whole reference
+// preserves distinct fields of the same Backend record.
+func (cfg *Config) validateCourierKeyLocations() error {
+	var keys []namedCourierKey
+	if agent := cfg.AgentAPI.TLS; agent != nil {
+		keys = append(keys, namedCourierKey{"agent_api.tls.certificate", agent.Certificate}, namedCourierKey{"agent_api.tls.key", agent.Key})
+		if acme := agent.ACME; acme != nil {
 			keys = append(keys, namedCourierKey{"agent_api.tls.acme.account_key", acme.AccountKey})
 			if acme.EAB != nil {
 				keys = append(keys, namedCourierKey{"agent_api.tls.acme.external_account_binding.hmac_key", acme.EAB.HMACKey})
@@ -772,31 +792,29 @@ func (a fileAgentAPI) validate(cfg *Config, baseDir string) error {
 				}
 			}
 		}
-		// The remote admin listener shares the pair whole, or names its own
-		// locations; ACME writes the Agent API's, so a partial overlap would
-		// pair a certificate with the wrong key or overwrite the admin pair.
-		if admin := cfg.Admin.TLS; admin != nil && !cfg.SharesAgentCertificate() {
-			if admin.Certificate == cert || admin.Key == key {
-				return errors.New("admin.tls shares only one of agent_api.tls.certificate and agent_api.tls.key; name both to share the Agent API's certificate, or neither")
-			}
-			keys = append(keys, namedCourierKey{"admin.tls.certificate", admin.Certificate}, namedCourierKey{"admin.tls.key", admin.Key})
+	}
+	// The remote admin listener shares the pair whole, or names its own
+	// locations; ACME writes the Agent API's, so a partial overlap would
+	// pair a certificate with the wrong key or overwrite the admin pair.
+	if admin := cfg.Admin.TLS; admin != nil && !cfg.SharesAgentCertificate() {
+		if agent := cfg.AgentAPI.TLS; agent != nil && (admin.Certificate == agent.Certificate || admin.Key == agent.Key) {
+			return errors.New("admin.tls shares only one of agent_api.tls.certificate and agent_api.tls.key; name both to share the Agent API's certificate, or neither")
 		}
-		// ACME writes the certificate and key locations, so each Courier
-		// Key needs its own.
-		for i, k := range keys {
-			for _, other := range keys[:i] {
-				if k.key == other.key {
-					return fmt.Errorf("%s and %s name the same location; each Courier Key needs its own", other.name, k.name)
-				}
+		keys = append(keys, namedCourierKey{"admin.tls.certificate", admin.Certificate}, namedCourierKey{"admin.tls.key", admin.Key})
+	}
+	if cfg.Audit.SigningKey != nil {
+		keys = append(keys, namedCourierKey{"audit.signing_key", *cfg.Audit.SigningKey})
+	}
+	// ACME writes certificate and key locations, so incompatible Courier
+	// Keys must never name the same Backend location.
+	for i, k := range keys {
+		for _, other := range keys[:i] {
+			if k.key == other.key {
+				return fmt.Errorf("%s and %s name the same location; each Courier Key needs its own", other.name, k.name)
 			}
 		}
 	}
 	return nil
-}
-
-type namedCourierKey struct {
-	name string
-	key  CourierKey
 }
 
 // sameBind reports whether two IP address and port strings would bind the
