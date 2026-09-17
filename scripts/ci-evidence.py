@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Reuse recent acceptance only for a proven, unchanged normal merge result.
 
-No artifacts or log claims are evidence. GitHub supplies run/job identity; Git
-supplies full content identity. Unsupported cases deliberately run full tests.
+No PR artifacts or log claims are evidence. GitHub supplies run/job identity;
+a trusted default-branch receipt preserves association, and Git identifies content. Unsupported cases deliberately run full tests.
 """
 import datetime as dt
 import json
@@ -47,7 +47,7 @@ def newest_pr_run(runs, head, repo):
     eligible = [run for run in runs
                 if run.get("head_sha") == head and run.get("event") == "pull_request"
                 and run.get("path") == ".github/workflows/ci.yml"
-                and run.get("head_repository", {}).get("full_name") == repo]
+                and (run.get("head_repository") or {}).get("full_name") == repo]
     return max(eligible, key=lambda run: run["id"], default=None)
 
 
@@ -68,13 +68,13 @@ def merge_identity(sha):
     if git("diff", "--name-only", base, sha, "--", *GUARDS):
         raise ValueError("acceptance/provenance definitions changed")
     entries = git("ls-tree", "-r", sha).splitlines()
-    if any(line.startswith("160000 ") or line.endswith("\t.gitmodules")
+    if any(line.startswith(("120000 ", "160000 ")) or line.endswith("\t.gitmodules")
            or line.endswith("\t.gitattributes") or line.endswith("/.gitattributes") for line in entries):
-        raise ValueError("submodule/filter inputs require full validation")
+        raise ValueError("symlink/submodule/filter inputs require full validation")
     return base, head, tree
 
 
-def receipt_for(run, pr, base, head, repo):
+def receipt_for(run, pr, base, head, sha, repo):
     # GitHub clears run->PR associations after merge. A default-branch-only
     # workflow_run producer captures the server event before that happens.
     # It executes no PR code and consumes no PR artifacts. Restrict the artifact
@@ -101,7 +101,8 @@ def receipt_for(run, pr, base, head, repo):
         producer_sha = receipt["producer_sha"]
         if not re.fullmatch(r"[0-9a-f]{40}", producer_sha):
             continue
-        subprocess.run(["git", "merge-base", "--is-ancestor", producer_sha, base], check=True)
+        git("cat-file", "-e", f"{producer_sha}:.github/workflows/acceptance-receipt.yml")
+        subprocess.run(["git", "merge-base", "--is-ancestor", producer_sha, sha], check=True)
         if git("diff", "--name-only", producer_sha, base, "--", *GUARDS):
             continue
         associations = recorded.get("pull_requests", [])
@@ -121,7 +122,7 @@ def prove_pr(sha, repo, now=None):
                and pr.get("base", {}).get("ref") == "main"
                and pr.get("base", {}).get("sha") == base
                and pr.get("head", {}).get("sha") == head
-               and pr.get("head", {}).get("repo", {}).get("full_name") == repo]
+               and (pr.get("head", {}).get("repo") or {}).get("full_name") == repo]
     if len(matches) != 1:
         raise ValueError("no unique same-repository merged PR")
     response = api(f"repos/{repo}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}&per_page=100")
@@ -134,7 +135,7 @@ def prove_pr(sha, repo, now=None):
         raise ValueError("PR evidence is older than 24 hours or future-dated")
     if not all_jobs_passed(jobs_for(run, repo)):
         raise ValueError("PR did not execute all six acceptance jobs")
-    receipt_id = receipt_for(run, matches[0], base, head, repo)
+    receipt_id = receipt_for(run, matches[0], base, head, sha, repo)
     return {"receipt_id": receipt_id, "run_id": run["id"], "attempt": run["run_attempt"], "head": head,
             "tree": tree, "url": run["html_url"]}
 
@@ -145,7 +146,7 @@ def plan(sha):
         try:
             proof = prove_pr(sha, os.environ["GH_REPO"])
             break
-        except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
+        except (ValueError, KeyError, TypeError, AttributeError, OSError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
             # A maintainer may merge immediately after CI completes, before the
             # independent default-branch receipt finishes. Bound that race.
             if str(error).startswith("no trusted completion receipt") and attempt < 3:

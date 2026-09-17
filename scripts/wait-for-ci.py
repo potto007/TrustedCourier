@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed unless the exact release commit passed all six main CI jobs."""
+"""Verify exact-commit main acceptance, including any trusted PR evidence chain."""
 import json
 import datetime as dt
 import os
@@ -60,8 +60,11 @@ def main():
                     raise SystemExit("Main CI has neither full acceptance nor a successful evidence gate")
                 # Reconstruct the chain independently; do not trust main's log
                 # message, output flag, or an uploaded PR artifact.
+                # Required PR jobs can finish just before the overall PR run,
+                # allowing main to start first. Its completed evidence gate is
+                # the server timestamp after provenance was actually checked.
                 proof = runpy.run_path(str(Path(__file__).with_name("ci-evidence.py")))["prove_pr"](
-                    sha, repo, now=dt.datetime.fromisoformat(run["created_at"].replace("Z", "+00:00")))
+                    sha, repo, now=dt.datetime.fromisoformat(gates[0]["completed_at"].replace("Z", "+00:00")))
                 print(f"Verified prior PR acceptance: {proof['url']}")
             print(f"Verified main CI for {sha}: {run['html_url']}")
             return

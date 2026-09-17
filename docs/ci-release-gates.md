@@ -47,7 +47,7 @@ Go test was found reading Git history or GitHub event metadata. A test requiring
 those inputs must revise this contract, triggering full validation on that change.
 Release binaries retain their ordinary packaging and version checks.
 
-Squash/rebase merges, forks, conflicting or changed merge results, submodules,
+Squash/rebase merges, forks, conflicting or changed merge results, symlinks, submodules,
 Git attributes/filters (including LFS), changed workflow/evidence definitions,
 stale or missing evidence, ambiguous associations and API errors fall back to
 full acceptance. Full-tree identity is conservative: unrelated docs changes also
@@ -84,8 +84,9 @@ main test successes or a successful main evidence gate plus an independently
 reconstructed PR/receipt/tree chain. Reused tests are reported as provenance in
 the main job summary; they are not relabeled as newly executed tests.
 
-Receipt age is evaluated at the main run's start for later releases, not at the
-release date. If old receipts were deleted or expired, rerun that main CI: absent
+Receipt age is evaluated at the successful main evidence gate's completion for
+later releases, not at the release date or the main run's earlier start. The PR
+workflow may finish moments after main starts once required jobs pass. If old receipts were deleted or expired, rerun that main CI: absent
 proof makes it execute full acceptance, which release can verify normally. An
 API error or unknown state never authorizes publication. Binaries and checksums
 are always built in the release run; no PR binary artifact is promoted.

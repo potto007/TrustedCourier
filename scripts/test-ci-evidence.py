@@ -32,6 +32,7 @@ class MergeEvidenceTests(unittest.TestCase):
         Path("scripts/ci-evidence.py").write_text("trusted contract")
         Path(".github/workflows").mkdir(parents=True)
         Path(".github/workflows/ci.yml").write_text("trusted workflow")
+        Path(".github/workflows/acceptance-receipt.yml").write_text("trusted receipt producer")
         self.git("add", ".")
         self.git("commit", "-qm", "base")
         self.base = self.git("rev-parse", "HEAD")
@@ -77,18 +78,24 @@ class MergeEvidenceTests(unittest.TestCase):
             archive.writestr("receipt.json", json.dumps(dict(producer_sha=self.base, run=run)))
         return out.getvalue()
 
-    def prove(self):
+    def prove(self, now=NOW):
         original = subprocess.check_output
         def output(args, **kwargs):
             if args[0] == "gh" and args[-1].endswith("/zip"):
                 return self.archive()
             return original(args, **kwargs)
         with patch("subprocess.check_output", side_effect=output), patch.dict(code["prove_pr"].__globals__, {"api": self.api}):
-            return code["prove_pr"](self.sha, REPO, now=NOW)
+            return code["prove_pr"](self.sha, REPO, now=now)
 
     def test_distinct_commit_identical_tree_reuses(self):
         self.assertNotEqual(self.sha, self.head)
         self.assertEqual(self.prove()["tree"], self.git("rev-parse", "HEAD^{tree}"))
+
+    def test_pr_finishing_after_main_start_valid_at_gate_completion(self):
+        self.run["updated_at"] = "2026-09-17T00:00:02Z"
+        with self.assertRaisesRegex(ValueError, "future-dated"):
+            self.prove(now=NOW)
+        self.assertEqual(self.prove(now=NOW + dt.timedelta(seconds=5))["run_id"], 10)
 
     def test_different_tree_falls_back(self):
         Path("code.txt").write_text("different merge result")
@@ -121,6 +128,21 @@ class MergeEvidenceTests(unittest.TestCase):
         self.git("commit", "-qm", "add filter")
         self.merge()
         with self.assertRaisesRegex(ValueError, "submodule/filter"):
+            self.prove()
+
+    def test_external_symlink_rejected(self):
+        self.git("reset", "--hard", self.base)
+        self.git("checkout", "-q", "feature")
+        Path("external").symlink_to("/outside-input")
+        self.git("add", ".")
+        self.git("commit", "-qm", "add external input")
+        self.merge()
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.prove()
+
+    def test_deleted_fork_metadata_falls_back(self):
+        self.pr["head"]["repo"] = None
+        with self.assertRaisesRegex(ValueError, "unique"):
             self.prove()
 
     def test_fork_wrong_sha_wrong_workflow_and_event_rejected(self):

@@ -76,14 +76,14 @@ class EvidenceTests(unittest.TestCase):
     def test_main_reuse_requires_reconstructed_chain(self):
         completed = dict(self.run, status="completed", conclusion="success", run_attempt=1,
                          created_at="2026-09-17T00:00:00Z", html_url="https://example.test/main")
-        jobs = {"total_count": 1, "jobs": [dict(name="acceptance evidence", status="completed", conclusion="success")]}
+        jobs = {"total_count": 1, "jobs": [dict(name="acceptance evidence", status="completed", conclusion="success", completed_at="2026-09-17T00:00:05Z")]}
         calls = []
         def proof(sha, repo, now):
             calls.append((sha, repo, now.isoformat()))
             return {"url": "https://example.test/pr"}
         with patch("runpy.run_path", return_value={"prove_pr": proof}):
             self.invoke({"workflow_runs": [completed]}, jobs)
-        self.assertEqual(calls, [(SHA, REPO, "2026-09-17T00:00:00+00:00")])
+        self.assertEqual(calls, [(SHA, REPO, "2026-09-17T00:00:05+00:00")])
         def reject(*args, **kwargs):
             raise ValueError("forged provenance")
         with patch("runpy.run_path", return_value={"prove_pr": reject}), self.assertRaises(ValueError):
