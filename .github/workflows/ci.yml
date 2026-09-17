@@ -4,14 +4,52 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  merge_group:
+    types: [checks_requested]
   workflow_call:
 
 permissions:
   contents: read
 
+# Only superseded PR work is disposable. Never cancel main or queue evidence.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  workflow-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 scripts/test-wait-for-ci.py
+
+  draft:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft
+    name: draft feedback (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [".", sdk/plugin, plugins/openbao]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    env:
+      GOFIPS140: certified
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: "**/go.sum"
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go build ./...
+
   test:
-    name: test (${{ matrix.module }}, fips140=${{ matrix.fips140 }})
+    # Draft skips MUST NOT report success under the six required check names.
+    name: ${{ github.event.pull_request.draft && 'draft deferred' || 'test' }} (${{ matrix.module }}, fips140=${{ matrix.fips140 }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -149,7 +149,8 @@ tests were needed.
    addresses an issue, add its trailer with
    `git commit -s --trailer "Github-Issue:#123"`.
 2. Push your branch to your fork and open a PR against `potto007/TrustedCourier`'s
-   `main` branch. Draft PRs are useful for work that needs early feedback.
+   `main` branch. Draft PRs receive format, vet, and build feedback. Mark the PR ready for review
+   to run the full required acceptance suite. See [CI and release gates](../docs/ci-release-gates.md).
 3. Explain the change, link the issue, and list the checks you ran. Use
    `Closes #123` only when the PR fully addresses that issue.
 4. Keep your branch current with `main` and respond to review comments. The DCO

@@ -8,6 +8,8 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/release.yml"
       - "scripts/*release*"
+      - "scripts/wait-for-ci.py"
+      - "scripts/test-wait-for-ci.py"
       - "go.mod"
       - "go.sum"
       - "sdk/plugin/**"
@@ -48,11 +50,24 @@ jobs:
           PY
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  # A tag is tested from scratch; a prior successful run on another commit
-  # cannot authorize publication. PRs already receive the ordinary CI workflow.
+  # Reuse only main push CI for this exact commit. PR checks cannot authorize
+  # release, and latest-main success is irrelevant if the tag is older.
   test:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    uses: ./.github/workflows/ci.yml
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Wait for exact-commit main CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/wait-for-ci.py "$(git rev-parse HEAD)"
 
   build:
     needs: validate
