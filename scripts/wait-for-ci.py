@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Fail closed unless the exact release commit passed all six main CI jobs."""
 import json
+import datetime as dt
 import os
 import re
+import runpy
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -49,8 +52,17 @@ def main():
             if run["conclusion"] != "success":
                 raise SystemExit(f"Main CI failed: {run['html_url']}")
             result = api(f"repos/{repo}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100")
-            if result["total_count"] != len(result["jobs"]) or not passed_jobs(result["jobs"]):
-                raise SystemExit("Main CI did not successfully execute all six required jobs")
+            if result["total_count"] != len(result["jobs"]):
+                raise SystemExit("Truncated main job evidence")
+            if not passed_jobs(result["jobs"]):
+                gates = [j for j in result["jobs"] if j.get("name") == "acceptance evidence"]
+                if len(gates) != 1 or gates[0].get("conclusion") != "success" or gates[0].get("status") != "completed":
+                    raise SystemExit("Main CI has neither full acceptance nor a successful evidence gate")
+                # Reconstruct the chain independently; do not trust main's log
+                # message, output flag, or an uploaded PR artifact.
+                proof = runpy.run_path(str(Path(__file__).with_name("ci-evidence.py")))["prove_pr"](
+                    sha, repo, now=dt.datetime.fromisoformat(run["created_at"].replace("Z", "+00:00")))
+                print(f"Verified prior PR acceptance: {proof['url']}")
             print(f"Verified main CI for {sha}: {run['html_url']}")
             return
         print(f"Waiting for main push CI at {sha}", flush=True)

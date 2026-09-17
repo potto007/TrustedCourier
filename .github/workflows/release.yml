@@ -9,6 +9,7 @@ on:
       - ".github/workflows/release.yml"
       - "scripts/*release*"
       - "scripts/wait-for-ci.py"
+      - "scripts/*ci-evidence.py"
       - "scripts/test-wait-for-ci.py"
       - "go.mod"
       - "go.sum"
@@ -59,10 +60,12 @@ jobs:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Wait for exact-commit main CI
         env:
           GH_TOKEN: ${{ github.token }}
