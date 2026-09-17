@@ -26,10 +26,16 @@ type Record struct {
 // WaitPropagated waits until every name server answers a TXT query for each
 // record with its value, so the CA's validation is asked for only once it
 // can succeed. One cfg.PropagationTimeout covers all the records. The
-// servers are cfg.Resolvers, or the zone's authoritative name servers found
+// servers are cfg.Resolvers, or each record's authoritative name servers found
 // through the system resolver; the system resolver itself is never asked,
 // since it caches a negative answer for longer than the wait.
 func WaitPropagated(ctx context.Context, cfg config.DNS, records []Record) error {
+	return waitPropagated(ctx, cfg, records, authoritativeServers)
+}
+
+// discover returns the authoritative servers for a record name. Tests supply
+// local DNS servers so they exercise propagation without public DNS or port 53.
+func waitPropagated(ctx context.Context, cfg config.DNS, records []Record, discover func(context.Context, string) ([]string, error)) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -39,18 +45,25 @@ func WaitPropagated(ctx context.Context, cfg config.DNS, records []Record) error
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	servers := cfg.Resolvers
-	if len(servers) == 0 {
-		var err error
-		if servers, err = authoritativeServers(ctx, records[0].Name); err != nil {
-			return fmt.Errorf("%w; set agent_api.tls.acme.dns.resolvers to name servers to check the record on", err)
+	serversByName := make(map[string][]string, len(records))
+	for _, r := range records {
+		if _, ok := serversByName[r.Name]; ok {
+			continue
 		}
+		servers := cfg.Resolvers
+		if len(servers) == 0 {
+			var err error
+			if servers, err = discover(ctx, r.Name); err != nil {
+				return fmt.Errorf("%w; set agent_api.tls.acme.dns.resolvers to name servers to check the record on", err)
+			}
+		}
+		serversByName[r.Name] = servers
 	}
 	for {
 		var missing []string
 		var lastErr error
 		for _, r := range records {
-			for _, server := range servers {
+			for _, server := range serversByName[r.Name] {
 				values, err := lookupTXT(ctx, server, r.Name)
 				if err != nil {
 					lastErr = err
