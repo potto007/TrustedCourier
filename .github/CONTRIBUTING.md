@@ -4,6 +4,56 @@ Bug reports, fixes, tests, documentation, and Backend Plugins are welcome.
 TrustedCourier is in early development; the [v1 spec](https://github.com/potto007/TrustedCourier/issues/1)
 tracks its intended scope.
 
+Participation follows the [Code of Conduct](CODE_OF_CONDUCT.md). Report suspected
+vulnerabilities through the private route in the [security policy](SECURITY.md).
+
+## Contributor signoff
+
+Human authors, including the maintainer, must certify their contributions under
+the [Developer Certificate of Origin 1.1](https://developercertificate.org/).
+Read it before adding a `Signed-off-by` trailer to each authored commit:
+
+```sh
+git commit -s -m "fix: describe the change" --trailer "Github-Issue:#123"
+```
+
+Omit the issue trailer when no issue applies. `-s` records your name and email
+from Git configuration. Check that they identify you before committing. The
+signoff is a public, lasting record; a GitHub noreply email is acceptable when
+it matches your commit identity. A DCO signoff is a rights attestation, separate
+from a cryptographic commit signature or GitHub's Verified badge.
+
+By signing off, you certify that you may submit the work under the applicable
+license. Code and documentation use [Apache-2.0](../LICENSE) unless a file states
+another license; the Code of Conduct retains its CC BY-SA 4.0 license. Confirm
+any required employer permission. Preserve third-party licenses and attribution,
+and raise unclear rights with the maintainer before submitting the material.
+
+For AI-assisted contributions, a human must review the result, its sources and
+licenses, and their authority to submit it, then authorize their own signoff.
+A tool must not add someone else's certification without that authorization.
+
+Each human co-author must supply a signoff as well as any `Co-authored-by` credit.
+The DCO app checks commit metadata; it does not establish ownership or verify
+every co-author's certification. Maintainers review those cases before merge.
+
+If your latest commit is missing your signoff, and you can make the certification:
+
+```sh
+git commit --amend --no-edit --signoff
+git push --force-with-lease
+```
+
+For several unsigned commits, use interactive rebase to edit and sign only the
+commits you can certify, then push with `--force-with-lease`. Coordinate before
+rewriting a shared contribution branch. Keep the original authors and their
+signoffs; never sign for someone else. Published `main` history is not rewritten.
+
+The DCO check must pass alongside CI before merge. Web commits require signoff
+through GitHub's editor. When squashing a PR, preserve the authors' signoffs in
+the final commit message. Automated bot and merge commits are exempt from the
+app's metadata check; human-authored material still needs a human certification.
+
 ## Find or propose work
 
 Search [existing issues](https://github.com/potto007/TrustedCourier/issues) before
@@ -97,15 +147,16 @@ tests were needed.
 1. Use a short, imperative Conventional Commit subject, such as
    `fix: reject invalid backend locations`, within 50 characters. When a commit
    addresses an issue, add its trailer with
-   `git commit --trailer "Github-Issue:#123"`.
+   `git commit -s --trailer "Github-Issue:#123"`.
 2. Push your branch to your fork and open a PR against `potto007/TrustedCourier`'s
    `main` branch. Draft PRs are useful for work that needs early feedback.
 3. Explain the change, link the issue, and list the checks you ran. Use
    `Closes #123` only when the PR fully addresses that issue.
-4. Keep your branch current with `main` and respond to review comments. All six
-   CI checks must pass and review conversations must be resolved before merge.
+4. Keep your branch current with `main` and respond to review comments. The DCO
+   check and all six CI checks must pass, and review conversations must be
+   resolved before merge.
 
 Discuss the code and its behavior respectfully. Be specific when reporting a
 problem or suggesting a change, and allow time for maintainer review.
 
-The project uses the [Apache License 2.0](../LICENSE).
+Maintainers should follow the [contribution and security procedures](../docs/maintainers/community-policies.md).

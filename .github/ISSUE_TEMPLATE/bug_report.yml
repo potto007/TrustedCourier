@@ -5,8 +5,13 @@ body:
   - type: markdown
     attributes:
       value: |
+        Report suspected vulnerabilities through
+        [private vulnerability reporting](https://github.com/potto007/TrustedCourier/security/advisories/new),
+        not this public form. See the [security policy](https://github.com/potto007/TrustedCourier/security/policy).
+
         Search existing issues first. Use made-up Secrets and remove credentials
         from configs and logs before posting them.
+        Participation follows the [Code of Conduct](https://github.com/potto007/TrustedCourier/blob/main/.github/CODE_OF_CONDUCT.md).
   - type: input
     id: version
     attributes:

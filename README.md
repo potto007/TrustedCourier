@@ -792,6 +792,11 @@ Bug reports, fixes, tests, documentation, and Backend Plugins are welcome. See t
 workflow. Use [GitHub Issues](https://github.com/potto007/TrustedCourier/issues/new/choose)
 to report a bug or propose a feature.
 
+Contributions require [DCO signoffs](.github/CONTRIBUTING.md#contributor-signoff),
+and participation follows the [Code of Conduct](.github/CODE_OF_CONDUCT.md).
+Report suspected vulnerabilities privately using the
+[security policy](.github/SECURITY.md).
+
 ## Development
 
 Run the checks CI runs, in each module (`.`, `sdk/plugin`, `plugins/openbao`):
