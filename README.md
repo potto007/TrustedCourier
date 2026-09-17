@@ -203,6 +203,8 @@ For a demo on one machine, with no domain and nothing persistent, [`compose.dev.
 
 Outside containers, [`scripts/build-release.sh`](scripts/build-release.sh) builds `tc` and the OpenBao plugin as static, stripped binaries against the validated FIPS 140-3 module, with a `SHA256SUMS` in the form the config pins, and `tc init` runs the same way against any OpenBao whose config has a `seal "static"` reading the key file you name.
 
+See [Release automation](docs/releases.md) for downloadable package contents, verification, and the tag-driven publishing process.
+
 ### Backend Plugins
 
 A Backend Plugin is a separate binary. Pin it by hash:

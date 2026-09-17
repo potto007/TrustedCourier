@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/*release*"
+      - "go.mod"
+      - "go.sum"
+      - "sdk/plugin/**"
+      - "plugins/openbao/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: version
+        name: Validate tag and source
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=v0.0.0-preview
+          if [[ "$REF_TYPE" == tag ]]; then
+            version="$REF_NAME"
+            git merge-base --is-ancestor HEAD origin/main
+          fi
+          python3 - "$version" <<'PY'
+          import runpy, sys
+          runpy.run_path("scripts/package-release.py")["validate_version"](sys.argv[1])
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # A tag is tested from scratch; a prior successful run on another commit
+  # cannot authorize publication. PRs already receive the ordinary CI workflow.
+  test:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux_amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux_arm64
+          - runner: macos-15-intel
+            platform: darwin_amd64
+          - runner: macos-15
+            platform: darwin_arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+      - name: Build and package
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+          GOFIPS140: certified
+        run: |
+          sh scripts/build-release.sh build/release
+          python3 scripts/test-package-release.py build/release "$PLATFORM"
+          python3 scripts/package-release.py "$VERSION" "$PLATFORM" build/release dist
+      - name: Smoke test extracted archive
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir extracted
+          tar -xzf "dist/trustedcourier_${VERSION}_${PLATFORM}.tar.gz" -C extracted
+          cd "extracted/trustedcourier_${VERSION}_${PLATFORM}"
+          shasum -a 256 -c SHA256SUMS
+          # The plugin's hash must agree with the same helper Operators use.
+          test "$(./tc plugin sha256 ./openbao-plugin)" = "sha256: $(awk '/openbao-plugin$/ {print $1}' SHA256SUMS)"
+          GODEBUG=fips140=on ./tc plugin sha256 ./openbao-plugin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [validate, test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create release and upload complete asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          cd dist
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 4
+          sha256sum ./*.tar.gz > SHA256SUMS
+          # Never overwrite an existing release. A failed upload leaves a draft
+          # for inspection; delete that draft before rerunning this job.
+          args=(--draft --verify-tag --generate-notes --title "$VERSION")
+          if [[ "$VERSION" == *-* ]]; then args+=(--prerelease); fi
+          gh release create "$VERSION" "${args[@]}" ./*.tar.gz SHA256SUMS
+          gh release edit "$VERSION" --draft=false
