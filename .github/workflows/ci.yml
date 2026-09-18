@@ -128,6 +128,19 @@ jobs:
         with:
           go-version-file: ${{ matrix.module }}/go.mod
           cache-dependency-path: "**/go.sum"
+      - name: Install shell confinement dependency
+        if: matrix.module == '.'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Enable unprivileged user namespaces on ephemeral runner
+        if: matrix.module == '.' && runner.environment == 'github-hosted'
+        run: |
+          userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [ -n "$userns" ] && [ "$userns" != 1 ]; then sudo sysctl -w kernel.unprivileged_userns_clone=1; fi
+          apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [ -n "$apparmor" ] && [ "$apparmor" != 0 ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+      - name: Verify shell confinement prerequisites
+        if: matrix.module == '.'
+        run: go test -run TestSandboxDeniesInternetSocketFamilies -count=1 ./cmd/tc-exec
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: go vet
