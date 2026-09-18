@@ -1,0 +1,12 @@
+{
+  "name": "trustedcourier",
+  "description": "TrustedCourier integrations for agent tool execution",
+  "owner": { "name": "TrustedCourier contributors" },
+  "plugins": [
+    {
+      "name": "trustedcourier",
+      "source": "./plugins/claude-trustedcourier",
+      "description": "Claude Code adapter for the local TrustedCourier execution profile"
+    }
+  ]
+}
