@@ -1,6 +1,6 @@
 ---
 name: use
-description: Use registered TrustedCourier operations from a protected Claude Code Linux session.
+description: Use registered TrustedCourier operations from an experimental Claude Code Linux session.
 ---
 
 # Use TrustedCourier
