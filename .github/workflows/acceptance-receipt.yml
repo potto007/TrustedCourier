@@ -1,0 +1,35 @@
+name: Acceptance receipt
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  receipt:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      # Never checkout PR code or download PR artifacts in this workflow.
+      - name: Record GitHub completion event
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          Path('receipt.json').write_text(json.dumps({
+              'producer_sha': os.environ['WORKFLOW_SHA'],
+              'run': event['workflow_run'],
+          }))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: acceptance-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: receipt.json
+          retention-days: 90
+          if-no-files-found: error

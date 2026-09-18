@@ -4,15 +4,101 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  merge_group:
+    types: [checks_requested]
   workflow_call:
 
 permissions:
   contents: read
 
+# Only superseded PR work is disposable. Never cancel main or queue evidence.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test:
-    name: test (${{ matrix.module }}, fips140=${{ matrix.fips140 }})
+  reuse:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      reuse: ${{ steps.proof.outputs.reuse }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: proof
+        name: Verify prior acceptance evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/ci-evidence.py plan "$(git rev-parse HEAD)"
+
+  acceptance:
+    name: acceptance evidence
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    needs: [reuse, test]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require executed tests or verified provenance
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          REUSE_RESULT: ${{ needs.reuse.result }}
+          REUSE: ${{ needs.reuse.outputs.reuse }}
+        run: |
+          [[ "$TEST_RESULT" == success ]] || [[ "$REUSE_RESULT" == success && "$REUSE" == true ]]
+
+  workflow-policy:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 scripts/test-wait-for-ci.py
+      - run: python3 scripts/test-ci-evidence.py
+
+  draft:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft
+    name: draft feedback (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [".", sdk/plugin, plugins/openbao]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    env:
+      GOFIPS140: certified
+      GOFLAGS: -buildvcs=false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify PR includes its base and remove commit metadata
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ -n "$BASE_SHA" ]]; then git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$BASE_SHA" HEAD; fi
+          rm -rf "$GITHUB_WORKSPACE/.git"
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: "**/go.sum"
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go build ./...
+
+  test:
+    # Draft skips MUST NOT report success under the six required check names.
+    name: ${{ github.event.pull_request.draft && 'draft deferred' || 'test' }} (${{ matrix.module }}, fips140=${{ matrix.fips140 }})
+    needs: reuse
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.reuse.outputs.reuse != 'true' }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -25,8 +111,19 @@ jobs:
       # Build against Go's validated FIPS 140-3 module, as release builds
       # do. tc pins the mode off by default; the matrix sets it explicitly.
       GOFIPS140: certified
+      GOFLAGS: -buildvcs=false
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify PR includes its base and remove commit metadata
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ -n "$BASE_SHA" ]]; then git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$BASE_SHA" HEAD; fi
+          rm -rf "$GITHUB_WORKSPACE/.git"
       - uses: actions/setup-go@v6
         with:
           go-version-file: ${{ matrix.module }}/go.mod
@@ -42,7 +139,11 @@ jobs:
           # container with docker and must never silently skip in CI.
           TC_REQUIRE_OPENBAO: "1"
         # The e2e package alone runs close to go test's default 10m limit.
-        run: go test -race -timeout 30m ./...
+        run: >-
+          env -i "PATH=$PATH" "HOME=$HOME" "TMPDIR=$RUNNER_TEMP"
+          GOFIPS140=certified GOFLAGS=-buildvcs=false
+          "GODEBUG=$GODEBUG" TC_REQUIRE_OPENBAO=1
+          go test -race -count=1 -timeout 30m ./...
       # Running a Backend Plugin as a separate OS user needs a root server.
       - name: go test as root (Backend Plugin user separation)
         if: matrix.module == '.'
@@ -50,7 +151,7 @@ jobs:
           GODEBUG: fips140=${{ matrix.fips140 }}
           TC_REQUIRE_OPENBAO: "1"
         run: >-
-          sudo --preserve-env=GODEBUG,GOFIPS140,TC_REQUIRE_OPENBAO env
-          "PATH=$PATH" "GOCACHE=$RUNNER_TEMP/root-gocache" "GOMODCACHE=$(go env GOMODCACHE)"
+          sudo env -i HOME=/root GOFIPS140=certified
+          "GODEBUG=$GODEBUG" TC_REQUIRE_OPENBAO=1 "PATH=$PATH" "GOCACHE=$RUNNER_TEMP/root-gocache" "GOMODCACHE=$(go env GOMODCACHE)"
           GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-buildvcs=false
           go test -race -count=1 -run '^(TestBackendPlugin(RunsAs|MustRunAs)SeparateUser|TestInitGivesTokenFileToPluginUser)$' ./e2e
