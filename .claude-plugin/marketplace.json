@@ -1,5 +1,6 @@
 {
   "name": "trustedcourier",
+  "description": "TrustedCourier integrations for agent tool execution",
   "owner": { "name": "TrustedCourier contributors" },
   "plugins": [
     {

@@ -17,7 +17,7 @@ func TestClaudeHookBrokerProxyDelivery(t *testing.T) {
 	dir := t.TempDir()
 	build := func(name, pkg string) string {
 		binary := filepath.Join(dir, name)
-		cmd := exec.Command("/usr/local/go/bin/go", "build", "-o", binary, pkg)
+		cmd := exec.Command("go", "build", "-o", binary, pkg)
 		cmd.Dir = ".."
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("build %s: %v\n%s", pkg, err, out)
@@ -58,7 +58,16 @@ func TestClaudeHookBrokerProxyDelivery(t *testing.T) {
 	}
 	adapter := exec.Command(hookBin)
 	adapter.Env = append(os.Environ(), "TC_EXEC_CONFIG="+cfg, "TC_EXEC_BINARY="+brokerBin)
-	adapter.Stdin = strings.NewReader(`{"tool_name":"Bash","cwd":"` + workspace + `","tool_input":{"command":"/tc-exec request --resource demo --method GET --path /v1/models","timeout":5000,"description":"synthetic read"}}`)
+	skill, err := os.ReadFile("../plugins/claude-trustedcourier/skills/use/SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const documented = "/tc-exec request --resource RESOURCE --method GET --path PATH"
+	if !strings.Contains(string(skill), "`"+documented+"`") {
+		t.Fatal("use skill lacks mounted worker command")
+	}
+	command := strings.ReplaceAll(strings.ReplaceAll(documented, "RESOURCE", "demo"), "PATH", "/v1/models")
+	adapter.Stdin = strings.NewReader(`{"tool_name":"Bash","cwd":"` + workspace + `","tool_input":{"command":"` + command + `","timeout":5000,"description":"synthetic read"}}`)
 	adapterOutput, err := adapter.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Claude adapter: %v\n%s", err, adapterOutput)
@@ -87,8 +96,64 @@ func TestClaudeHookBrokerProxyDelivery(t *testing.T) {
 	if strings.Contains(string(output), token) || strings.Contains(string(output), "test-value-1") {
 		t.Fatal("Agent Token or synthetic Secret reached tool output")
 	}
+	bashAdapter := exec.Command(hookBin)
+	bashAdapter.Env = adapter.Env
+	bashAdapter.Stdin = strings.NewReader(`{"tool_name":"Bash","cwd":"` + workspace + `","tool_input":{"command":"[[ 1 == 1 ]] && a=(ok) && echo ${a[0]}"}}`)
+	bashOutput, err := bashAdapter.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Bash adapter: %v\n%s", err, bashOutput)
+	}
+	if err := json.Unmarshal(bashOutput, &rewritten); err != nil {
+		t.Fatal(err)
+	}
+	bashDispatch := exec.Command("/bin/sh", "-c", rewritten.HookSpecificOutput.UpdatedInput.Command)
+	if result, err := bashDispatch.CombinedOutput(); err != nil || string(result) != "ok\n" {
+		t.Fatalf("Bash dispatch: %v %q", err, result)
+	}
 	requests := tc.Upstream().Requests()
 	if len(requests) != 1 || requests[0].Header.Get("Authorization") != "Bearer test-value-1" {
 		t.Fatalf("proxy request = %+v", requests)
+	}
+}
+
+func TestClaudePluginLauncherWithSpacedPath(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "plugin with ' quote")
+	bin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.ReadFile("../plugins/claude-trustedcourier/bin/tc-claude-hook")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "tc-claude-hook"), source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	adapter := filepath.Join(t.TempDir(), "adapter")
+	if err := os.WriteFile(adapter, []byte("#!/bin/sh\necho synthetic-hook-ok\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile("../plugins/claude-trustedcourier/hooks/hooks.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hooks struct {
+		Hooks struct {
+			PreToolUse []struct {
+				Hooks []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"PreToolUse"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &hooks); err != nil {
+		t.Fatal(err)
+	}
+	command := hooks.Hooks.PreToolUse[0].Hooks[0].Command
+	cmd := exec.Command("/bin/sh", "-c", command)
+	cmd.Env = append(os.Environ(), "CLAUDE_PLUGIN_ROOT="+root, "TC_CLAUDE_HOOK_BINARY="+adapter)
+	out, err := cmd.CombinedOutput()
+	if err != nil || string(out) != "synthetic-hook-ok\n" {
+		t.Fatalf("plugin launcher: %v %q", err, out)
 	}
 }
