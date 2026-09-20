@@ -34,3 +34,4 @@ MADR records of settled, non-obvious decisions. Accepted ADRs are immutable: sup
 | [0028](0028-openbao-plugin-locations-env-and-kit-contract.md) | The OpenBao plugin addresses KV fields, is configured by environment, and the conformance kit makes malformed Secrets the plugin's error | accepted |
 | [0029](0029-tc-init-seal-key-hand-off-and-bootstrap-order.md) | tc init writes the seal key OpenBao waits for, then finishes the bootstrap through the Backend Plugin | accepted |
 | [0030](0030-public-agent-url-for-tc-env.md) | tc env uses an explicit public Agent API origin when configured | accepted |
+| [0031](0031-fifo-dispatch-and-codex-read-allowlist.md) | FIFO dispatch and a Codex read allowlist preserve the command sandbox | proposed |
