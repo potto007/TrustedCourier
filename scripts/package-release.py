@@ -2,6 +2,7 @@
 """Package an already built release without reading any local deployment state."""
 import argparse
 import hashlib
+import io
 import json
 import re
 import subprocess
@@ -9,6 +10,26 @@ import tarfile
 from pathlib import Path
 
 VERSION = r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:[0-9A-Za-z-]+)(?:\.[0-9A-Za-z-]+)*)?"
+
+
+PLUGIN_FILES = [
+    ".claude-plugin/marketplace.json",
+    "plugins/claude-trustedcourier/.claude-plugin/plugin.json",
+    "plugins/claude-trustedcourier/bin/tc-claude-hook",
+    "plugins/claude-trustedcourier/hooks/hooks.json",
+    "plugins/claude-trustedcourier/skills/setup/SKILL.md",
+    "plugins/claude-trustedcourier/skills/use/SKILL.md",
+    "docs/claude-code.md",
+    "docs/integrations/codex-cli.md",
+    "docs/decisions/0031-fifo-dispatch-and-codex-read-allowlist.md",
+]
+
+
+def release_binaries(platform):
+    names = ["tc", "openbao-plugin"]
+    if platform.startswith("linux_"):
+        names += ["tc-exec", "tc-claude-hook"]
+    return names
 
 
 def validate_version(value):
@@ -29,9 +50,10 @@ def main():
     parser.add_argument("output_dir", type=Path)
     args = parser.parse_args()
     src = Path(__file__).resolve().parent.parent
-    # Verify exactly the two expected binaries, not arbitrary paths from a manifest.
+    binaries = release_binaries(args.platform)
+    # Verify exactly the expected binaries, not arbitrary paths from a manifest.
     expected = "".join(f"{hashlib.sha256((args.build_dir / name).read_bytes()).hexdigest()}  {name}\n"
-                       for name in ("tc", "openbao-plugin"))
+                       for name in binaries)
     if (args.build_dir / "SHA256SUMS").read_text() != expected:
         raise ValueError("binary checksum verification failed")
     metadata = {
@@ -39,7 +61,7 @@ def main():
         "platform": args.platform,
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=src, text=True).strip(),
         "go_build_info": {name: subprocess.check_output(["go", "version", "-m", str((args.build_dir / name).resolve())], text=True)
-                          for name in ("tc", "openbao-plugin")},
+                          for name in binaries},
     }
     os_name, arch = args.platform.split("_")
     for info in metadata["go_build_info"].values():
@@ -52,10 +74,23 @@ def main():
     name = f"trustedcourier_{args.version}_{args.platform}"
     archive = args.output_dir / f"{name}.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
-        for item in ("tc", "openbao-plugin", "SHA256SUMS", "BUILD-INFO.json"):
+        for item in binaries + ["SHA256SUMS", "BUILD-INFO.json"]:
             tar.add(args.build_dir / item, arcname=f"{name}/{item}")
         tar.add(src / "LICENSE", arcname=f"{name}/LICENSE")
         tar.add(src / "README.md", arcname=f"{name}/README.md")
+        if args.platform.startswith("linux_"):
+            for item in PLUGIN_FILES:
+                if item.endswith(".claude-plugin/plugin.json"):
+                    # Give the distributed plugin this release's version without
+                    # changing the development checkout's manifest.
+                    manifest = json.loads((src / item).read_text())
+                    manifest["version"] = args.version.removeprefix("v")
+                    data = (json.dumps(manifest, indent=2) + "\n").encode()
+                    info = tar.gettarinfo(str(src / item), arcname=f"{name}/{item}")
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+                else:
+                    tar.add(src / item, arcname=f"{name}/{item}")
     print(archive)
 
 
