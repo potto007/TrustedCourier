@@ -1,72 +1,42 @@
-# Codex CLI tool execution bridge (experimental Linux/WSL prototype)
+# Codex CLI tool execution bridge (experimental Linux/WSL profile)
 
-`tc-exec` lets a Codex CLI Bash hook send ordinary commands to a local broker. The broker runs those commands with `bubblewrap` in a workspace mount with an empty home, minimal environment, private process namespace, and a seccomp rule that denies Internet socket families. A registered HTTP read operation runs in the broker through **local TrustedCourier Proxy Delivery**. TrustedCourier can use a shared remote OpenBao Backend; no Backend or Operator credential goes into Codex.
+`tc-exec` routes ordinary Codex Bash commands through a local broker. The broker
+runs a confined worker and performs registered HTTP reads through TrustedCourier
+Proxy Delivery. The worker receives neither the Agent Token nor the upstream
+Secret. Codex provider authentication stays separate; this does not proxy model
+traffic.
 
-This is a bounded prototype, **not an enforced Codex profile**. Codex's documented hook failure behavior can continue the original host tool call; other local tools, hosted tools, MCP servers, and the desktop app are not covered. Do not put host credentials or a TC Agent Token in Codex's environment or workspace. Use a separate unprivileged execution identity and OS controls before relying on this for mandatory mediation. In particular, Codex model/provider authentication remains Codex's own configuration and is outside this bridge.
+The optional `--codex-sandbox` setup uses **filesystem dispatch and a network-off
+Codex command sandbox**. It denies filesystem reads by default, allowing only
+the workspace, minimal runtime paths, two executable files, and the mailbox.
+Keeping credentials outside the workspace alone is insufficient because the
+standard Codex workspace profile permits broad reads.
 
-## Verified Linux limitation
+This protects the tested command path, **not the whole harness**. Other tools,
+connectors, browsers, the desktop app, Codex itself, and malicious unsandboxed
+processes sharing the OS identity are outside this boundary. Hook failure may
+let Codex execute the original command; the independent command sandbox remains
+necessary. Native interactive approval behavior is unverified.
 
-**The current socket dispatcher does not work inside the Linux Codex command sandbox.**
-Model-driven runs with Linux Codex CLI 0.154.0 and 0.155.1 on WSL2 reached
-`PreToolUse`, but the rewritten dispatcher could not connect to the broker and
-no request reached TrustedCourier's synthetic Upstream. The command reported
-`dial unix .../broker.sock: connect: operation not permitted` with network off,
-or `socket: operation not permitted` with Codex's network proxy enabled.
+## Disposable setup
 
-Do not disable the sandbox or enable unrestricted command networking to work
-around this failure. Adding a socket allow rule does not make a direct Unix
-connection work on these versions. The [official network policy documentation](https://learn.chatgpt.com/docs/agent-approvals-security#network-policy)
-describes proxy-mediated socket access; the implementation of both tested
-releases restricts that feature to macOS. Linux requests carrying
-`x-unix-socket` receive HTTP 501, `unix sockets unsupported`.
-
-The exact [0.155.1 platform capability check](https://github.com/openai/codex/blob/rust-v0.155.1/codex-rs/network-proxy/src/runtime.rs#L1047)
-and [0.154.0 sandbox regression](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/linux-sandbox/tests/suite/managed_proxy.rs#L663)
-show why accepted configuration is insufficient: Linux managed proxy mode
-intentionally denies direct `AF_UNIX` socket creation. Moreover, TrustedCourier's
-broker speaks newline-delimited JSON, not the HTTP protocol required by that
-socket proxy.
-
-These are compatibility failures, not successful integration tests. The broker
-worker and its direct integration tests can succeed independently. A safe Linux
-integration needs a supported narrow dispatch transport; it cannot be delivered
-by changing only the network settings shown in the Codex documentation.
-
-To reproduce the sandbox capability check without model calls or real credentials:
-
-```sh
-python3 scripts/diagnose-codex-sandbox.py \
-  --codex /absolute/path/to/linux/codex \
-  --out /absolute/path/to/new-evidence-directory
-```
-
-The probe starts synthetic broker, unrelated Unix, IPv4, and IPv6 listeners,
-confirms they work from the host, then checks them through the actual Codex
-sandbox. It also tests the proxy socket route and readability of a synthetic
-Agent Token file outside the workspace. It records versions, binary hashes,
-configuration, outcomes, and timestamped listener events. No Codex login or
-model request is needed. A zero script exit means evidence collection completed;
-inspect `summary.json` for the capability result. It does not test hooks,
-interactive approvals, broker worker isolation, or full harness confinement.
-
-In these runs, the outer `:workspace` profile could read the synthetic file.
-That profile restricts writes but retains broad read access. The broker worker's
-empty home and narrower mounts are a separate boundary; do not treat its tests
-as proof that Codex itself cannot read an Operator's Agent Token file. Use a
-separate execution identity and independently verified filesystem policy.
-
-## Set up a disposable profile
-
-On the Linux/WSL execution machine, install Go and `bubblewrap`, then build:
+Use Linux Codex CLI, Go, and `bubblewrap` on the Linux/WSL machine. Install both
+executables outside the workspace:
 
 ```sh
 go build -o "$HOME/.local/bin/tc-exec" ./cmd/tc-exec
 ```
 
-Use a local TC Agent API listener (`127.0.0.1` or `::1`) with a Secret Name pinned to an Upstream, a proxy-only Policy limited to GET and the desired path, and an Agent Token issued for that Policy. Store the Agent Token in an Operator-controlled file outside the workspace and profile, mode `0600`. This prototype reads the Agent Token into the broker process; it never sends it to ordinary shell jobs. The Operator should use a dedicated token for this one resource and revoke it when finished.
+Configure a local TC Agent API, a Secret Name pinned to an Upstream, and a
+proxy-only Policy limited to GET and the intended path. Keep its private Agent
+Token file, TC configuration, Backend credentials, and Operator configuration
+outside all allowed workspace, runtime, and mailbox paths. The broker reads the
+Agent Token; the sandbox dispatcher never loads it or the broker configuration.
 
 ```sh
 tc-exec setup \
+  --codex-sandbox \
+  --codex-binary /absolute/path/to/linux/codex \
   --dir "$HOME/tc-codex-demo" \
   --workspace "$HOME/src/my-project" \
   --agent-url http://127.0.0.1:8200 \
@@ -75,36 +45,144 @@ tc-exec setup \
   --secret-name github-work \
   --upstream api \
   --path-prefix /repos/example/project/issues
+
 tc-exec serve --config "$HOME/tc-codex-demo/tc-exec.json"
 ```
 
-`setup` creates only `tc-exec.json` and `hooks.json` in the named profile. It refuses to overwrite differing files, so rerunning the same command is safe. To uninstall, stop the broker and remove this dedicated profile directory after checking its contents. It never edits the normal `~/.codex` profile. The profile must be outside the workspace. The broker refuses a non-loopback TC URL and an Agent Token file with group or world permissions.
+Setup creates private `tc-exec.json`, `hooks.json`, `config.toml`, and a mailbox
+directory. It refuses differing existing files and symlink or publicly
+accessible mailbox directories. It never edits the normal `~/.codex` profile.
+Without `--codex-sandbox`, setup retains the Unix-socket configuration used by
+other adapters, including Claude Code.
 
-In another shell, run a **Linux Codex CLI** with the dedicated profile:
+In another shell, authenticate using Codex's normal login flow inside the
+dedicated `CODEX_HOME`, then start the same executable:
 
 ```sh
-CODEX_HOME="$HOME/tc-codex-demo" codex -C "$HOME/src/my-project"
+CODEX_HOME="$HOME/tc-codex-demo" /absolute/path/to/linux/codex --strict-config \
+  -C "$HOME/src/my-project"
 ```
 
-Log in to Codex inside this profile using Codex's normal flow. Review and trust the hook when Codex asks. No model provider or authentication setting is changed by `tc-exec`. Linux Codex CLI 0.154.0 and 0.155.1 have been exercised end to end with a synthetic Backend and TLS Upstream. Both invoked the hook but failed at sandbox-to-broker dispatch as described above. Successful Linux Codex execution remains unverified.
+Review and trust the hook when prompted. The generated `default_permissions`
+selects `trustedcourier`. Do not replace it with a legacy `--sandbox` option,
+add unrelated writable roots, or disable the sandbox. Executable paths are
+exact; regenerate a fresh profile when an installation moves. Generated shape:
 
-Ordinary Bash calls are rewritten to `tc-exec dispatch --job …`. The sandbox mounts only the broker socket and a non-secret copy of the profile config, so an ordinary Bash call can perform the registered read operation explicitly:
+```toml
+default_permissions = "trustedcourier"
+
+[permissions.trustedcourier.filesystem]
+":root" = "deny"
+":minimal" = "read"
+"/absolute/profile" = "deny"
+"/absolute/agent-token" = "deny"
+"/absolute/workspace" = "write"
+"/absolute/profile/mailbox" = "write"
+"/absolute/tc-exec" = "read"
+"/absolute/codex" = "read"
+
+[permissions.trustedcourier.network]
+enabled = false
+```
+
+Policy, hooks, broker configuration, and Agent Token stay outside the command
+allowlist. Put no credentials in allowed paths. Codex's host process still uses
+its own provider login; this profile does not disable that connection.
+
+## Dispatch and protected operations
+
+The host-side hook submits a command over the existing broker socket. The broker
+keeps command and working directory in memory and atomically publishes two
+private FIFOs in a fresh session directory. The hook rewrites Bash to
+`tc-exec dispatch --mailbox ... --job ...`. The sandbox dispatcher sends only
+a start signal; changing a file cannot replace the stored command.
+
+A random 192-bit job identifier and device/inode identities bind the reference.
+Opens reject traversal, symlinks, wrong owners, public permissions, non-FIFOs,
+and replaced endpoints. The broker pins directory/FIFO descriptors and consumes
+each job once. Pending jobs expire after ten minutes; admission and worker
+concurrency are bounded. Command output is capped at 1 MiB. Closing the request
+pipe cancels and reaps a running worker, including when the dispatcher is killed.
+Workers also have a two-minute limit.
+
+Restart creates a fresh session; old references cannot replay jobs. Graceful
+shutdown removes its empty session directory. Crashes can leave inert FIFOs.
+Stop the broker before inspecting and removing the dedicated profile. Cleanup
+never recursively follows Agent-created paths. Mailbox mutations can deny
+service but cannot replace the command in memory.
+
+Inside the worker, `/tc-exec` and the Unix broker socket remain mounted:
 
 ```sh
 /tc-exec request --resource github-work --method GET \
   --path /repos/example/project/issues
 ```
 
-`/tc-exec` is a read-only mount of the installed binary inside the shell worker. The request command talks to the local broker. The broker attaches the Agent Token to the local TC Proxy Delivery route; TC applies its Policy, injects the Secret for the pinned Upstream, redacts the response, and records the Delivery. This client currently supports response bodies up to 1 MiB and one-shot GET requests. It does not translate arbitrary `curl` or `gh` syntax.
+The broker attaches its Agent Token. TC checks its Policy, injects the Secret,
+redacts the response, and records the Delivery. The broker independently checks
+its resource/method/path registration. Arbitrary `curl` and `gh` commands are
+not translated. Only one-shot GET responses up to 1 MiB are supported.
 
-## Boundary and current gaps
+`serve --events-file /private/new-events.jsonl` creates an optional new mode-0600
+diagnostic file, refusing an existing path. Timestamped records contain actions,
+job identifiers, statuses, and outcome flags, never commands, request paths,
+bodies, or credentials. They supplement TC Audit Records; they are not an
+authorization mechanism or durable audit guarantee.
 
-The local socket accepts requests from the OS identity that owns the socket and applies registered resource, method, and path rules independently of the hook. Other host processes with that same identity can also reach the socket and may be able to alter the profile or workspace; this prototype does not protect against a malicious same-UID host process. The random job reference is single-use and expires after ten minutes, allowing time for a human approval prompt. The broker caps pending jobs and concurrent workers, and expires abandoned jobs. The broker does not grant a raw Secret retrieval method. Direct calls to the socket have only the same registered operations.
+## Verification and remaining scope
 
-The ordinary shell cannot create Internet sockets and has no access to host home or the Agent Token file. Bubblewrap shares the host network namespace because some unprivileged kernels refuse its loopback setup; the required seccomp filter permits only Unix sockets. The mounted broker socket remains accessible and applies policy independently of the hook. **Host abstract Unix sockets remain reachable** under this prototype, and privileged Unix sockets inside the workspace are also reachable. Run it only on a host without such endpoints exposed to the Agent's OS identity; a separate network namespace or stronger launcher is required to close this gap. Commands can use only files inside the mounted workspace and read-only system binaries/libraries. The broker resolves the workspace before validation and holds its directory open for each mount, so replacing its path after startup cannot redirect the mount. Anything sensitive already present *inside the workspace* remains accessible. Test commands requiring public network, package downloads, Docker, or host tools outside the mounted paths will fail. Child processes inherit the same filter. Each command starts a new Bash process with startup files disabled and has a two-minute limit. There is no PTY, stdin continuation, streaming output, or background job support; interactive `write_stdin` paths are therefore not supported. Output is bounded while it is collected to 1 MiB, stdout/stderr are combined, and the broker marks a truncated reply explicitly.
+Actual model-driven Linux Codex CLI 0.154.0 and 0.155.1 tests used a synthetic Backend, real
+TC, and TLS Upstream. Hook, FIFO dispatch, worker, authenticated Proxy Delivery,
+and response completed. Forbidden paths and methods were denied. Outer probes
+could not read Agent Token, synthetic Backend/Operator credentials, broker
+config, TC config, or Codex policy, including workspace symlink and
+`/proc/<broker>/root` aliases. Unrelated Unix and direct IPv4/IPv6 host listeners
+were unreachable; host controls proved they were live. Worker probes separately
+verified credential absence and denied Internet socket creation.
 
-Codex's `PreToolUse` accepts a Bash argument rewrite with `permissionDecision: "allow"` and `updatedInput`; native Linux approval behavior for the original command remains unverified. The rewrite does **not** make hook failure fail closed. If the hook is missing, times out, or returns malformed JSON, Codex may run the original host command. Other tools can also execute outside this bridge. Thus the bridge shows a working TC HTTP use path and secret-free *brokered* shell, but cannot claim all Codex tool execution is mediated. An enforced release needs a launcher/runtime boundary that confines every tool worker and prevents a skipped hook or alternate tool from reaching host credentials or the protected service. It also needs cancellation and interactive session support, approval semantics, workload identity stronger than same-UID socket ownership, immutable Operator-owned installation, and a verified Linux Codex CLI matrix.
+A separately authorized disposable run used
+`--dangerously-bypass-approvals-and-sandbox`. Delivery worked, but outer commands
+could read protected synthetic files and reach all listeners. The worker stayed
+confined. This is functionality evidence without the outer boundary, not proof
+of sandbox or approval enforcement.
 
-The wire protocol is intentionally harness-neutral: one JSON request per Unix socket connection, returning one JSON reply. `{ "action": "submit", "command": "…", "workdir": "…" }` returns a `job`, `dispatch` consumes that job and returns `status` and `output`, and `{ "action": "request", "resource": "…", "method": "GET", "path": "/…" }` invokes a registered protected operation. Adapters for other harnesses can translate their own hook payloads to these messages without reading an Operator Credential or Backend token.
+```sh
+go test -race ./cmd/tc-exec ./cmd/tc-claude-hook
+go test -race -run 'TestTCExecAuthenticatedReadThroughProxyDelivery|TestClaude' ./e2e
+TC_CODEX_BINARY=/absolute/path/to/linux/codex \
+  go test -race -count=1 -run TestTCExecAuthenticatedReadThroughProxyDelivery ./e2e
+```
 
-Codex hook behavior described above follows the [official hook reference](https://developers.openai.com/codex/hooks#pretooluse). TrustedCourier's route and policy behavior is defined in [ADR-0005](../decisions/0005-proxy-delivery-by-base-url-route.md) and [ADR-0018](../decisions/0018-policy-method-and-path-limits.md).
+The last command also tests the rewritten dispatcher and protected-file checks
+in the actual Codex sandbox without login or model calls. Interactive approvals,
+background jobs, PTYs, stdin continuation, streaming, and full harness confinement
+remain unverified or unsupported. The hook's `permissionDecision: "allow"`
+rewrite is not a fail-closed approval mechanism.
+
+The worker has an empty home, minimal environment, private process namespace,
+read-only runtime binaries, workspace mount, and seccomp denial of Internet
+socket families. It shares the host network namespace because some unprivileged
+kernels refuse loopback setup. **Host abstract Unix sockets and sockets already
+in the workspace remain a worker limitation.** Use a separate identity and
+stronger OS boundary for mandatory mediation. Contents already in the workspace,
+including hard-linked credentials, are accessible; do not put sensitive data there.
+
+## Original socket incompatibility
+
+Linux Codex 0.154.0 and 0.155.1 reject the legacy direct Unix dispatcher. Managed
+proxy mode denies direct `AF_UNIX` creation. Their Unix proxy is
+[macOS-only](https://github.com/openai/codex/blob/rust-v0.155.1/codex-rs/network-proxy/src/runtime.rs#L1047),
+and Linux forwarding returned HTTP 501. The broker's newline-delimited JSON
+also differs from that HTTP proxy protocol. No unrestricted network exception
+was used to solve this incompatibility.
+
+The original `scripts/diagnose-codex-sandbox.py --codex /absolute/path/to/codex
+--out /new/evidence-directory` checks that legacy policy, not the new FIFO
+profile. Its zero exit means collection completed; inspect its outcomes.
+Failed baseline evidence stays separate from successful filesystem dispatch.
+
+See [ADR-0031](../decisions/0031-fifo-dispatch-and-codex-read-allowlist.md), the
+[official permission reference](https://learn.chatgpt.com/docs/permissions),
+[hook reference](https://developers.openai.com/codex/hooks#pretooluse),
+[ADR-0005](../decisions/0005-proxy-delivery-by-base-url-route.md), and
+[ADR-0018](../decisions/0018-policy-method-and-path-limits.md).

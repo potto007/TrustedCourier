@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -34,7 +35,12 @@ func TestTCExecAuthenticatedReadThroughProxyDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	profile := filepath.Join(dir, "profile")
-	setup := exec.Command(binary, "setup", "--dir", profile, "--workspace", workspace, "--agent-url", srv.AgentURL(), "--agent-token-file", tokenFile, "--resource", "demo", "--secret-name", "openai", "--upstream", "api", "--path-prefix", "/v1/models")
+	codexBinary := os.Getenv("TC_CODEX_BINARY")
+	configBinary := codexBinary
+	if configBinary == "" {
+		configBinary = "/usr/bin/true"
+	}
+	setup := exec.Command(binary, "setup", "--codex-sandbox", "--codex-binary", configBinary, "--dir", profile, "--workspace", workspace, "--agent-url", srv.AgentURL(), "--agent-token-file", tokenFile, "--resource", "demo", "--secret-name", "openai", "--upstream", "api", "--path-prefix", "/v1/models")
 	if out, err := setup.CombinedOutput(); err != nil {
 		t.Fatalf("setup: %v\n%s", err, out)
 	}
@@ -77,8 +83,35 @@ func TestTCExecAuthenticatedReadThroughProxyDelivery(t *testing.T) {
 	if rewritten.HookSpecificOutput.UpdatedInput.Timeout != 120000 {
 		t.Fatal("Codex timeout field was lost")
 	}
+	if !strings.Contains(rewritten.HookSpecificOutput.UpdatedInput.Command, " dispatch --mailbox ") {
+		t.Fatal("Codex did not use filesystem dispatch")
+	}
 	dispatchedCommand := exec.Command("/bin/sh", "-c", rewritten.HookSpecificOutput.UpdatedInput.Command)
-	if out, err := dispatchedCommand.CombinedOutput(); err != nil || string(out) != "ok\n" {
+	if codexBinary != "" {
+		// The hook itself runs on the host. Test its rewritten command inside the
+		// actual Codex sandbox, including read restrictions before FIFO dispatch.
+		outer := filepath.Join(workspace, "outer-boundary.py")
+		source := fmt.Sprintf(`import os,socket
+for path in [%q,%q,%q]:
+ try:
+  with open(path, "rb") as f: f.read(1)
+ except OSError: pass
+ else: raise SystemExit("protected file readable")
+s=socket.socket(socket.AF_UNIX)
+try: s.connect(%q)
+except OSError: pass
+else: raise SystemExit("broker socket reachable from outer sandbox")
+`, tokenFile, cfg, filepath.Join(workspace, "token-alias"), socket)
+		if err := os.Symlink(tokenFile, filepath.Join(workspace, "token-alias")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(outer, []byte(source), 0600); err != nil {
+			t.Fatal(err)
+		}
+		dispatchedCommand = exec.Command(codexBinary, "sandbox", "-P", "trustedcourier", "-C", workspace, "/bin/sh", "-c", "python3 ./outer-boundary.py && "+rewritten.HookSpecificOutput.UpdatedInput.Command)
+		dispatchedCommand.Env = append(os.Environ(), "CODEX_HOME="+profile)
+	}
+	if out, err := dispatchedCommand.Output(); err != nil || string(out) != "ok\n" {
 		t.Fatalf("Codex Bash rewrite: %v %q", err, out)
 	}
 	call := exec.Command(binary, "request", "--config", cfg, "--resource", "demo", "--method", "GET", "--path", "/v1/models")

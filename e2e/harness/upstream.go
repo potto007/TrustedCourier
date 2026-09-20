@@ -43,6 +43,7 @@ type Upstream struct {
 
 // UpstreamRequest is one request the fake Upstream received.
 type UpstreamRequest struct {
+	ReceivedAt time.Time
 	Method     string
 	Host       string
 	Path       string // escaped, as sent
@@ -181,6 +182,7 @@ func (u *Upstream) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	u.mu.Lock()
 	u.requests = append(u.requests, UpstreamRequest{
+		ReceivedAt: time.Now().UTC(),
 		Method:     r.Method,
 		Host:       r.Host,
 		Path:       r.URL.EscapedPath(),
