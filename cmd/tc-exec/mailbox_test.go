@@ -280,3 +280,45 @@ func TestSetupCodexRejectsTokenInMailbox(t *testing.T) {
 		t.Fatal("unsafe profile was published")
 	}
 }
+
+func TestProfilePreflightAndNoFollow(t *testing.T) {
+	for _, kind := range []string{"conflict", "symlink", "dangling"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			os.Chmod(root, 0700)
+			target := filepath.Join(t.TempDir(), "outside")
+			conflict := filepath.Join(root, "hooks.json")
+			switch kind {
+			case "conflict":
+				os.WriteFile(conflict, []byte("different"), 0600)
+			case "symlink":
+				os.WriteFile(target, []byte("outside"), 0600)
+				os.Symlink(target, conflict)
+			case "dangling":
+				os.Symlink(target, conflict)
+			}
+			if err := publishProfile(root, map[string][]byte{"config.toml": []byte("policy"), "hooks.json": []byte("hooks")}); err == nil {
+				t.Fatal("unsafe profile accepted")
+			}
+			if _, err := os.Stat(filepath.Join(root, "config.toml")); !os.IsNotExist(err) {
+				t.Fatal("preflight failure published a policy")
+			}
+			data, err := os.ReadFile(target)
+			if kind == "dangling" && !os.IsNotExist(err) {
+				t.Fatal("dangling symlink target created")
+			}
+			if kind == "symlink" && string(data) != "outside" {
+				t.Fatal("symlink target changed")
+			}
+		})
+	}
+	root := t.TempDir()
+	os.Chmod(root, 0700)
+	files := map[string][]byte{"config.toml": []byte("complete policy"), "hooks.json": []byte("complete hooks")}
+	if err := publishProfile(root, files); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishProfile(root, files); err != nil {
+		t.Fatal("idempotent setup:", err)
+	}
+}

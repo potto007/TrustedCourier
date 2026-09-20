@@ -292,21 +292,8 @@ func setup(args []string) error {
 	if *codexSandbox {
 		files["config.toml"] = codexSandboxConfig(ws, cfg.Mailbox, exe, *codexBinary, protectedToken)
 	}
-	for name, contents := range files {
-		path := filepath.Join(abs, name)
-		old, er := os.ReadFile(path)
-		if er == nil {
-			if !bytes.Equal(old, contents) {
-				return fmt.Errorf("%s exists with different contents", path)
-			}
-			continue
-		}
-		if !os.IsNotExist(er) {
-			return er
-		}
-		if er = os.WriteFile(path, contents, 0600); er != nil {
-			return er
-		}
+	if e = publishProfile(abs, files); e != nil {
+		return e
 	}
 	fmt.Println("Profile ready:", abs)
 	fmt.Println("Start broker: ", exe, "serve --config", filepath.Join(abs, "tc-exec.json"))
