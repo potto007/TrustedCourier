@@ -134,7 +134,7 @@ func TestMailboxCancellationAndRestart(t *testing.T) {
 
 func TestCodexSandboxConfigKeepsCredentialsOutsideAllowlist(t *testing.T) {
 	c := string(codexSandboxConfig("/project", "/profile/mailbox", "/bin/tc-exec", "/bin/codex", "/private/token"))
-	for _, want := range []string{`":root" = "deny"`, `":minimal" = "read"`, `enabled = false`, `"/profile/mailbox" = "write"`} {
+	for _, want := range []string{`":root" = "deny"`, `":minimal" = "read"`, `enabled = false`, `inherit = "none"`, `"/profile/mailbox" = "write"`} {
 		if !strings.Contains(c, want) {
 			t.Fatalf("missing %s", want)
 		}

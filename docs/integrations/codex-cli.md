@@ -71,6 +71,10 @@ exact; regenerate a fresh profile when an installation moves. Generated shape:
 ```toml
 default_permissions = "trustedcourier"
 
+[shell_environment_policy]
+inherit = "none"
+set = { PATH = "/usr/bin:/bin", LANG = "C.UTF-8" }
+
 [permissions.trustedcourier.filesystem]
 ":root" = "deny"
 ":minimal" = "read"
@@ -87,7 +91,9 @@ enabled = false
 
 Policy, hooks, broker configuration, and Agent Token stay outside the command
 allowlist. Put no credentials in allowed paths. Codex's host process still uses
-its own provider login; this profile does not disable that connection.
+its own provider login; this profile does not disable that connection. Sandboxed shell commands start with an empty inherited environment plus
+explicit runtime values, preventing host environment credentials from passing
+through. The live YOLO comparison retained the synthetic environment marker, so this guarantee applies only to the tested sandboxed route. This is the documented [shell environment policy](https://learn.chatgpt.com/docs/config-file/config-advanced#shell-environment-policy), separate from Codex's own provider authentication.
 
 ## Dispatch and protected operations
 

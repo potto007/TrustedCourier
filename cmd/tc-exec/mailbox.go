@@ -30,6 +30,10 @@ type mailboxRef struct {
 func codexSandboxConfig(workspace, mailbox, executable, codexBinary, tokenFile string) []byte {
 	return []byte(fmt.Sprintf(`default_permissions = "trustedcourier"
 
+[shell_environment_policy]
+inherit = "none"
+set = { PATH = "/usr/bin:/bin", LANG = "C.UTF-8" }
+
 [permissions.trustedcourier.filesystem]
 ":root" = "deny"
 ":minimal" = "read"

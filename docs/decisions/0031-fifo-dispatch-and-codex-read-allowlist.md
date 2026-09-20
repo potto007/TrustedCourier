@@ -20,7 +20,9 @@ The default socket protocol remains compatible with Claude Code and existing
 profiles. The new profile denies networking and filesystem reads by default,
 granting only minimal runtime reads, workspace and mailbox writes, and reads of
 the installed Codex and tc-exec executables. Broker, Backend, Operator, and Agent
-Token files must stay outside those allowed paths.
+Token files must stay outside those allowed paths. Sandboxed shell commands inherit no
+host environment variables; only explicit runtime values are set. The bounded YOLO comparison retained an inherited synthetic credential marker, so that mode has no such verified boundary. Codex provider
+authentication remains in its separate host process.
 
 The host hook submits a bounded command over the existing socket. The broker
 retains it in memory, creates a random 192-bit job reference, and atomically
