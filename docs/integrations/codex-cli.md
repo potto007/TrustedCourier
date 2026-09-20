@@ -4,6 +4,57 @@
 
 This is a bounded prototype, **not an enforced Codex profile**. Codex's documented hook failure behavior can continue the original host tool call; other local tools, hosted tools, MCP servers, and the desktop app are not covered. Do not put host credentials or a TC Agent Token in Codex's environment or workspace. Use a separate unprivileged execution identity and OS controls before relying on this for mandatory mediation. In particular, Codex model/provider authentication remains Codex's own configuration and is outside this bridge.
 
+## Verified Linux limitation
+
+**The current socket dispatcher does not work inside the Linux Codex command sandbox.**
+Model-driven runs with Linux Codex CLI 0.154.0 and 0.155.1 on WSL2 reached
+`PreToolUse`, but the rewritten dispatcher could not connect to the broker and
+no request reached TrustedCourier's synthetic Upstream. The command reported
+`dial unix .../broker.sock: connect: operation not permitted` with network off,
+or `socket: operation not permitted` with Codex's network proxy enabled.
+
+Do not disable the sandbox or enable unrestricted command networking to work
+around this failure. Adding a socket allow rule does not make a direct Unix
+connection work on these versions. The [official network policy documentation](https://learn.chatgpt.com/docs/agent-approvals-security#network-policy)
+describes proxy-mediated socket access; the implementation of both tested
+releases restricts that feature to macOS. Linux requests carrying
+`x-unix-socket` receive HTTP 501, `unix sockets unsupported`.
+
+The exact [0.155.1 platform capability check](https://github.com/openai/codex/blob/rust-v0.155.1/codex-rs/network-proxy/src/runtime.rs#L1047)
+and [0.154.0 sandbox regression](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/linux-sandbox/tests/suite/managed_proxy.rs#L663)
+show why accepted configuration is insufficient: Linux managed proxy mode
+intentionally denies direct `AF_UNIX` socket creation. Moreover, TrustedCourier's
+broker speaks newline-delimited JSON, not the HTTP protocol required by that
+socket proxy.
+
+These are compatibility failures, not successful integration tests. The broker
+worker and its direct integration tests can succeed independently. A safe Linux
+integration needs a supported narrow dispatch transport; it cannot be delivered
+by changing only the network settings shown in the Codex documentation.
+
+To reproduce the sandbox capability check without model calls or real credentials:
+
+```sh
+python3 scripts/diagnose-codex-sandbox.py \
+  --codex /absolute/path/to/linux/codex \
+  --out /absolute/path/to/new-evidence-directory
+```
+
+The probe starts synthetic broker, unrelated Unix, IPv4, and IPv6 listeners,
+confirms they work from the host, then checks them through the actual Codex
+sandbox. It also tests the proxy socket route and readability of a synthetic
+Agent Token file outside the workspace. It records versions, binary hashes,
+configuration, outcomes, and timestamped listener events. No Codex login or
+model request is needed. A zero script exit means evidence collection completed;
+inspect `summary.json` for the capability result. It does not test hooks,
+interactive approvals, broker worker isolation, or full harness confinement.
+
+In these runs, the outer `:workspace` profile could read the synthetic file.
+That profile restricts writes but retains broad read access. The broker worker's
+empty home and narrower mounts are a separate boundary; do not treat its tests
+as proof that Codex itself cannot read an Operator's Agent Token file. Use a
+separate execution identity and independently verified filesystem policy.
+
 ## Set up a disposable profile
 
 On the Linux/WSL execution machine, install Go and `bubblewrap`, then build:
@@ -35,7 +86,7 @@ In another shell, run a **Linux Codex CLI** with the dedicated profile:
 CODEX_HOME="$HOME/tc-codex-demo" codex -C "$HOME/src/my-project"
 ```
 
-Log in to Codex inside this profile using Codex's normal flow. Review and trust the hook when Codex asks. No model provider or authentication setting is changed by `tc-exec`. The tested local executable was the Windows Codex CLI 0.155.0-alpha.2.6; it confirmed hook support in `features list`, but that executable does not run inside this WSL broker. A Linux Codex CLI end-to-end run remains to be verified.
+Log in to Codex inside this profile using Codex's normal flow. Review and trust the hook when Codex asks. No model provider or authentication setting is changed by `tc-exec`. Linux Codex CLI 0.154.0 and 0.155.1 have been exercised end to end with a synthetic Backend and TLS Upstream. Both invoked the hook but failed at sandbox-to-broker dispatch as described above. Successful Linux Codex execution remains unverified.
 
 Ordinary Bash calls are rewritten to `tc-exec dispatch --job …`. The sandbox mounts only the broker socket and a non-secret copy of the profile config, so an ordinary Bash call can perform the registered read operation explicitly:
 
