@@ -8,6 +8,7 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/release.yml"
       - "scripts/*release*"
+      - "docs/release-notes/**"
       - "scripts/wait-for-ci.py"
       - "scripts/*ci-evidence.py"
       - "scripts/test-wait-for-ci.py"
@@ -116,6 +117,9 @@ jobs:
           # The plugin's hash must agree with the same helper Operators use.
           test "$(./tc plugin sha256 ./openbao-plugin)" = "sha256: $(awk '/openbao-plugin$/ {print $1}' SHA256SUMS)"
           GODEBUG=fips140=on ./tc plugin sha256 ./openbao-plugin
+          if [[ "$PLATFORM" == linux_* ]]; then
+            python3 "$GITHUB_WORKSPACE/scripts/smoke-release-integrations.py" "$PWD"
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.platform }}
@@ -150,6 +154,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: release-bundle
@@ -166,6 +173,9 @@ jobs:
           # Never overwrite an existing release. A failed upload leaves a draft
           # for inspection; delete that draft before rerunning this job.
           args=(--draft --verify-tag --generate-notes --title "$VERSION")
+          if [[ -f "../docs/release-notes/${VERSION}.md" ]]; then
+            args+=(--notes-file "../docs/release-notes/${VERSION}.md")
+          fi
           if [[ "$VERSION" == *-* ]]; then args+=(--prerelease); fi
           gh release create "$VERSION" "${args[@]}" ./*.tar.gz SHA256SUMS
           gh release edit "$VERSION" --draft=false

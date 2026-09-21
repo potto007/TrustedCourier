@@ -15,7 +15,7 @@ claude plugin validate .
 claude plugin validate ./plugins/claude-trustedcourier
 ```
 
-`claude plugin validate` requires an installed Claude Code CLI. The plugin is a development source bundle and does not contain signed platform binaries. Build instructions do not install or change a host service. The runtime profile and broker service must be configured and started by the Operator according to the `tc-exec` documentation. The profile contains a workspace, Unix socket, Agent API URL, a path to an Agent Token file, and registered resources. Keep the Agent Token file inaccessible to arbitrary tool code. This plugin never reads it.
+`claude plugin validate` requires an installed Claude Code CLI. The source checkout is a development plugin bundle. Linux release archives include the plugin marketplace and unsigned `tc-exec` and `tc-claude-hook` binaries; their plugin manifest uses the release version. Use the extracted package root as the local marketplace and set the binary paths below. Build instructions do not install or change a host service. The runtime profile and broker service must be configured and started by the Operator according to the `tc-exec` documentation. The profile contains a workspace, Unix socket, Agent API URL, a path to an Agent Token file, and registered resources. Keep the Agent Token file inaccessible to arbitrary tool code. This plugin never reads it.
 
 For a local plugin trial, add this checkout as a marketplace and install the plugin:
 
